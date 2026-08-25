@@ -63,6 +63,7 @@ ACTIVE_DATA_KEYS = (
     "photo_versions",
     "travel_card_path",
     "travel_caption",
+    "travel_ai_caption",
 )
 
 
@@ -280,6 +281,66 @@ def db_latest_card(user_id: int):
     return None
 
 
+def db_latest_completed_payload(user_id: int):
+    if not PERSISTENCE_OK:
+        return None, None
+
+    try:
+        with db_connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, data_json
+                FROM completed_quests
+                WHERE user_id=?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (int(user_id),),
+            ).fetchone()
+
+        if not row:
+            return None, None
+
+        return int(row["id"]), json.loads(row["data_json"])
+    except Exception:
+        logger.exception("Failed to load latest completed quest for user %s", user_id)
+        return None, None
+
+
+def db_update_completed_payload(record_id: int, payload: dict):
+    if not PERSISTENCE_OK or not record_id:
+        return False
+
+    try:
+        quest = payload.get("quest") or {}
+        city = payload.get("city") or {}
+        completed = payload.get("completed", [])
+        bonuses = payload.get("bonuses", [])
+        photos = payload.get("photos", {})
+        xp = earned_xp(quest, completed, bonuses) if quest else 0
+
+        with db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE completed_quests
+                SET title=?, city=?, xp=?, photos=?, data_json=?
+                WHERE id=?
+                """,
+                (
+                    str(quest.get("title") or "CityQuest"),
+                    city_display_ru(city),
+                    int(xp),
+                    int(len(photos)),
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    int(record_id),
+                ),
+            )
+        return True
+    except Exception:
+        logger.exception("Failed to update completed quest %s", record_id)
+        return False
+
+
 async def persist_active_state(user_id: int, state: FSMContext):
     data = await state.get_data()
     if data.get("quest"):
@@ -347,6 +408,7 @@ class QuestForm(StatesGroup):
     waiting_photo = State()
     waiting_free_photo = State()
     free_photo_ready = State()
+    waiting_custom_impression = State()
     quest_finished = State()
 
 
@@ -3326,7 +3388,7 @@ def render_travel_card(data, photo_images, caption):
 
     draw.text(
         (78, bottom_top + 25),
-        "МОЯ ЗАМЕТКА",
+        "ВПЕЧАТЛЕНИЯ",
         font=kicker_font,
         fill=gold,
     )
@@ -3414,12 +3476,16 @@ async def collect_card_photos(bot, photos):
     return images
 
 
-async def create_and_save_travel_card(bot, user_id, data):
+async def create_and_save_travel_card(bot, user_id, data, caption_override=None):
     photos = data.get("photos") or {}
     if not photos:
         return None, None
 
-    caption = await generate_travel_caption(data)
+    caption = (
+        str(caption_override).strip()
+        if caption_override is not None
+        else await generate_travel_caption(data)
+    )
     images = await collect_card_photos(bot, photos)
 
     if not images:
@@ -3439,13 +3505,25 @@ async def create_and_save_travel_card(bot, user_id, data):
     return path, caption
 
 
-def travel_card_actions_keyboard():
+def travel_card_actions_keyboard(custom=False, initial=False, editable=True):
     kb = InlineKeyboardBuilder()
+
+    if editable:
+        if custom:
+            kb.button(text="✍️ Изменить впечатления", callback_data="custom_impression")
+            kb.button(text="↩️ Вернуть готовый вариант", callback_data="restore_ai_impression")
+        else:
+            kb.button(text="✍️ Написать свои впечатления", callback_data="custom_impression")
+            if initial:
+                kb.button(text="✨ Оставить готовый текст", callback_data="keep_ai_impression")
+
     kb.button(text="🎒 Мои приключения", callback_data="my_quests")
     kb.button(text="🧭 Новый квест", callback_data="new_quest")
     kb.button(text="🏠 Главное меню", callback_data="home")
     kb.adjust(1)
     return kb.as_markup()
+
+
 def route_summary(route, quest, duration):
     walk = route["time_s"] / 60
     missions = sum(int(s["mission"].get("minutes", 12)) for s in quest["stops"])
@@ -4431,6 +4509,7 @@ async def quest_finish(callback: CallbackQuery, state: FSMContext):
             await state.update_data(
                 travel_card_path=card_path,
                 travel_caption=travel_caption,
+                travel_ai_caption=travel_caption,
             )
             data = await state.get_data()
 
@@ -4461,7 +4540,7 @@ async def quest_finish(callback: CallbackQuery, state: FSMContext):
                 "🖼 <b>Твоя travel-открытка</b>\n\n"
                 "Ею можно поделиться обычной кнопкой Telegram «Переслать»."
             ),
-            reply_markup=travel_card_actions_keyboard(),
+            reply_markup=travel_card_actions_keyboard(initial=True),
         )
     elif photos:
         if card_status:
@@ -4472,7 +4551,7 @@ async def quest_finish(callback: CallbackQuery, state: FSMContext):
     else:
         await callback.message.answer(
             "📷 В этом квесте не было фото-трофеев, поэтому фотоколлаж не создавался.",
-            reply_markup=travel_card_actions_keyboard(),
+            reply_markup=travel_card_actions_keyboard(editable=False),
         )
 
 
@@ -4577,16 +4656,215 @@ async def my_quests(callback: CallbackQuery, state: FSMContext):
     )
 
 
+@router.callback_query(F.data == "custom_impression")
+async def custom_impression_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+
+    record_id, payload = db_latest_completed_payload(callback.from_user.id)
+    if not payload or not payload.get("travel_card_path"):
+        await callback.message.answer(
+            "🤔 Не нашла travel-открытку, для которой можно изменить впечатления."
+        )
+        return
+
+    await state.update_data(custom_impression_record_id=record_id)
+    await state.set_state(QuestForm.waiting_custom_impression)
+
+    current = str(payload.get("travel_caption") or "").strip()
+    current_text = (
+        f"\n\nСейчас на открытке:\n<i>{esc(current)}</i>"
+        if current else ""
+    )
+
+    await callback.message.answer(
+        "✍️ <b>Напиши свои впечатления</b>\n\n"
+        "Пришли 1–3 коротких предложения одним сообщением. "
+        "Я заменю готовую подпись твоим текстом и пересоберу открытку."
+        f"{current_text}\n\n"
+        "Для отмены: /cancelimpression"
+    )
+
+
+@router.message(Command("cancelimpression"))
+async def cancel_custom_impression(message: Message, state: FSMContext):
+    await state.set_state(QuestForm.quest_finished)
+    await message.answer("Изменение впечатлений отменено.")
+
+
+@router.message(QuestForm.waiting_custom_impression)
+async def custom_impression_received(message: Message, state: FSMContext):
+    custom_text = (message.text or "").strip()
+
+    if len(custom_text) < 5:
+        await message.answer(
+            "Напиши чуть подробнее — хотя бы одно короткое предложение."
+        )
+        return
+
+    if len(custom_text) > 420:
+        await message.answer(
+            "Для открытки текст слишком длинный. Сократи примерно до 1–3 предложений."
+        )
+        return
+
+    state_data = await state.get_data()
+    wanted_record_id = state_data.get("custom_impression_record_id")
+    record_id, payload = db_latest_completed_payload(message.from_user.id)
+
+    if not payload or (wanted_record_id and record_id != wanted_record_id):
+        await message.answer("🤔 Не удалось найти нужную travel-открытку.")
+        await state.set_state(QuestForm.quest_finished)
+        return
+
+    original_ai_caption = str(
+        payload.get("travel_ai_caption")
+        or payload.get("travel_caption")
+        or ""
+    ).strip()
+
+    status = await message.answer(
+        "🎨 <b>Пересобираю открытку с твоими впечатлениями…</b>"
+    )
+
+    try:
+        card_path, _ = await create_and_save_travel_card(
+            message.bot,
+            message.from_user.id,
+            payload,
+            caption_override=custom_text,
+        )
+    except Exception:
+        logger.exception("Custom travel card regeneration failed")
+        card_path = None
+
+    if not card_path:
+        await status.edit_text(
+            "🤔 Не получилось пересобрать открытку. Попробуй ещё раз позже."
+        )
+        await state.set_state(QuestForm.quest_finished)
+        return
+
+    payload["travel_ai_caption"] = original_ai_caption
+    payload["travel_caption"] = custom_text
+    payload["travel_card_path"] = card_path
+    db_update_completed_payload(record_id, payload)
+
+    await state.set_state(QuestForm.quest_finished)
+
+    with open(card_path, "rb") as f:
+        card_bytes = f.read()
+
+    await status.edit_text(
+        "✅ <b>Готово — теперь на открытке твои впечатления.</b>"
+    )
+
+    await message.answer_photo(
+        BufferedInputFile(
+            card_bytes,
+            filename="cityquest_travel_card.jpg",
+        ),
+        caption="✍️ <b>Открытка с твоими впечатлениями</b>",
+        reply_markup=travel_card_actions_keyboard(custom=True),
+    )
+
+
+@router.callback_query(F.data == "restore_ai_impression")
+async def restore_ai_impression(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+
+    record_id, payload = db_latest_completed_payload(callback.from_user.id)
+    if not payload:
+        await callback.message.answer("🤔 Завершённый квест не найден.")
+        return
+
+    ai_caption = str(
+        payload.get("travel_ai_caption")
+        or payload.get("travel_caption")
+        or ""
+    ).strip()
+
+    if not ai_caption:
+        await callback.message.answer(
+            "🤔 Исходный готовый текст для этой открытки не сохранился."
+        )
+        return
+
+    status = await callback.message.answer(
+        "↩️ <b>Возвращаю готовый вариант впечатлений…</b>"
+    )
+
+    try:
+        card_path, _ = await create_and_save_travel_card(
+            callback.bot,
+            callback.from_user.id,
+            payload,
+            caption_override=ai_caption,
+        )
+    except Exception:
+        logger.exception("Restore AI travel card failed")
+        card_path = None
+
+    if not card_path:
+        await status.edit_text("🤔 Не получилось пересобрать открытку.")
+        return
+
+    payload["travel_caption"] = ai_caption
+    payload["travel_ai_caption"] = ai_caption
+    payload["travel_card_path"] = card_path
+    db_update_completed_payload(record_id, payload)
+
+    with open(card_path, "rb") as f:
+        card_bytes = f.read()
+
+    await status.edit_text("✅ <b>Готовый вариант восстановлен.</b>")
+
+    await callback.message.answer_photo(
+        BufferedInputFile(
+            card_bytes,
+            filename="cityquest_travel_card.jpg",
+        ),
+        caption="✨ <b>Открытка с готовыми впечатлениями</b>",
+        reply_markup=travel_card_actions_keyboard(custom=False),
+    )
+
+
+@router.callback_query(F.data == "keep_ai_impression")
+async def keep_ai_impression(callback: CallbackQuery):
+    await callback.answer("Оставляем готовый текст ✨")
+    await callback.message.answer(
+        "✨ Готовый вариант впечатлений оставлен. "
+        "Позже его можно изменить через «Мои приключения»."
+    )
+
+
 @router.callback_query(F.data == "latest_card")
 async def latest_card(callback: CallbackQuery):
     await callback.answer()
-    path = db_latest_card(callback.from_user.id)
 
+    record_id, payload = db_latest_completed_payload(callback.from_user.id)
+    if not payload:
+        await callback.message.answer(
+            "🖼 Сохранённая travel-открытка не найдена."
+        )
+        return
+
+    path = payload.get("travel_card_path")
     if not path or not os.path.exists(path):
         await callback.message.answer(
             "🖼 Сохранённая travel-открытка не найдена."
         )
         return
+
+    current_caption = str(payload.get("travel_caption") or "").strip()
+    ai_caption = str(
+        payload.get("travel_ai_caption")
+        or current_caption
+    ).strip()
+    is_custom = bool(
+        current_caption
+        and ai_caption
+        and current_caption != ai_caption
+    )
 
     try:
         with open(path, "rb") as f:
@@ -4599,9 +4877,9 @@ async def latest_card(callback: CallbackQuery):
             ),
             caption=(
                 "🖼 <b>Последняя travel-открытка</b>\n\n"
-                "Ею можно поделиться через «Переслать» в Telegram."
+                "Текст блока «Впечатления» можно изменить."
             ),
-            reply_markup=travel_card_actions_keyboard(),
+            reply_markup=travel_card_actions_keyboard(custom=is_custom),
         )
     except Exception:
         logger.exception("Failed to send latest travel card")
@@ -4621,7 +4899,8 @@ async def about(callback: CallbackQuery):
         "• Vision AI разбирает фото, меню, надписи, символы, достопримечательности и памятники.\n"
         "• Если AI не уверен — бот даёт простую китайскую фразу, которую можно показать человеку.\n"
         "• Активный квест, прогресс, XP и фото сохраняются между перезапусками BotHost.\n"
-        "• После завершения квеста бот собирает travel-открытку из фото-трофеев."
+        "• После завершения квеста бот собирает travel-открытку из фото-трофеев.\n"
+        "• Блок «Впечатления» можно заменить своим текстом и вернуть готовый вариант."
     )
 
 
@@ -4634,7 +4913,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Starting CityQuest China v7.1 Photo Flow + Travel Card Redesign")
+    logger.info("Starting CityQuest China v7.3 Custom Impressions")
     await dp.start_polling(bot)
 
 
