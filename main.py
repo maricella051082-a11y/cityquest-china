@@ -8,6 +8,8 @@ import logging
 import math
 import os
 import re
+import sqlite3
+from datetime import datetime, timezone
 from typing import Any
 
 import aiohttp
@@ -31,6 +33,10 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.6-27b")
 
+DATA_DIR = os.getenv("DATA_DIR", "./data")
+DB_PATH = os.path.join(DATA_DIR, "cityquest.sqlite3")
+PERSISTENCE_OK = True
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 if not GEOAPIFY_API_KEY:
@@ -41,6 +47,265 @@ if not GROQ_API_KEY:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cityquest")
 router = Router()
+
+
+ACTIVE_DATA_KEYS = (
+    "quest",
+    "route",
+    "duration",
+    "city",
+    "style",
+    "interests",
+    "completed",
+    "bonuses",
+    "photos",
+)
+
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
+def init_persistence():
+    global PERSISTENCE_OK
+
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with db_connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS active_quests (
+                    user_id INTEGER PRIMARY KEY,
+                    data_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS completed_quests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    title TEXT,
+                    city TEXT,
+                    finished_at TEXT NOT NULL,
+                    xp INTEGER NOT NULL DEFAULT 0,
+                    photos INTEGER NOT NULL DEFAULT 0,
+                    data_json TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_completed_user_finished
+                ON completed_quests(user_id, finished_at DESC)
+                """
+            )
+        logger.info("Persistence ready: %s", DB_PATH)
+    except Exception:
+        PERSISTENCE_OK = False
+        logger.exception("Persistence initialization failed; bot will continue without DB")
+
+
+def active_payload(data):
+    return {
+        key: data.get(key)
+        for key in ACTIVE_DATA_KEYS
+        if key in data
+    }
+
+
+def db_save_active(user_id: int, data: dict):
+    if not PERSISTENCE_OK or not data.get("quest"):
+        return
+
+    payload = active_payload(data)
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO active_quests(user_id, data_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    data_json=excluded.data_json,
+                    updated_at=excluded.updated_at
+                """,
+                (int(user_id), raw, utc_now_iso()),
+            )
+    except Exception:
+        logger.exception("Failed to save active quest for user %s", user_id)
+
+
+def db_load_active(user_id: int):
+    if not PERSISTENCE_OK:
+        return None
+
+    try:
+        with db_connect() as conn:
+            row = conn.execute(
+                "SELECT data_json FROM active_quests WHERE user_id=?",
+                (int(user_id),),
+            ).fetchone()
+
+        if not row:
+            return None
+        return json.loads(row["data_json"])
+    except Exception:
+        logger.exception("Failed to load active quest for user %s", user_id)
+        return None
+
+
+def db_delete_active(user_id: int):
+    if not PERSISTENCE_OK:
+        return
+
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                "DELETE FROM active_quests WHERE user_id=?",
+                (int(user_id),),
+            )
+    except Exception:
+        logger.exception("Failed to delete active quest for user %s", user_id)
+
+
+def db_archive_completed(user_id: int, data: dict):
+    if not PERSISTENCE_OK or not data.get("quest"):
+        return
+
+    quest = data["quest"]
+    completed = data.get("completed", [])
+    bonuses = data.get("bonuses", [])
+    photos = data.get("photos", {})
+    city = data.get("city") or {}
+
+    xp = earned_xp(quest, completed, bonuses)
+    payload = active_payload(data)
+    payload["finished_at"] = utc_now_iso()
+
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO completed_quests(
+                    user_id, title, city, finished_at, xp, photos, data_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(user_id),
+                    str(quest.get("title") or "CityQuest"),
+                    str(
+                        city.get("input_name")
+                        or city.get("city")
+                        or city.get("name")
+                        or ""
+                    ),
+                    payload["finished_at"],
+                    int(xp),
+                    int(len(photos)),
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                ),
+            )
+            conn.execute(
+                "DELETE FROM active_quests WHERE user_id=?",
+                (int(user_id),),
+            )
+    except Exception:
+        logger.exception("Failed to archive quest for user %s", user_id)
+
+
+def db_completed_list(user_id: int, limit: int = 5):
+    if not PERSISTENCE_OK:
+        return []
+
+    try:
+        with db_connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, title, city, finished_at, xp, photos
+                FROM completed_quests
+                WHERE user_id=?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (int(user_id), int(limit)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+    except Exception:
+        logger.exception("Failed to list completed quests for user %s", user_id)
+        return []
+
+
+async def persist_active_state(user_id: int, state: FSMContext):
+    data = await state.get_data()
+    if data.get("quest"):
+        db_save_active(user_id, data)
+
+
+async def restore_active_state(user_id: int, state: FSMContext):
+    """
+    Restore MemoryStorage from SQLite after BotHost restart.
+    Returns the restored/current state data.
+    """
+    data = await state.get_data()
+    if data.get("quest"):
+        return data
+
+    saved = db_load_active(user_id)
+    if not saved or not saved.get("quest"):
+        return data
+
+    await state.clear()
+    await state.update_data(**saved)
+    await state.set_state(QuestForm.quest_active)
+    return await state.get_data()
+
+
+def active_quest_summary(data):
+    quest = data.get("quest") or {}
+    city = data.get("city") or {}
+    completed = data.get("completed", [])
+    bonuses = data.get("bonuses", [])
+    photos = data.get("photos", {})
+
+    title = str(quest.get("title") or "CityQuest")
+    city_name = str(
+        city.get("input_name")
+        or city.get("city")
+        or city.get("name")
+        or "Китай"
+    )
+    total = len(quest.get("stops", []))
+    xp = earned_xp(quest, completed, bonuses) if quest else 0
+
+    return (
+        f"🏮 <b>{esc(title)}</b>\n"
+        f"📍 {esc(city_name)}\n"
+        f"✅ Миссии: <b>{len(completed)}/{total}</b>\n"
+        f"⭐ XP: <b>{xp}</b>\n"
+        f"📷 Фото: <b>{len(photos)}</b>"
+    )
+
+
+def adventures_keyboard(has_active=False):
+    kb = InlineKeyboardBuilder()
+    if has_active:
+        kb.button(text="▶️ Продолжить активный квест", callback_data="resume_quest")
+    kb.button(text="🧭 Новый квест", callback_data="new_quest")
+    kb.button(text="🏠 Главное меню", callback_data="home")
+    kb.adjust(1)
+    return kb.as_markup()
 
 
 class QuestForm(StatesGroup):
@@ -537,8 +802,10 @@ def city_choices_keyboard(candidates, indexes=None):
     return kb.as_markup()
 
 
-def main_menu():
+def main_menu(has_active=False):
     kb = InlineKeyboardBuilder()
+    if has_active:
+        kb.button(text="▶️ Продолжить квест", callback_data="resume_quest")
     kb.button(text="🧭 Создать квест", callback_data="new_quest")
     kb.button(text="📷 Спросить по фото", callback_data="free_photo")
     kb.button(text="🎒 Мои приключения", callback_data="my_quests")
@@ -2602,6 +2869,7 @@ async def send_quest(message, state):
 
     await state.update_data(completed=[], bonuses=[], photos={})
     await state.set_state(QuestForm.quest_active)
+    await persist_active_state(message.from_user.id, state)
     await message.answer(
         checklist_text(quest, [], [], {}),
         reply_markup=checklist_keyboard(quest, []),
@@ -2611,13 +2879,29 @@ async def send_quest(message, state):
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext):
     await state.clear()
+    saved = db_load_active(message.from_user.id)
+
+    if saved and saved.get("quest"):
+        await state.update_data(**saved)
+        await state.set_state(QuestForm.quest_active)
+
     name = esc(message.from_user.first_name if message.from_user else "путешественник")
+
+    active_text = ""
+    if saved and saved.get("quest"):
+        active_text = (
+            "\n\n💾 <b>У тебя есть незавершённый квест.</b>\n"
+            "Он сохранён даже после перезапуска бота.\n\n"
+            f"{active_quest_summary(saved)}"
+        )
+
     await message.answer(
         f"🏮 <b>CityQuest China 城市奇遇</b>\n\n"
         f"Привет, {name}!\n\n"
-        "Я превращаю прогулку по китайскому городу в AI-квест: реальные места, маршрут, миссии, фото-трофеи и китайские фразы.\n\n"
+        "Я превращаю прогулку по китайскому городу в AI-квест: реальные места, маршрут, миссии, фото-трофеи и китайские фразы."
+        f"{active_text}\n\n"
         "С чего начнём?",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(has_active=bool(saved and saved.get("quest"))),
     )
 
 
@@ -2630,7 +2914,18 @@ async def newquest(message: Message, state: FSMContext):
 @router.message(Command("cancel"))
 async def cancel(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("Квест отменён.", reply_markup=main_menu())
+    saved = db_load_active(message.from_user.id)
+
+    if saved and saved.get("quest"):
+        await message.answer(
+            "Действие отменено. 💾 Незавершённый квест остался сохранён.",
+            reply_markup=main_menu(has_active=True),
+        )
+    else:
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=main_menu(),
+        )
 
 
 @router.callback_query(F.data == "new_quest")
@@ -2946,7 +3241,7 @@ async def style_cb(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("mission_toggle:"))
 async def mission_toggle(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
+    data = await restore_active_state(callback.from_user.id, state)
     quest = data.get("quest")
 
     if not quest:
@@ -2965,6 +3260,7 @@ async def mission_toggle(callback: CallbackQuery, state: FSMContext):
 
     completed = sorted(set(completed))
     await state.update_data(completed=completed)
+    await persist_active_state(callback.from_user.id, state)
     await callback.answer(msg)
 
     refreshed = await state.get_data()
@@ -2981,7 +3277,7 @@ async def mission_toggle(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("bonus_toggle:"))
 async def bonus_toggle(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
+    data = await restore_active_state(callback.from_user.id, state)
     quest = data.get("quest")
     idx = int(callback.data.split(":", 1)[1])
 
@@ -2998,13 +3294,14 @@ async def bonus_toggle(callback: CallbackQuery, state: FSMContext):
         msg = "Бонус +10 XP 🎁"
 
     await state.update_data(bonuses=sorted(set(bonuses)))
+    await persist_active_state(callback.from_user.id, state)
     await callback.answer(msg)
 
 
 @router.callback_query(F.data.startswith("photo_add:"))
 async def photo_add(callback: CallbackQuery, state: FSMContext):
     idx = int(callback.data.split(":", 1)[1])
-    data = await state.get_data()
+    data = await restore_active_state(callback.from_user.id, state)
     quest = data.get("quest")
 
     if not quest or idx >= len(quest["stops"]):
@@ -3026,7 +3323,7 @@ async def photo_add(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("photo_replace:"))
 async def photo_replace(callback: CallbackQuery, state: FSMContext):
     idx = int(callback.data.split(":", 1)[1])
-    data = await state.get_data()
+    data = await restore_active_state(callback.from_user.id, state)
     quest = data.get("quest")
 
     if not quest or idx < 0 or idx >= len(quest["stops"]):
@@ -3072,6 +3369,7 @@ async def receive_photo(message: Message, state: FSMContext):
 
     await state.update_data(photos=photos, photo_target=None)
     await state.set_state(QuestForm.quest_active)
+    await persist_active_state(message.from_user.id, state)
 
     stop = quest["stops"][idx]
     await message.answer(
@@ -3092,7 +3390,7 @@ async def vision_callback(callback: CallbackQuery, state: FSMContext):
     _, mode, idx_raw = callback.data.split(":", 2)
     idx = int(idx_raw)
 
-    data = await state.get_data()
+    data = await restore_active_state(callback.from_user.id, state)
     quest = data.get("quest")
     photos = data.get("photos", {})
     file_id = photos.get(str(idx))
@@ -3162,7 +3460,7 @@ async def phrase_callback(callback: CallbackQuery, state: FSMContext):
         f"💬 {esc(phrase['translation'])}"
     )
 
-    data = await state.get_data()
+    data = await restore_active_state(callback.from_user.id, state)
     quest = data.get("quest")
     if quest:
         await callback.message.answer(
@@ -3179,7 +3477,7 @@ async def phrase_callback(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("quest_stop:"))
 async def quest_stop_callback(callback: CallbackQuery, state: FSMContext):
     idx = int(callback.data.split(":", 1)[1])
-    data = await state.get_data()
+    data = await restore_active_state(callback.from_user.id, state)
     quest, route = data.get("quest"), data.get("route")
 
     if not quest or not route:
@@ -3196,7 +3494,7 @@ async def quest_stop_callback(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "show_checklist")
 async def show_checklist_callback(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
+    data = await restore_active_state(callback.from_user.id, state)
     quest = data.get("quest")
 
     if not quest:
@@ -3231,9 +3529,10 @@ async def free_photo_start(callback: CallbackQuery, state: FSMContext):
 async def home_callback(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.clear()
+    active = db_load_active(callback.from_user.id)
     await callback.message.answer(
         "🏠 <b>Главное меню</b>",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(has_active=bool(active and active.get("quest"))),
     )
 
 
@@ -3308,7 +3607,7 @@ async def vision_free_callback(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "quest_finish")
 async def quest_finish(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
+    data = await restore_active_state(callback.from_user.id, state)
     quest = data.get("quest")
     completed = set(data.get("completed", []))
 
@@ -3324,6 +3623,7 @@ async def quest_finish(callback: CallbackQuery, state: FSMContext):
     photos = data.get("photos", {})
 
     await callback.answer()
+    db_archive_completed(callback.from_user.id, data)
     await state.set_state(QuestForm.quest_finished)
 
     await callback.message.answer(
@@ -3336,12 +3636,99 @@ async def quest_finish(callback: CallbackQuery, state: FSMContext):
     )
 
 
-@router.callback_query(F.data == "my_quests")
-async def my_quests(callback: CallbackQuery):
+@router.callback_query(F.data == "resume_quest")
+async def resume_quest(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
+    saved = db_load_active(callback.from_user.id)
+
+    if not saved or not saved.get("quest"):
+        await callback.message.answer(
+            "💾 Сохранённого активного квеста сейчас нет.",
+            reply_markup=main_menu(),
+        )
+        return
+
+    await state.clear()
+    await state.update_data(**saved)
+    await state.set_state(QuestForm.quest_active)
+
+    quest = saved["quest"]
+    route = saved.get("route") or {"distance_m": 0, "time_s": 0, "legs": []}
+    completed = saved.get("completed", [])
+    bonuses = saved.get("bonuses", [])
+    photos = saved.get("photos", {})
+
     await callback.message.answer(
-        "🎒 <b>Мои приключения</b>\n\n"
-        "Пока активный квест и фото хранятся в памяти процесса. Постоянную историю подключим следующим этапом."
+        "▶️ <b>Продолжаем квест</b>\n\n"
+        f"{active_quest_summary(saved)}"
+    )
+
+    # Put the next unfinished mission at the bottom of the chat.
+    next_index = None
+    completed_set = set(completed)
+    for i in range(len(quest.get("stops", []))):
+        if i not in completed_set:
+            next_index = i
+            break
+
+    if next_index is not None:
+        await send_stop_card(
+            callback.message,
+            quest,
+            route,
+            next_index,
+        )
+        await callback.message.answer(
+            "🧭 <b>Навигация:</b>",
+            reply_markup=mission_nav_keyboard(quest, next_index),
+        )
+
+    await callback.message.answer(
+        checklist_text(quest, completed, bonuses, photos),
+        reply_markup=checklist_keyboard(quest, completed),
+    )
+
+
+@router.callback_query(F.data == "my_quests")
+async def my_quests(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+
+    active = db_load_active(callback.from_user.id)
+    history = db_completed_list(callback.from_user.id, limit=5)
+
+    lines = ["🎒 <b>Мои приключения</b>"]
+
+    if active and active.get("quest"):
+        lines += [
+            "",
+            "▶️ <b>Активный квест</b>",
+            active_quest_summary(active),
+        ]
+    else:
+        lines += ["", "Сейчас нет незавершённого квеста."]
+
+    if history:
+        lines += ["", "🏆 <b>Завершённые квесты</b>"]
+        for i, item in enumerate(history, 1):
+            city = item.get("city") or "Китай"
+            title = item.get("title") or "CityQuest"
+            lines += [
+                "",
+                f"<b>{i}. {esc(title)}</b>",
+                f"📍 {esc(city)} · ⭐ {int(item.get('xp') or 0)} XP · 📷 {int(item.get('photos') or 0)}",
+            ]
+    else:
+        lines += ["", "Завершённых квестов пока нет."]
+
+    if not PERSISTENCE_OK:
+        lines += [
+            "",
+            "⚠️ Постоянное хранилище сейчас недоступно; данные будут жить только до перезапуска.",
+        ]
+
+    await callback.message.answer(
+        "\n".join(lines),
+        reply_markup=adventures_keyboard(has_active=bool(active and active.get("quest"))),
     )
 
 
@@ -3354,18 +3741,21 @@ async def about(callback: CallbackQuery):
         "• Geoapify находит реальные места и проверяет пеший маршрут.\n"
         "• AI оформляет квест на русском.\n"
         "• Vision AI разбирает фото, меню, надписи, символы, достопримечательности и памятники.\n"
-        "• Если AI не уверен — бот даёт простую китайскую фразу, которую можно показать человеку."
+        "• Если AI не уверен — бот даёт простую китайскую фразу, которую можно показать человеку.\n"
+        "• Активный квест, прогресс, XP и фото сохраняются между перезапусками BotHost."
     )
 
 
 async def main():
+    init_persistence()
+
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Starting CityQuest China v5.3.3 Staged City Confirmation")
+    logger.info("Starting CityQuest China v6 Persistent Adventures")
     await dp.start_polling(bot)
 
 
