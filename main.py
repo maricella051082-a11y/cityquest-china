@@ -20,10 +20,11 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 from pypinyin import Style, lazy_pinyin
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 load_dotenv()
 
@@ -59,6 +60,8 @@ ACTIVE_DATA_KEYS = (
     "completed",
     "bonuses",
     "photos",
+    "travel_card_path",
+    "travel_caption",
 )
 
 
@@ -78,6 +81,7 @@ def init_persistence():
 
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
+        os.makedirs(os.path.join(DATA_DIR, "travel_cards"), exist_ok=True)
         with db_connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
@@ -242,6 +246,39 @@ def db_completed_list(user_id: int, limit: int = 5):
         return []
 
 
+def db_latest_card(user_id: int):
+    if not PERSISTENCE_OK:
+        return None
+
+    try:
+        with db_connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT data_json
+                FROM completed_quests
+                WHERE user_id=?
+                ORDER BY id DESC
+                LIMIT 10
+                """,
+                (int(user_id),),
+            ).fetchall()
+
+        for row in rows:
+            try:
+                payload = json.loads(row["data_json"])
+            except Exception:
+                continue
+
+            path = payload.get("travel_card_path")
+            if path and os.path.exists(path):
+                return path
+
+    except Exception:
+        logger.exception("Failed to load latest travel card for user %s", user_id)
+
+    return None
+
+
 async def persist_active_state(user_id: int, state: FSMContext):
     data = await state.get_data()
     if data.get("quest"):
@@ -288,10 +325,12 @@ def active_quest_summary(data):
     )
 
 
-def adventures_keyboard(has_active=False):
+def adventures_keyboard(has_active=False, has_card=False):
     kb = InlineKeyboardBuilder()
     if has_active:
         kb.button(text="▶️ Продолжить активный квест", callback_data="resume_quest")
+    if has_card:
+        kb.button(text="🖼 Последняя travel-открытка", callback_data="latest_card")
     kb.button(text="🧭 Новый квест", callback_data="new_quest")
     kb.button(text="🏠 Главное меню", callback_data="home")
     kb.adjust(1)
@@ -2882,6 +2921,363 @@ def followup_phrase_keys(mode):
     return []
 
 
+TRAVEL_CAPTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "caption": {"type": "string"},
+    },
+    "required": ["caption"],
+    "additionalProperties": False,
+}
+
+
+async def generate_travel_caption(data):
+    quest = data.get("quest") or {}
+    city = data.get("city") or {}
+    completed = data.get("completed") or []
+    photos = data.get("photos") or {}
+    interests = data.get("interests") or []
+
+    interest_text = ", ".join(
+        INTERESTS.get(key, {}).get("label", key)
+        for key in interests
+    )
+
+    prompt = f"""
+Ты пишешь одну короткую подпись для travel-открытки после городского квеста.
+Только по-русски. Без Markdown, без кавычек, без хэштегов.
+Не перечисляй статистику: она будет отдельно.
+Тон: тёплый, живой, как личная заметка из путешествия.
+Не придумывай факты о городе и местах.
+Длина: максимум 110 символов.
+
+Город: {city_display_ru(city)}
+Название квеста: {quest.get('title') or 'CityQuest'}
+Интересы: {interest_text}
+Выполнено миссий: {len(completed)}
+Фото: {len(photos)}
+""".strip()
+
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Верни только русский JSON по заданной схеме.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "reasoning_effort": "low",
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "travel_card_caption",
+                "strict": True,
+                "schema": TRAVEL_CAPTION_SCHEMA,
+            },
+        },
+        "temperature": 0.7,
+    }
+
+    timeout = aiohttp.ClientTimeout(total=35)
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, headers=headers, json=payload) as response:
+                body = await response.text()
+                if response.status != 200:
+                    raise RuntimeError(f"Caption API HTTP {response.status}")
+
+                data_json = json.loads(body)
+                result = json.loads(
+                    data_json["choices"][0]["message"]["content"]
+                )
+                caption = str(result.get("caption") or "").strip()
+                caption = re.sub(r"[#*_`<>]", "", caption)
+                if caption:
+                    return caption[:140]
+    except Exception:
+        logger.exception("Travel caption generation failed")
+
+    return "Маленькое путешествие, которое получилось увидеть своими глазами."
+
+
+def load_card_font(size, bold=False):
+    candidates = []
+
+    if bold:
+        candidates.extend([
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        ])
+    else:
+        candidates.extend([
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ])
+
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size=size)
+            except Exception:
+                pass
+
+    return ImageFont.load_default()
+
+
+def wrap_by_pixels(draw, text_value, font, max_width):
+    words = str(text_value or "").split()
+    if not words:
+        return []
+
+    lines = []
+    current = words[0]
+
+    for word in words[1:]:
+        trial = current + " " + word
+        box = draw.textbbox((0, 0), trial, font=font)
+        if box[2] - box[0] <= max_width:
+            current = trial
+        else:
+            lines.append(current)
+            current = word
+
+    lines.append(current)
+    return lines
+
+
+def rounded_photo(source, size, radius=28):
+    fitted = ImageOps.fit(
+        source.convert("RGB"),
+        size,
+        method=Image.Resampling.LANCZOS,
+        centering=(0.5, 0.5),
+    )
+
+    mask = Image.new("L", size, 0)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.rounded_rectangle(
+        (0, 0, size[0], size[1]),
+        radius=radius,
+        fill=255,
+    )
+
+    output = Image.new("RGB", size, (246, 241, 231))
+    output.paste(fitted, (0, 0), mask)
+    return output
+
+
+def photo_layout_boxes(count):
+    x0, y0 = 70, 360
+    width, height = 940, 650
+    gap = 16
+
+    if count <= 1:
+        return [(x0, y0, width, height)]
+
+    if count == 2:
+        w = (width - gap) // 2
+        return [
+            (x0, y0, w, height),
+            (x0 + w + gap, y0, w, height),
+        ]
+
+    if count == 3:
+        top_h = 390
+        bottom_h = height - top_h - gap
+        bottom_w = (width - gap) // 2
+        return [
+            (x0, y0, width, top_h),
+            (x0, y0 + top_h + gap, bottom_w, bottom_h),
+            (x0 + bottom_w + gap, y0 + top_h + gap, bottom_w, bottom_h),
+        ]
+
+    if count == 4:
+        w = (width - gap) // 2
+        h = (height - gap) // 2
+        return [
+            (x0, y0, w, h),
+            (x0 + w + gap, y0, w, h),
+            (x0, y0 + h + gap, w, h),
+            (x0 + w + gap, y0 + h + gap, w, h),
+        ]
+
+    # 5 photos: 2 large above + 3 below.
+    top_h = 340
+    bottom_h = height - top_h - gap
+    top_w = (width - gap) // 2
+    bottom_w = (width - 2 * gap) // 3
+    return [
+        (x0, y0, top_w, top_h),
+        (x0 + top_w + gap, y0, top_w, top_h),
+        (x0, y0 + top_h + gap, bottom_w, bottom_h),
+        (x0 + bottom_w + gap, y0 + top_h + gap, bottom_w, bottom_h),
+        (x0 + 2 * (bottom_w + gap), y0 + top_h + gap, bottom_w, bottom_h),
+    ]
+
+
+def render_travel_card(data, photo_images, caption):
+    width, height = 1080, 1350
+    bg = (247, 242, 232)
+    ink = (45, 45, 42)
+    muted = (104, 100, 92)
+    red = (164, 61, 50)
+    gold = (181, 143, 70)
+    line = (220, 211, 194)
+
+    image = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(image)
+
+    title_font = load_card_font(54, bold=True)
+    city_font = load_card_font(38, bold=True)
+    label_font = load_card_font(23, bold=True)
+    stat_font = load_card_font(25, bold=True)
+    body_font = load_card_font(27, bold=False)
+    footer_font = load_card_font(20, bold=False)
+
+    quest = data.get("quest") or {}
+    city = data.get("city") or {}
+    route = data.get("route") or {}
+    completed = data.get("completed") or []
+    bonuses = data.get("bonuses") or []
+
+    title = str(quest.get("title") or "CityQuest China")
+    city_name = city_display_ru(city)
+    xp = earned_xp(quest, completed, bonuses) if quest else 0
+    distance = fmt_distance(float(route.get("distance_m") or 0))
+    duration = str(data.get("duration") or "")
+
+    # Header decoration.
+    draw.rounded_rectangle((70, 55, 306, 103), radius=24, fill=red)
+    draw.text((91, 67), "CITYQUEST CHINA", font=label_font, fill=(255, 250, 242))
+    draw.ellipse((932, 54, 978, 100), fill=gold)
+    draw.ellipse((987, 54, 1018, 85), outline=red, width=5)
+
+    y = 135
+    draw.text((70, y), city_name, font=city_font, fill=red)
+    y += 58
+
+    title_lines = wrap_by_pixels(draw, title, title_font, 930)[:2]
+    for line_text in title_lines:
+        draw.text((70, y), line_text, font=title_font, fill=ink)
+        y += 64
+
+    # Stats row.
+    stats_y = 292
+    draw.line((70, stats_y - 18, 1010, stats_y - 18), fill=line, width=2)
+    stats = [
+        f"✓ {len(completed)}/{len(quest.get('stops', []))} миссий",
+        f"★ {xp} XP",
+        f"↟ {distance}",
+        f"◷ {duration}",
+    ]
+
+    x_positions = [70, 315, 550, 775]
+    for x, value in zip(x_positions, stats):
+        draw.text((x, stats_y), value, font=stat_font, fill=muted)
+
+    # Photo area.
+    count = min(len(photo_images), 5)
+    boxes = photo_layout_boxes(max(count, 1))
+
+    if count:
+        for photo, box in zip(photo_images[:5], boxes):
+            x, yb, w, h = box
+            card = rounded_photo(photo, (w, h), radius=26)
+            image.paste(card, (x, yb))
+    else:
+        # Text-only fallback.
+        x, yb, w, h = boxes[0]
+        draw.rounded_rectangle((x, yb, x + w, yb + h), radius=28, outline=line, width=3)
+        placeholder_font = load_card_font(36, bold=True)
+        draw.text((x + 115, yb + 270), "Фото-трофеи появятся здесь", font=placeholder_font, fill=muted)
+
+    # Caption block.
+    cap_top = 1045
+    draw.line((70, cap_top, 1010, cap_top), fill=line, width=2)
+    draw.text((70, cap_top + 32), "МОЯ ЗАМЕТКА", font=label_font, fill=gold)
+
+    cap_lines = wrap_by_pixels(draw, caption, body_font, 920)[:4]
+    cy = cap_top + 76
+    for line_text in cap_lines:
+        draw.text((70, cy), line_text, font=body_font, fill=ink)
+        cy += 39
+
+    draw.text(
+        (70, 1302),
+        "CityQuest China · AI-квест по реальным местам Китая",
+        font=footer_font,
+        fill=muted,
+    )
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=92, optimize=True)
+    return buffer.getvalue()
+
+
+async def collect_card_photos(bot, photos):
+    images = []
+
+    def sort_key(item):
+        key, _ = item
+        try:
+            return int(key)
+        except Exception:
+            return 999
+
+    for _, file_id in sorted(photos.items(), key=sort_key)[:5]:
+        try:
+            tg_file = await bot.get_file(file_id)
+            buffer = io.BytesIO()
+            await bot.download_file(tg_file.file_path, destination=buffer)
+            buffer.seek(0)
+            images.append(Image.open(buffer).convert("RGB"))
+        except Exception:
+            logger.exception("Failed to download card photo")
+
+    return images
+
+
+async def create_and_save_travel_card(bot, user_id, data):
+    photos = data.get("photos") or {}
+    if not photos:
+        return None, None
+
+    caption = await generate_travel_caption(data)
+    images = await collect_card_photos(bot, photos)
+
+    if not images:
+        return None, None
+
+    card_bytes = render_travel_card(data, images, caption)
+
+    cards_dir = os.path.join(DATA_DIR, "travel_cards")
+    os.makedirs(cards_dir, exist_ok=True)
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(cards_dir, f"{int(user_id)}_{stamp}.jpg")
+
+    with open(path, "wb") as f:
+        f.write(card_bytes)
+
+    return path, caption
+
+
+def travel_card_actions_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🎒 Мои приключения", callback_data="my_quests")
+    kb.button(text="🧭 Новый квест", callback_data="new_quest")
+    kb.button(text="🏠 Главное меню", callback_data="home")
+    kb.adjust(1)
+    return kb.as_markup()
 def route_summary(route, quest, duration):
     walk = route["time_s"] / 60
     missions = sum(int(s["mission"].get("minutes", 12)) for s in quest["stops"])
@@ -3723,6 +4119,33 @@ async def quest_finish(callback: CallbackQuery, state: FSMContext):
     photos = data.get("photos", {})
 
     await callback.answer()
+
+    card_status = None
+    card_path = None
+    travel_caption = None
+
+    if photos:
+        card_status = await callback.message.answer(
+            "🎨 <b>Собираю твою travel-открытку…</b>\n"
+            "Использую фото-трофеи из этого квеста."
+        )
+
+        try:
+            card_path, travel_caption = await create_and_save_travel_card(
+                callback.bot,
+                callback.from_user.id,
+                data,
+            )
+        except Exception:
+            logger.exception("Travel card generation failed")
+
+        if card_path:
+            await state.update_data(
+                travel_card_path=card_path,
+                travel_caption=travel_caption,
+            )
+            data = await state.get_data()
+
     db_archive_completed(callback.from_user.id, data)
     await state.set_state(QuestForm.quest_finished)
 
@@ -3731,9 +4154,38 @@ async def quest_finish(callback: CallbackQuery, state: FSMContext):
         f"✅ Миссии: <b>{len(completed)}/{len(quest['stops'])}</b>\n"
         f"⭐ XP: <b>{earned_xp(quest, completed, bonuses)}/{total_xp(quest)}</b>\n"
         f"📷 Фото-трофеи: <b>{len(photos)}</b>\n\n"
-        f"🎁 <b>Финальный штрих:</b> {esc(quest['final_challenge'])}\n\n"
-        "Следующий этап — собрать фото в красивую travel-открытку."
+        f"🎁 <b>Финальный штрих:</b> {esc(quest['final_challenge'])}"
     )
+
+    if card_path and os.path.exists(card_path):
+        if card_status:
+            await card_status.edit_text("✅ <b>Travel-открытка готова!</b>")
+
+        with open(card_path, "rb") as f:
+            card_bytes = f.read()
+
+        await callback.message.answer_photo(
+            BufferedInputFile(
+                card_bytes,
+                filename="cityquest_travel_card.jpg",
+            ),
+            caption=(
+                "🖼 <b>Твоя travel-открытка</b>\n\n"
+                "Ею можно поделиться обычной кнопкой Telegram «Переслать»."
+            ),
+            reply_markup=travel_card_actions_keyboard(),
+        )
+    elif photos:
+        if card_status:
+            await card_status.edit_text(
+                "🤔 Квест сохранён, но открытку сейчас собрать не получилось. "
+                "Попробуем ещё раз из «Моих приключений» позже."
+            )
+    else:
+        await callback.message.answer(
+            "📷 В этом квесте не было фото-трофеев, поэтому фотоколлаж не создавался.",
+            reply_markup=travel_card_actions_keyboard(),
+        )
 
 
 @router.callback_query(F.data == "resume_quest")
@@ -3826,10 +4278,48 @@ async def my_quests(callback: CallbackQuery, state: FSMContext):
             "⚠️ Постоянное хранилище сейчас недоступно; данные будут жить только до перезапуска.",
         ]
 
+    latest_card = db_latest_card(callback.from_user.id)
+
     await callback.message.answer(
         "\n".join(lines),
-        reply_markup=adventures_keyboard(has_active=bool(active and active.get("quest"))),
+        reply_markup=adventures_keyboard(
+            has_active=bool(active and active.get("quest")),
+            has_card=bool(latest_card),
+        ),
     )
+
+
+@router.callback_query(F.data == "latest_card")
+async def latest_card(callback: CallbackQuery):
+    await callback.answer()
+    path = db_latest_card(callback.from_user.id)
+
+    if not path or not os.path.exists(path):
+        await callback.message.answer(
+            "🖼 Сохранённая travel-открытка не найдена."
+        )
+        return
+
+    try:
+        with open(path, "rb") as f:
+            card_bytes = f.read()
+
+        await callback.message.answer_photo(
+            BufferedInputFile(
+                card_bytes,
+                filename="cityquest_travel_card.jpg",
+            ),
+            caption=(
+                "🖼 <b>Последняя travel-открытка</b>\n\n"
+                "Ею можно поделиться через «Переслать» в Telegram."
+            ),
+            reply_markup=travel_card_actions_keyboard(),
+        )
+    except Exception:
+        logger.exception("Failed to send latest travel card")
+        await callback.message.answer(
+            "🤔 Не получилось открыть сохранённую открытку."
+        )
 
 
 @router.callback_query(F.data == "about")
@@ -3842,7 +4332,8 @@ async def about(callback: CallbackQuery):
         "• AI оформляет квест на русском.\n"
         "• Vision AI разбирает фото, меню, надписи, символы, достопримечательности и памятники.\n"
         "• Если AI не уверен — бот даёт простую китайскую фразу, которую можно показать человеку.\n"
-        "• Активный квест, прогресс, XP и фото сохраняются между перезапусками BotHost."
+        "• Активный квест, прогресс, XP и фото сохраняются между перезапусками BotHost.\n"
+        "• После завершения квеста бот собирает travel-открытку из фото-трофеев."
     )
 
 
@@ -3855,7 +4346,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Starting CityQuest China v6.1 Russian City Names")
+    logger.info("Starting CityQuest China v7 Travel Card Finale")
     await dp.start_polling(bot)
 
 
