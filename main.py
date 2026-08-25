@@ -1135,20 +1135,30 @@ def mission_for_place(place, interests, index, used_titles):
         variants = [
             {
                 "type": "market",
-                "title": "Что здесь самое необычное?",
-                "text": "Найди три вещи, блюда, упаковки или вывески, которых обычно не видишь дома. Выбери одну как трофей улицы.",
-                "tip": "Не фотографируй людей крупным планом без разрешения.",
-                "photo": "Сфотографируй выбранный трофей или его название.",
+                "title": "Выбери свой трофей рынка",
+                "text": (
+                    "Выбери ОДИН из двух путей:\n"
+                    "🍜 ЕДА — найди незнакомое блюдо, напиток или строку меню;\n"
+                    "🧧 ПРЕДМЕТ — найди необычный товар, декор, барабан, фонарь, вывеску, упаковку или другой интересный объект.\n"
+                    "Тебе не нужно искать еду, если интереснее что-то другое."
+                ),
+                "tip": (
+                    "После загрузки фото бот сначала даст подходящие варианты анализа: "
+                    "для еды — состав и острота, для предмета — что это, символика и надписи."
+                ),
+                "photo": "Сфотографируй выбранный трофей: еду/меню ИЛИ интересный предмет/декор/вывеску.",
                 "xp": 20,
                 "minutes": 12,
-                "phrase": PHRASES["what"],
             },
             {
                 "type": "market",
-                "title": "Одна непонятная вывеска",
-                "text": "Найди короткую надпись или название товара, которое тебе совершенно непонятно.",
-                "tip": "Загрузи фото — AI попробует прочитать китайский текст и объяснить его.",
-                "photo": "Сними надпись достаточно близко и ровно.",
+                "title": "Одна непонятная находка",
+                "text": (
+                    "Найди то, что хочется расшифровать: блюдо, предмет, вывеску, символ или необычный декор. "
+                    "Сфотографируй находку и попроси AI помочь разобраться."
+                ),
+                "tip": "Не фотографируй людей крупным планом без разрешения.",
+                "photo": "Сними объект или надпись достаточно близко, чтобы детали были видны.",
                 "xp": 20,
                 "minutes": 10,
             },
@@ -1360,7 +1370,10 @@ def mission_nav_keyboard(quest, idx):
         row.append(InlineKeyboardButton(text=f"{idx+2} ➡️", callback_data=f"quest_stop:{idx+1}"))
 
     kb.row(*row)
-    kb.row(InlineKeyboardButton(text="✅ Чек-лист", callback_data="show_checklist"))
+    kb.row(
+        InlineKeyboardButton(text="🔄 Другое фото", callback_data=f"photo_replace:{idx}"),
+        InlineKeyboardButton(text="✅ Чек-лист", callback_data="show_checklist"),
+    )
     return kb.as_markup()
 
 
@@ -1414,22 +1427,33 @@ def photo_actions_keyboard(stop, index):
     group = place_group(stop["place"])
     kb = InlineKeyboardBuilder()
 
-    if group in {"restaurant", "cafe", "tea", "market"}:
+    if group in {"restaurant", "cafe", "tea"}:
         kb.button(text="🍜 Что на фото / в меню?", callback_data=f"vision:menu:{index}")
         kb.button(text="🌶 Острое или нет?", callback_data=f"vision:spicy:{index}")
         kb.button(text="🥢 Из чего это?", callback_data=f"vision:ingredients:{index}")
         kb.button(text="🔤 Прочитать / перевести", callback_data=f"vision:text:{index}")
+
+    elif group == "market":
+        # Market is not automatically a food stop.
+        kb.button(text="🍜 Это еда / меню", callback_data=f"vision:menu:{index}")
+        kb.button(text="🧧 Это предмет / символ", callback_data=f"vision:monument:{index}")
+        kb.button(text="🏮 Что здесь традиционного?", callback_data=f"vision:tradition:{index}")
+        kb.button(text="🔤 Прочитать / перевести", callback_data=f"vision:text:{index}")
+        kb.button(text="🏯 Что это за место?", callback_data=f"vision:place:{index}")
+
     elif group in {"heritage", "temple"}:
         kb.button(text="🏯 Что это за место?", callback_data=f"vision:place:{index}")
         kb.button(text="🗿 Что за памятник / объект?", callback_data=f"vision:monument:{index}")
         kb.button(text="🧠 Что за символ?", callback_data=f"vision:symbol:{index}")
         kb.button(text="🏮 Что здесь традиционного?", callback_data=f"vision:tradition:{index}")
         kb.button(text="🔤 Что написано?", callback_data=f"vision:text:{index}")
+
     elif group == "museum":
         kb.button(text="🏯 Что это за место?", callback_data=f"vision:place:{index}")
         kb.button(text="🗿 Что за объект?", callback_data=f"vision:monument:{index}")
         kb.button(text="🧠 Что можно понять по фото?", callback_data=f"vision:object:{index}")
         kb.button(text="🔤 Прочитать надпись", callback_data=f"vision:text:{index}")
+
     else:
         kb.button(text="🏯 Что это за место?", callback_data=f"vision:place:{index}")
         kb.button(text="🗿 Что за памятник / объект?", callback_data=f"vision:monument:{index}")
@@ -1437,6 +1461,7 @@ def photo_actions_keyboard(stop, index):
         kb.button(text="📸 Оценить кадр", callback_data=f"vision:photo:{index}")
         kb.button(text="🔤 Что написано?", callback_data=f"vision:text:{index}")
 
+    kb.button(text="🔄 Другое фото", callback_data=f"photo_replace:{index}")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -1451,6 +1476,7 @@ def free_photo_actions_keyboard():
     kb.button(text="🏮 Что за символ?", callback_data="visionfree:symbol")
     kb.button(text="🔤 Прочитать / перевести", callback_data="visionfree:text")
     kb.button(text="📸 Оценить кадр", callback_data="visionfree:photo")
+    kb.button(text="🔄 Другое фото", callback_data="free_photo")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -2077,6 +2103,28 @@ async def photo_add(callback: CallbackQuery, state: FSMContext):
     )
 
 
+
+@router.callback_query(F.data.startswith("photo_replace:"))
+async def photo_replace(callback: CallbackQuery, state: FSMContext):
+    idx = int(callback.data.split(":", 1)[1])
+    data = await state.get_data()
+    quest = data.get("quest")
+
+    if not quest or idx < 0 or idx >= len(quest["stops"]):
+        await callback.answer("Миссия не найдена.", show_alert=True)
+        return
+
+    await callback.answer()
+    await state.update_data(photo_target=idx)
+    await state.set_state(QuestForm.waiting_photo)
+
+    await callback.message.answer(
+        f"🔄 <b>Другое фото для {idx+1}. {esc(quest['stops'][idx]['name_ru'])}</b>\n\n"
+        "Пришли новый снимок. Он заменит предыдущее фото этой миссии, "
+        "и следующие AI-вопросы будут относиться уже к новому снимку."
+    )
+
+
 @router.message(Command("cancelphoto"))
 async def cancelphoto(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -2109,7 +2157,8 @@ async def receive_photo(message: Message, state: FSMContext):
     stop = quest["stops"][idx]
     await message.answer(
         f"📷 <b>Фото сохранено: {esc(stop['name_ru'])}</b>\n\n"
-        "Что сделать с фотографией?",
+        "Выбери, что именно нужно узнать по ЭТОМУ снимку. "
+        "Если прислал не то — нажми «🔄 Другое фото».",
         reply_markup=photo_actions_keyboard(stop, idx),
     )
 
@@ -2187,7 +2236,7 @@ async def phrase_callback(callback: CallbackQuery, state: FSMContext):
 
     await callback.answer()
     await callback.message.answer(
-        "📱 <b>ПОКАЖИ ЭКРАН СОТРУДНИКУ</b>\n\n"
+        "📱 <b>ПОКАЖИ ЭКРАН СОТРУДНИКУ ИЛИ СПРОСИ САМ</b>\n\n"
         f"<b>{esc(phrase['hanzi'])}</b>\n\n"
         f"🔤 <i>{esc(phrase['pinyin'])}</i>\n"
         f"🗣 Примерно: <b>{esc(phrase['ru'])}</b>\n"
@@ -2397,7 +2446,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Starting CityQuest China v4 Photo Travel Assistant")
+    logger.info("Starting CityQuest China v4.1 market photo choice + replace photo")
     await dp.start_polling(bot)
 
 
