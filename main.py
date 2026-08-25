@@ -424,6 +424,42 @@ def is_food_group(group):
     return group in {"restaurant", "tea", "cafe"}
 
 
+GLOBAL_CHAIN_PATTERNS = [
+    "starbucks", "星巴克",
+    "mcdonald", "麦当劳",
+    "kfc", "肯德基",
+    "pizza hut", "必胜客",
+    "burger king", "汉堡王",
+    "subway",
+    "costa",
+]
+
+
+def is_global_chain(place):
+    name = str(place.get("name") or "").casefold()
+    return any(pattern.casefold() in name for pattern in GLOBAL_CHAIN_PATTERNS)
+
+
+def prefer_local_places(places):
+    """
+    Keep chains as fallback for sparse cities, but if we have enough local POIs,
+    remove global chains from the candidate pool.
+    """
+    if not places:
+        return places
+
+    local = [p for p in places if not is_global_chain(p)]
+    chains = [p for p in places if is_global_chain(p)]
+
+    # If there are enough local candidates and enough category diversity,
+    # don't let a familiar global chain displace a more useful local stop.
+    if len(local) >= 5 and len({place_group(p) for p in local}) >= 3:
+        return local
+
+    # Sparse city: keep chains at the END as emergency fallbacks.
+    return local + chains
+
+
 def is_outdoor_social_place(place):
     return place_group(place) in {"park", "market", "heritage", "temple", "viewpoint", "art", "other"}
 
@@ -836,7 +872,7 @@ async def search_places(city, interests, duration):
         primary_places = merge_place_results(primary_results, primary_sources, max_items=28)
 
         if not pool_needs_broadening(primary_places):
-            return primary_places
+            return prefer_local_places(primary_places)
 
         # Sparse map: search broad, safe categories in the same city.
         fallback_results = await asyncio.gather(*[
@@ -846,7 +882,7 @@ async def search_places(city, interests, duration):
 
     all_sources = primary_sources + FALLBACK_DISCOVERY_SOURCES
     all_results = primary_results + list(fallback_results)
-    return merge_place_results(all_results, all_sources, max_items=32)
+    return prefer_local_places(merge_place_results(all_results, all_sources, max_items=32))
 
 
 def suggested_mode_from_pool(places):
@@ -1274,9 +1310,15 @@ def reason_for_place(place, interests):
     matches = set(place.get("interest_matches") or [])
     chosen = set(interests)
 
-    primary = {
-        "restaurant": "Познакомиться с местной кухней",
-        "cafe": "Сделать гастрономическую паузу и посмотреть местное меню",
+    if is_global_chain(place):
+        primary = (
+            "Знакомая сетевая точка как запасная гастрономическая пауза; "
+            "можно сравнить меню с тем, что знакомо дома"
+        )
+    else:
+        primary = {
+        "restaurant": "Познакомиться с кухней города через меню и незнакомые блюда",
+        "cafe": "Сделать гастрономическую паузу и исследовать меню",
         "tea": "Познакомиться с китайской чайной культурой",
         "market": "Увидеть город через еду, вывески и повседневную жизнь",
         "museum": "Добавить в маршрут историю, культуру и реальные экспонаты",
@@ -1286,7 +1328,7 @@ def reason_for_place(place, interests):
         "art": "Добавить современное или традиционное искусство",
         "viewpoint": "Посмотреть на город с выразительного ракурса",
         "other": "Добавить в маршрут необычную городскую точку",
-    }.get(group, "Добавить в маршрут новый тип впечатления")
+        }.get(group, "Добавить в маршрут новый тип впечатления")
 
     # Add only compatible selected interests.
     compatible = []
@@ -1436,8 +1478,15 @@ def mission_for_place(place, interests, index, used_titles):
             {
                 "type": "food",
                 "title": "Местный выбор",
-                "text": "Найди в меню две незнакомые позиции и выбери одну, которую попробовал бы первой.",
-                "tip": "Загрузи меню: AI попробует прочитать подпись и примерно определить блюдо. Если информации мало — предложит вопрос сотруднику.",
+                "text": (
+                    "Найди в меню две незнакомые позиции и выбери одну, которую попробовал бы первой. "
+                    "Покупать её не обязательно."
+                ),
+                "tip": (
+                    "Если меню непонятно, сфотографируй название или строку меню. "
+                    "Бот попробует прочитать подпись, объяснить блюдо по-русски и, если нужно, "
+                    "предложит короткий вопрос сотруднику."
+                ),
                 "photo": "Сохрани фото меню или названия выбранного блюда.",
                 "xp": 20,
                 "minutes": 12,
@@ -1446,15 +1495,39 @@ def mission_for_place(place, interests, index, used_titles):
             {
                 "type": "food",
                 "title": "Острое или нет?",
-                "text": "Выбери одно незнакомое блюдо и попробуй понять по названию или меню, острое ли оно.",
-                "tip": "По фото бот может проверить слова 辣, 麻辣, 香辣. Если неясно — покажет вопрос 这个辣不辣？",
-                "photo": "Сфотографируй название или строку меню.",
+                "text": (
+                    "Выбери одно незнакомое блюдо и попробуй выяснить, острое ли оно. "
+                    "Самому читать китайские иероглифы не нужно."
+                ),
+                "tip": (
+                    "Сфотографируй название блюда или строку меню. Бот сам попробует понять, "
+                    "есть ли признаки острого блюда. Если по фото это неясно — он даст простой вопрос, "
+                    "который можно показать сотруднику или произнести самому."
+                ),
+                "photo": "Сфотографируй название блюда или подходящую строку меню.",
                 "xp": 20,
                 "minutes": 10,
                 "phrase": PHRASES["spicy"],
             },
+            {
+                "type": "food",
+                "title": "Что внутри?",
+                "text": (
+                    "Выбери незнакомое блюдо и попробуй понять, из чего оно приготовлено: "
+                    "мясо, рыба, овощи или что-то другое."
+                ),
+                "tip": (
+                    "Сфотографируй название или меню. Бот попробует объяснить состав простыми словами. "
+                    "Если информации недостаточно — предложит короткий вопрос сотруднику."
+                ),
+                "photo": "Сфотографируй название блюда или строку меню.",
+                "xp": 20,
+                "minutes": 10,
+                "phrase": PHRASES["inside"],
+            },
         ]
         mission = choose_unused_variant(variants, used_titles)
+
 
     elif group == "market":
         variants = [
@@ -2978,7 +3051,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Starting CityQuest China v5.1 City Disambiguation + Adaptive Engine")
+    logger.info("Starting CityQuest China v5.2 Clear Food Missions + Local POI Preference")
     await dp.start_polling(bot)
 
 
