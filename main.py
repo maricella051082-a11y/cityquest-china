@@ -68,6 +68,20 @@ INTERESTS = {
 
 REST_CATEGORIES = ["catering.cafe.tea", "catering.cafe"]
 
+FALLBACK_DISCOVERY_SOURCES = [
+    ("fallback_history", ["tourism.sights", "heritage", "entertainment.museum", "tourism.sights.place_of_worship"]),
+    ("fallback_nature", ["leisure.park", "leisure.park.garden", "natural"]),
+    ("fallback_local", ["commercial.marketplace"]),
+    ("fallback_food", ["catering.restaurant", "catering.cafe", "catering.fast_food"]),
+    ("fallback_culture", ["entertainment.culture", "tourism.attraction.artwork", "tourism.attraction.viewpoint"]),
+]
+
+ADAPTIVE_MODE_LABELS = {
+    "rich": "🟢 Полный городской квест",
+    "compact": "🟡 Компактный квест",
+    "explorer": "🟠 Исследовательский квест",
+}
+
 STYLE_LABELS = {
     "calm": "😌 Спокойно",
     "explorer": "🔎 Исследователь",
@@ -633,22 +647,11 @@ async def fetch_places_source(session, city, source_key, categories, limit=20):
     return output
 
 
-async def search_places(city, interests, duration):
-    sources = [(key, INTERESTS[key]["categories"]) for key in interests]
-    if duration != "2 часа" and "tea" not in interests and "food" not in interests:
-        sources.append(("rest", REST_CATEGORIES))
-
-    timeout = aiohttp.ClientTimeout(total=35)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        results = await asyncio.gather(*[
-            fetch_places_source(session, city, key, cats)
-            for key, cats in sources
-        ])
-
+def merge_place_results(result_sets, source_defs, max_items=32):
     merged = {}
-    per_source = {key: [] for key, _ in sources}
+    per_source = {key: [] for key, _ in source_defs}
 
-    for (source_key, _), places in zip(sources, results):
+    for (source_key, _), places in zip(source_defs, result_sets):
         for place in places:
             unique = place.get("place_id") or f"{place['name']}:{place['lat']:.5f}:{place['lon']:.5f}"
             if unique in merged:
@@ -656,25 +659,112 @@ async def search_places(city, interests, duration):
                     merged[unique]["interest_matches"].append(source_key)
             else:
                 merged[unique] = place
+
             if unique not in per_source[source_key]:
                 per_source[source_key].append(unique)
 
     ordered, seen = [], set()
-    for pos in range(14):
-        for source_key, _ in sources:
+
+    # Round-robin prevents one broad category from taking over the pool.
+    for pos in range(20):
+        for source_key, _ in source_defs:
             arr = per_source[source_key]
             if pos < len(arr) and arr[pos] not in seen:
                 seen.add(arr[pos])
                 ordered.append(arr[pos])
-            if len(ordered) >= 24:
+            if len(ordered) >= max_items:
                 break
-        if len(ordered) >= 24:
+        if len(ordered) >= max_items:
             break
 
     for key in merged:
-        if key not in seen and len(ordered) < 24:
+        if key not in seen and len(ordered) < max_items:
             ordered.append(key)
+
     return [merged[k] for k in ordered]
+
+
+def pool_stats(places):
+    groups = [place_group(p) for p in places]
+    return {
+        "count": len(places),
+        "groups": len(set(groups)),
+        "group_names": sorted(set(groups)),
+    }
+
+
+def pool_needs_broadening(places):
+    stats = pool_stats(places)
+    return stats["count"] < 10 or stats["groups"] < 4
+
+
+async def search_places(city, interests, duration):
+    """
+    First search exactly what the user asked for.
+    If the map is sparse, broaden discovery with neutral city categories.
+    This never means "the city has nothing"; it only compensates for map coverage.
+    """
+    primary_sources = [(key, INTERESTS[key]["categories"]) for key in interests]
+
+    if duration != "2 часа" and "tea" not in interests and "food" not in interests:
+        primary_sources.append(("rest", REST_CATEGORIES))
+
+    timeout = aiohttp.ClientTimeout(total=40)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        primary_results = await asyncio.gather(*[
+            fetch_places_source(session, city, key, cats)
+            for key, cats in primary_sources
+        ])
+
+        primary_places = merge_place_results(primary_results, primary_sources, max_items=28)
+
+        if not pool_needs_broadening(primary_places):
+            return primary_places
+
+        # Sparse map: search broad, safe categories in the same city.
+        fallback_results = await asyncio.gather(*[
+            fetch_places_source(session, city, key, cats, limit=16)
+            for key, cats in FALLBACK_DISCOVERY_SOURCES
+        ])
+
+    all_sources = primary_sources + FALLBACK_DISCOVERY_SOURCES
+    all_results = primary_results + list(fallback_results)
+    return merge_place_results(all_results, all_sources, max_items=32)
+
+
+def suggested_mode_from_pool(places):
+    stats = pool_stats(places)
+
+    if stats["count"] >= 10 and stats["groups"] >= 4:
+        return "rich"
+    if stats["count"] >= 3:
+        return "compact"
+    if stats["count"] >= 1:
+        return "explorer"
+    return "none"
+
+
+def pool_mode_message(mode):
+    if mode == "rich":
+        return (
+            "На карте достаточно разных точек — попробую собрать полноценный маршрут."
+        )
+    if mode == "compact":
+        return (
+            "На карте меньше подробно размеченных мест, чем в крупных туристических центрах. "
+            "Это нормально: если строгий маршрут не соберётся, бот автоматически сделает компактный квест "
+            "из лучших подтверждённых точек."
+        )
+    if mode == "explorer":
+        return (
+            "На карте сейчас очень мало подробно размеченных мест. "
+            "Это не значит, что в городе нечего смотреть: бот включит исследовательский режим "
+            "и использует подтверждённые точки как ориентиры, а часть заданий даст по ходу прогулки."
+        )
+    return (
+        "На карте пока не удалось найти подходящие подробно размеченные точки."
+    )
 
 
 def candidate_summary(places):
@@ -798,6 +888,7 @@ async def walking_route(stops):
 
 
 def stop_counts(duration):
+    # Rich-city target counts: preserve the existing behavior.
     return {
         "2 часа": [3],
         "4 часа": [5, 4],
@@ -806,32 +897,85 @@ def stop_counts(duration):
     }.get(duration, [4])
 
 
-def route_fits(route, duration, count):
+def compact_stop_counts(duration):
+    return {
+        "2 часа": [3, 2],
+        "4 часа": [4, 3, 2],
+        "6 часов": [4, 3, 2],
+        "весь день": [5, 4, 3, 2],
+    }.get(duration, [3, 2])
+
+
+def route_fits(route, duration, count, relaxed=False):
     total = DURATION_MINUTES[duration]
     walk = route["time_s"] / 60
     mission_est = 14 * count
     pause = max(15, total * 0.12)
 
-    if walk > total * 0.45:
+    walk_share = 0.52 if relaxed else 0.45
+    leg_limit = MAX_LEG_MINUTES[duration] + (10 if relaxed else 0)
+
+    if walk > total * walk_share:
         return False
     if walk + mission_est + pause > total:
         return False
-    if any(leg["time_s"] / 60 > MAX_LEG_MINUTES[duration] for leg in route.get("legs", [])):
+    if any(leg["time_s"] / 60 > leg_limit for leg in route.get("legs", [])):
         return False
     return True
 
 
-async def select_route(places, interests, duration):
-    pool = places[:18]
+def relaxed_combo_ok(combo):
+    """
+    Keep hard UX rules (no food crawl), but stop requiring every selected interest
+    to have its own POI in a sparse city.
+    """
+    groups = [place_group(p) for p in combo]
+    food_count = sum(is_food_group(g) for g in groups)
 
-    for wanted in stop_counts(duration):
+    if food_count > 2:
+        return False
+    if groups.count("restaurant") > 1:
+        return False
+    if "restaurant" in groups and sum(g in {"tea", "cafe"} for g in groups) > 1:
+        return False
+
+    if len(combo) >= 3 and len(set(groups)) < 2:
+        return False
+
+    return True
+
+
+def covered_interests(places, interests):
+    covered = set()
+    for p in places:
+        covered.update(k for k in p.get("interest_matches", []) if k in interests)
+
+    # These are naturally expressible as mission mechanics even without a dedicated POI.
+    for mission_level_interest in {"photo", "tradition", "unusual"}:
+        if mission_level_interest in interests:
+            covered.add(mission_level_interest)
+
+    return covered
+
+
+def fake_single_stop_route():
+    return {
+        "distance_m": 0.0,
+        "time_s": 0.0,
+        "legs": [],
+    }
+
+
+async def try_route_combinations(pool, wanted_counts, duration, combo_validator, relaxed):
+    for wanted in wanted_counts:
         if len(pool) < wanted:
             continue
 
         scored = []
         for idxs in itertools.combinations(range(len(pool)), wanted):
             combo = [pool[i] for i in idxs]
-            if not combo_ok(combo, interests):
+
+            if not combo_validator(combo):
                 continue
 
             ordered, approx = best_order(combo)
@@ -839,20 +983,85 @@ async def select_route(places, interests, duration):
                 continue
 
             diversity = len(set(place_group(p) for p in combo))
-            scored.append((approx - diversity * 250, ordered))
+            # Diversity remains valuable, but compactness still matters.
+            scored.append((approx - diversity * 260, ordered))
 
         scored.sort(key=lambda x: x[0])
 
-        for _, ordered in scored[:10]:
+        for _, ordered in scored[:14]:
             try:
                 route = await walking_route(ordered)
             except Exception:
                 continue
 
-            if route_fits(route, duration, len(ordered)):
+            if route_fits(route, duration, len(ordered), relaxed=relaxed):
                 return ordered, route
 
-    raise RuntimeError("No diversified realistic route")
+    return None
+
+
+async def select_route(places, interests, duration):
+    """
+    Adaptive cascade:
+    1) existing strict route;
+    2) compact route with interests treated as preferences;
+    3) explorer route with 2 real anchors;
+    4) one confirmed anchor + field missions.
+    """
+    pool = places[:20]
+
+    # 1. Preserve the current strict behavior when the data supports it.
+    strict = await try_route_combinations(
+        pool,
+        stop_counts(duration),
+        duration,
+        lambda combo: combo_ok(combo, interests),
+        relaxed=False,
+    )
+    if strict:
+        selected, route = strict
+        return selected, route, "rich"
+
+    # 2. Compact mode: fewer stops, interests are preferences, hard food rules stay.
+    compact = await try_route_combinations(
+        pool,
+        compact_stop_counts(duration),
+        duration,
+        relaxed_combo_ok,
+        relaxed=True,
+    )
+    if compact:
+        selected, route = compact
+        mode = "compact" if len(selected) >= 3 else "explorer"
+        return selected, route, mode
+
+    # 3. If routing API cannot connect a sparse set, still try the two closest real anchors.
+    if len(pool) >= 2:
+        best_pair = None
+        best_distance = float("inf")
+
+        for a, b in itertools.combinations(pool, 2):
+            if is_food_group(place_group(a)) and is_food_group(place_group(b)):
+                continue
+            dist = haversine(a, b)
+            if dist < best_distance:
+                best_pair = [a, b]
+                best_distance = dist
+
+        if best_pair:
+            ordered, _ = best_order(best_pair)
+            try:
+                route = await walking_route(ordered)
+                if route_fits(route, duration, 2, relaxed=True):
+                    return ordered, route, "explorer"
+            except Exception:
+                pass
+
+    # 4. Last useful fallback: one confirmed real point.
+    if pool:
+        return [pool[0]], fake_single_stop_route(), "explorer"
+
+    raise RuntimeError("No confirmed POI")
 
 
 AI_META_SCHEMA = {
@@ -1248,7 +1457,112 @@ def optional_social_bonus(place):
     }
 
 
-def build_quest(city, interests, style, places, ai_meta):
+def missing_interest_labels(places, interests):
+    covered = covered_interests(places, interests)
+    return [
+        INTERESTS[key]["label"]
+        for key in interests
+        if key not in covered
+    ]
+
+
+def build_field_missions(mode, interests, real_stop_count):
+    if mode == "rich":
+        return []
+
+    templates = [
+        {
+            "title": "Короткая вывеска",
+            "text": (
+                "По пути найди короткую вывеску или табличку с 2–4 иероглифами. "
+                "Не обязательно понимать её — просто выбери ту, что заинтересовала."
+            ),
+        },
+        {
+            "title": "Неожиданная деталь",
+            "text": (
+                "Заметь одну вещь, которой не ожидал здесь увидеть: предмет, оформление окна, транспорт, "
+                "двор, упаковку, звук или необычную городскую деталь."
+            ),
+        },
+        {
+            "title": "Старое рядом с новым",
+            "text": (
+                "Попробуй найти в одном направлении что-то традиционное или старомодное и что-то явно современное. "
+                "Не нужно доказывать возраст — важен визуальный контраст."
+            ),
+        },
+        {
+            "title": "Цвет города",
+            "text": (
+                "Выбери один цвет, который сегодня часто встречается вокруг, и найди его ещё два раза по пути."
+            ),
+        },
+    ]
+
+    if "food" in interests or "tea" in interests:
+        templates.insert(1, {
+            "title": "Местный вкус без обязательной остановки",
+            "text": (
+                "Если по пути встретится меню, витрина, чайная вывеска или необычная еда — просто рассмотри её. "
+                "Заходить и покупать ничего не обязательно."
+            ),
+        })
+
+    if "tradition" in interests or "history" in interests:
+        templates.insert(1, {
+            "title": "Традиционная деталь по пути",
+            "text": (
+                "Ищи фонарь, иероглиф, форму крыши, ворота, орнамент или другой визуальный элемент, "
+                "который кажется тебе связанным с китайской традицией."
+            ),
+        })
+
+    if "photo" in interests:
+        templates.insert(1, {
+            "title": "Один кадр вне маршрута",
+            "text": (
+                "Сделай один кадр не у основной точки, а просто по дороге — то, что лучше всего передаёт ощущение города."
+            ),
+        })
+
+    wanted = 2 if mode == "compact" else 3
+    wanted = min(wanted, max(1, len(templates)))
+
+    return templates[:wanted]
+
+
+def adaptive_mode_note(mode, places, interests):
+    if mode == "rich":
+        return ""
+
+    missing = missing_interest_labels(places, interests)
+    missing_text = ""
+
+    if missing:
+        missing_text = (
+            "\n\nНекоторые выбранные темы не получили отдельной точки на карте: "
+            + ", ".join(missing)
+            + ". Я не буду отправлять тебя далеко ради формального совпадения — эти темы лучше встроить в задания по пути."
+        )
+
+    if mode == "compact":
+        return (
+            "🟡 <b>Компактный режим</b>\n"
+            "На карте здесь меньше подробно размеченных POI, поэтому маршрут короче, "
+            "но все точки реальные и проверенные. Между ними будут дополнительные задания наблюдения."
+            + missing_text
+        )
+
+    return (
+        "🟠 <b>Исследовательский режим</b>\n"
+        "На карте сейчас мало подробно размеченных мест. Это не означает, что в городе нечего смотреть: "
+        "подтверждённые точки станут ориентирами, а часть квеста будет происходить по пути."
+        + missing_text
+    )
+
+
+def build_quest(city, interests, style, places, ai_meta, adaptive_mode="rich"):
     stops = []
     social_used = False
     used_titles = set()
@@ -1282,6 +1596,9 @@ def build_quest(city, interests, style, places, ai_meta):
             "Реальный городской квест: разные типы мест, фото-трофеи и небольшие задания вместо обычного списка достопримечательностей."
         ),
         "stops": stops,
+        "adaptive_mode": adaptive_mode,
+        "adaptive_note": adaptive_mode_note(adaptive_mode, places, interests),
+        "field_missions": build_field_missions(adaptive_mode, interests, len(places)),
         "final_challenge": str(ai_meta.get("final_challenge") or "").strip() or (
             "Выбери лучший кадр прогулки и придумай ему короткое название."
         ),
@@ -1776,6 +2093,14 @@ def route_summary(route, quest, duration):
     pause = max(15, int(total * 0.12))
     reserve = max(0, total - walk - missions - pause)
 
+    if len(quest.get("stops", [])) <= 1:
+        return (
+            "🗺 <b>Основа квеста проверена</b>\n"
+            "📍 Подтверждённая точка: 1\n"
+            f"🎯 Основная миссия: ~{fmt_minutes(missions)}\n"
+            "🧭 Остальное время — исследовательские задания вокруг этой точки и по ближайшим улицам."
+        )
+
     return (
         "🗺 <b>Маршрут проверен</b>\n"
         f"🚶 Пешком: ~{fmt_distance(route['distance_m'])} · ~{fmt_minutes(walk)}\n"
@@ -1812,15 +2137,29 @@ async def send_quest(message, state):
     quest, route = data["quest"], data["route"]
     duration, city, style = data["duration"], data["city"], data["style"]
 
+    mode_note = quest.get("adaptive_note") or ""
+    mode_block = f"\n\n{mode_note}" if mode_note else ""
+
     await message.answer(
         f"🏮 <b>{esc(quest['title'])}</b>\n\n"
         f"{esc(quest['intro'])}\n\n"
         f"📍 {esc(city['input_name'])} · ⏱ {esc(duration)} · {esc(STYLE_LABELS[style])}\n\n"
         f"{route_summary(route, quest, duration)}"
+        f"{mode_block}"
     )
 
     for i in range(len(quest["stops"])):
         await send_stop_card(message, quest, route, i)
+
+        # In compact/explorer mode add lightweight tasks between real POIs.
+        field_missions = quest.get("field_missions") or []
+        if i < len(field_missions):
+            field = field_missions[i]
+            await message.answer(
+                f"🧭 <b>По пути · {esc(field['title'])}</b>\n\n"
+                f"{esc(field['text'])}\n\n"
+                "Это дополнительная исследовательская миссия — она не требует отдельной точки на карте."
+            )
 
     await state.update_data(completed=[], bonuses=[], photos={})
     await state.set_state(QuestForm.quest_active)
@@ -1961,18 +2300,24 @@ async def interests_continue(callback: CallbackQuery, state: FSMContext):
         logger.exception("Places")
         places = []
 
-    if len(places) < 3:
-        await status.edit_text("🤔 Нашлось слишком мало мест. Попробуй изменить интересы.")
+    if not places:
+        await status.edit_text(
+            "🤔 На карте пока не удалось найти ни одной подходящей подробно размеченной точки в этом городе.\n\n"
+            "Это ограничение данных карты, а не оценка самого города. "
+            "Попробуй другой город или вернись к нему позже."
+        )
         return
 
-    await state.update_data(candidates=places)
+    pool_mode = suggested_mode_from_pool(places)
+    await state.update_data(candidates=places, pool_mode=pool_mode)
     await state.set_state(QuestForm.choosing_style)
 
     await status.edit_text(
         f"📍 <b>Нашёл {len(places)} кандидата</b>\n\n"
         f"{candidate_summary(places)}\n\n"
-        "Сейчас ничего выбирать не нужно. После выбора стиля бот сам соберёт разнообразный маршрут "
-        "и покажет уже финальные точки с понятными названиями.\n\n"
+        f"{pool_mode_message(pool_mode)}\n\n"
+        "Сейчас ничего выбирать не нужно. После выбора стиля бот сам попробует самый качественный режим: "
+        "сначала полный маршрут, затем компактный, а при очень скудной разметке — исследовательский.\n\n"
         "🎯 <b>Как будем исследовать город?</b>",
         reply_markup=style_keyboard(),
     )
@@ -1993,19 +2338,22 @@ async def style_cb(callback: CallbackQuery, state: FSMContext):
     )
 
     try:
-        selected, route = await select_route(candidates, interests, duration)
+        selected, route, adaptive_mode = await select_route(candidates, interests, duration)
     except Exception:
         logger.exception("Route")
         await state.set_state(QuestForm.choosing_style)
         await status.edit_text(
-            "🗺 Не получилось собрать хороший компактный маршрут. Попробуй другой набор интересов или больше времени.",
+            "🗺 На карте не удалось подтвердить даже одну пригодную точку для квеста.\n\n"
+            "Это похоже на нехватку данных карты для этого города, а не на отсутствие интересных мест. "
+            "Можно попробовать другой город или другие интересы.",
             reply_markup=style_keyboard(),
         )
         return
 
     await status.edit_text(
-        f"🔎 <b>Маршрут готов.</b>\n\n"
-        f"Пешком ~{fmt_distance(route['distance_m'])} · ~{fmt_minutes(route['time_s']/60)}.\n"
+        f"🔎 <b>{esc(ADAPTIVE_MODE_LABELS.get(adaptive_mode, 'Квест'))}</b>\n\n"
+        f"Подтверждённых точек в маршруте: <b>{len(selected)}</b>.\n"
+        f"Пешком между ними: ~{fmt_distance(route['distance_m'])} · ~{fmt_minutes(route['time_s']/60)}.\n"
         "Уточняю финальные точки и их типы через Place Details…"
     )
 
@@ -2018,7 +2366,7 @@ async def style_cb(callback: CallbackQuery, state: FSMContext):
     )
 
     ai_meta = await groq_meta(city, duration, interests, style, selected)
-    quest = build_quest(city, interests, style, selected, ai_meta)
+    quest = build_quest(city, interests, style, selected, ai_meta, adaptive_mode=adaptive_mode)
 
     await state.update_data(quest=quest, route=route, style=style)
     await status.edit_text("✅ <b>Квест готов!</b>")
@@ -2446,7 +2794,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Starting CityQuest China v4.1 market photo choice + replace photo")
+    logger.info("Starting CityQuest China v5 Adaptive Small City Engine")
     await dp.start_polling(bot)
 
 
