@@ -188,6 +188,69 @@ def chinese_to_pinyin(text: str) -> str:
     return "".join(parts).replace(" ", "").strip().lower()
 
 
+def place_name_pinyin(text: str) -> str:
+    """Readable pinyin for Chinese POI names shown to a non-Chinese-speaking user."""
+    if not contains_han(text):
+        return ""
+
+    parts = lazy_pinyin(
+        text,
+        style=Style.TONE,
+        errors=lambda chars: [chars],
+    )
+    value = " ".join(part for part in parts if part).strip()
+    if value:
+        value = value[0].upper() + value[1:]
+    return value
+
+
+def place_category_label(categories: list[str]) -> str:
+    """Convert Geoapify categories into a short Russian label for the UI."""
+    cats = categories or []
+
+    def has(prefix: str) -> bool:
+        return any(cat == prefix or cat.startswith(prefix + ".") for cat in cats)
+
+    if has("catering.cafe.tea"):
+        return "🍵 чайная"
+    if has("catering.restaurant"):
+        return "🍜 ресторан"
+    if has("catering.food_court"):
+        return "🍽 фуд-корт"
+    if has("catering.fast_food"):
+        return "🥡 кафе / фастфуд"
+    if has("catering.cafe"):
+        return "☕ кафе"
+    if has("commercial.marketplace"):
+        return "🛍 рынок"
+    if has("entertainment.museum"):
+        return "🏛 музей"
+    if has("tourism.sights.place_of_worship") or has("religion"):
+        return "🛕 храм / религиозное место"
+    if has("tourism.sights.city_gate"):
+        return "🏮 исторические ворота"
+    if has("tourism.attraction.viewpoint"):
+        return "📸 смотровая точка"
+    if has("tourism.attraction.artwork"):
+        return "🎨 арт-объект"
+    if has("leisure.park.garden"):
+        return "🌺 сад"
+    if has("leisure.park"):
+        return "🌿 парк"
+    if has("natural"):
+        return "🌿 природное место"
+    if has("entertainment.culture"):
+        return "🎭 культурное место"
+    if has("heritage"):
+        return "🏯 историческое место"
+    if has("tourism.sights"):
+        return "🏯 достопримечательность"
+    if has("tourism.attraction"):
+        return "📍 достопримечательность"
+
+    return "📍 интересное место"
+
+
 async def geo_search(session: aiohttp.ClientSession, query: str) -> list[dict]:
     url = "https://api.geoapify.com/v1/geocode/search"
     params = {
@@ -343,11 +406,15 @@ async def search_places(city: dict, interests: list[str]) -> list[dict]:
         if lat is None or lon is None:
             continue
 
+        raw_categories = props.get("categories") or []
+
         candidates.append({
             "place_id": place_id,
             "name": name,
+            "pinyin": place_name_pinyin(name),
+            "category_label": place_category_label(raw_categories),
             "formatted": props.get("formatted") or "",
-            "categories": props.get("categories") or [],
+            "categories": raw_categories,
             "lat": lat,
             "lon": lon,
             "distance": props.get("distance"),
@@ -612,15 +679,23 @@ async def cb_interests_continue(callback: CallbackQuery, state: FSMContext):
     preview = places[:6]
     lines = []
     for index, place in enumerate(preview, start=1):
-        lines.append(f"{index}. <b>{place['name']}</b>")
+        line = (
+            f"{index}. {place.get('category_label', '📍 место')} — "
+            f"<b>{place['name']}</b>"
+        )
+        if place.get("pinyin"):
+            line += f"\n   <i>{place['pinyin']}</i>"
+        lines.append(line)
 
     city_label = city.get("input_name") or city.get("city") or "город"
 
     await status.edit_text(
         f"📍 <b>Нашёл реальные места в {city_label}</b>\n\n"
+        "Вот несколько примеров:\n\n"
         + "\n".join(lines)
-        + f"\n\nВсего подходящих кандидатов: <b>{len(places)}</b>.\n"
-        "Это пока не маршрут — из этих точек позже будут выбраны лучшие для квеста.\n\n"
+        + f"\n\nВсего подходящих кандидатов: <b>{len(places)}</b>.\n\n"
+        "Сейчас ничего выбирать не нужно — это предварительный список. "
+        "После выбора стиля бот сам выберет лучшие точки для квеста.\n\n"
         "🎯 <b>Как будем исследовать город?</b>",
         reply_markup=style_keyboard(),
     )
