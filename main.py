@@ -36,6 +36,84 @@ router = Router()
 class QuestForm(StatesGroup):
     waiting_city = State()
     city_confirmed = State()
+    choosing_interests = State()
+    choosing_style = State()
+    ready_to_generate = State()
+
+
+INTERESTS = {
+    "history": {
+        "label": "🏯 История",
+        "categories": [
+            "tourism.sights",
+            "heritage",
+            "entertainment.museum",
+        ],
+    },
+    "tea": {
+        "label": "🍵 Чай",
+        "categories": [
+            "catering.cafe.tea",
+            "catering.cafe",
+        ],
+    },
+    "food": {
+        "label": "🍜 Еда",
+        "categories": [
+            "catering.restaurant",
+            "catering.fast_food",
+            "catering.food_court",
+            "commercial.marketplace",
+        ],
+    },
+    "photo": {
+        "label": "📸 Фото",
+        "categories": [
+            "tourism.attraction",
+            "tourism.attraction.viewpoint",
+            "tourism.sights",
+        ],
+    },
+    "nature": {
+        "label": "🌿 Природа",
+        "categories": [
+            "leisure.park",
+            "leisure.park.garden",
+            "natural",
+        ],
+    },
+    "art": {
+        "label": "🎨 Искусство",
+        "categories": [
+            "entertainment.culture",
+            "entertainment.museum",
+            "tourism.attraction.artwork",
+        ],
+    },
+    "tradition": {
+        "label": "🏮 Традиции",
+        "categories": [
+            "tourism.sights.place_of_worship.temple",
+            "tourism.sights.city_gate",
+            "tourism.sights",
+            "heritage",
+        ],
+    },
+    "unusual": {
+        "label": "🕵️ Необычное",
+        "categories": [
+            "tourism.attraction",
+            "tourism.sights",
+            "commercial.marketplace",
+        ],
+    },
+}
+
+STYLE_LABELS = {
+    "calm": "😌 Спокойно",
+    "explorer": "🔎 Исследователь",
+    "adventure": "🔥 Приключение",
+}
 
 
 def main_menu():
@@ -65,6 +143,42 @@ def duration_keyboard():
     return kb.as_markup()
 
 
+def interests_keyboard(selected: list[str] | None = None):
+    selected_set = set(selected or [])
+    kb = InlineKeyboardBuilder()
+
+    for key, meta in INTERESTS.items():
+        prefix = "✅ " if key in selected_set else ""
+        kb.button(
+            text=f"{prefix}{meta['label']}",
+            callback_data=f"interest:{key}",
+        )
+
+    kb.adjust(2)
+
+    markup = kb.as_markup()
+
+    # Add the continue button manually after the grid.
+    if selected_set:
+        from aiogram.types import InlineKeyboardButton
+        markup.inline_keyboard.append(
+            [InlineKeyboardButton(
+                text=f"Продолжить ({len(selected_set)}/3) →",
+                callback_data="interests_continue",
+            )]
+        )
+    return markup
+
+
+def style_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="😌 Спокойно", callback_data="style:calm")
+    kb.button(text="🔎 Исследователь", callback_data="style:explorer")
+    kb.button(text="🔥 Приключение", callback_data="style:adventure")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 def contains_han(text: str) -> bool:
     return bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", text))
 
@@ -88,7 +202,7 @@ async def geo_search(session: aiohttp.ClientSession, query: str) -> list[dict]:
     async with session.get(url, params=params) as response:
         if response.status != 200:
             body = await response.text()
-            logger.error("Geoapify failed: %s %s", response.status, body)
+            logger.error("Geoapify geocoding failed: %s %s", response.status, body)
             raise RuntimeError("Geoapify request failed")
         data = await response.json()
         return data.get("results", [])
@@ -160,6 +274,88 @@ async def geocode_city(city_query: str) -> dict | None:
     return None
 
 
+def categories_for_interests(interests: list[str]) -> list[str]:
+    categories = []
+    seen = set()
+
+    for interest in interests:
+        for category in INTERESTS.get(interest, {}).get("categories", []):
+            if category not in seen:
+                seen.add(category)
+                categories.append(category)
+
+    return categories
+
+
+async def search_places(city: dict, interests: list[str]) -> list[dict]:
+    categories = categories_for_interests(interests)
+    if not categories:
+        return []
+
+    url = "https://api.geoapify.com/v2/places"
+
+    # Prefer exact city boundary. If place_id is missing, fall back to a circle.
+    if city.get("place_id"):
+        spatial_filter = f"place:{city['place_id']}"
+    else:
+        spatial_filter = f"circle:{city['lon']},{city['lat']},15000"
+
+    params = {
+        "categories": ",".join(categories),
+        "filter": spatial_filter,
+        "bias": f"proximity:{city['lon']},{city['lat']}",
+        "limit": 35,
+        "lang": "zh",
+        "apiKey": GEOAPIFY_API_KEY,
+    }
+
+    timeout = aiohttp.ClientTimeout(total=30)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, params=params) as response:
+            if response.status != 200:
+                body = await response.text()
+                logger.error("Geoapify Places failed: %s %s", response.status, body)
+                raise RuntimeError("Geoapify Places request failed")
+
+            data = await response.json()
+
+    candidates = []
+    seen = set()
+
+    for feature in data.get("features", []):
+        props = feature.get("properties", {})
+        name = (props.get("name") or props.get("address_line1") or "").strip()
+
+        if not name:
+            continue
+
+        place_id = props.get("place_id") or ""
+        key = place_id or name.casefold()
+
+        if key in seen:
+            continue
+        seen.add(key)
+
+        lat = props.get("lat")
+        lon = props.get("lon")
+
+        if lat is None or lon is None:
+            continue
+
+        candidates.append({
+            "place_id": place_id,
+            "name": name,
+            "formatted": props.get("formatted") or "",
+            "categories": props.get("categories") or [],
+            "lat": lat,
+            "lon": lon,
+            "distance": props.get("distance"),
+        })
+
+    return candidates
+
+
 async def ask_for_city(message: Message, state: FSMContext):
     await state.set_state(QuestForm.waiting_city)
     await message.answer(
@@ -173,10 +369,24 @@ async def ask_for_city(message: Message, state: FSMContext):
     )
 
 
+async def show_interests(message: Message, state: FSMContext):
+    data = await state.get_data()
+    selected = data.get("interests", [])
+
+    await state.set_state(QuestForm.choosing_interests)
+
+    await message.answer(
+        "✨ <b>Что тебе интересно?</b>\n\n"
+        "Выбери от 1 до 3 тем. Можно нажимать повторно, чтобы снять выбор.",
+        reply_markup=interests_keyboard(selected),
+    )
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     first_name = message.from_user.first_name if message.from_user else "путешественник"
+
     await message.answer(
         f"🏮 <b>CityQuest China 城市奇遇</b>\n\n"
         f"Привет, {first_name}!\n\n"
@@ -229,7 +439,7 @@ async def process_city(message: Message, state: FSMContext):
     try:
         city = await geocode_city(city_query)
     except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError):
-        logger.exception("Geoapify error")
+        logger.exception("Geoapify geocoding error")
         await status_message.edit_text(
             "🗺 Карта сейчас не ответила.\n\nПопробуй ещё раз через несколько секунд."
         )
@@ -241,7 +451,7 @@ async def process_city(message: Message, state: FSMContext):
         )
         return
 
-    await state.update_data(city=city)
+    await state.update_data(city=city, interests=[])
 
     state_line = f"\nПровинция / регион: <b>{city['state']}</b>" if city.get("state") else ""
     coords = ""
@@ -311,15 +521,143 @@ async def cb_duration(callback: CallbackQuery, state: FSMContext):
     }
 
     duration = duration_map.get(callback.data, "не указано")
+    await state.update_data(duration=duration, interests=[])
+
+    if callback.message:
+        await show_interests(callback.message, state)
+
+
+@router.callback_query(F.data.startswith("interest:"))
+async def cb_interest(callback: CallbackQuery, state: FSMContext):
+    key = callback.data.split(":", 1)[1]
+
+    if key not in INTERESTS:
+        await callback.answer("Неизвестный интерес", show_alert=True)
+        return
+
+    data = await state.get_data()
+    selected = list(data.get("interests", []))
+
+    if key in selected:
+        selected.remove(key)
+    else:
+        if len(selected) >= 3:
+            await callback.answer(
+                "Можно выбрать максимум 3 интереса.",
+                show_alert=True,
+            )
+            return
+        selected.append(key)
+
+    await state.update_data(interests=selected)
+    await callback.answer()
+
+    if callback.message:
+        await callback.message.edit_reply_markup(
+            reply_markup=interests_keyboard(selected)
+        )
+
+
+@router.callback_query(F.data == "interests_continue")
+async def cb_interests_continue(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    interests = list(data.get("interests", []))
+    city = data.get("city")
+
+    if not interests:
+        await callback.answer("Выбери хотя бы один интерес.", show_alert=True)
+        return
+
+    if not city:
+        await callback.answer("Город потерялся. Начни квест заново.", show_alert=True)
+        return
+
+    await callback.answer()
+
+    if not callback.message:
+        return
+
+    selected_labels = " · ".join(
+        INTERESTS[key]["label"] for key in interests
+    )
+
+    status = await callback.message.answer(
+        "🔎 <b>Ищу реальные места…</b>\n\n"
+        f"{selected_labels}\n"
+        "Проверяю точки внутри выбранного города."
+    )
+
+    try:
+        places = await search_places(city, interests)
+    except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError):
+        logger.exception("Geoapify Places error")
+        await status.edit_text(
+            "🗺 Не удалось получить места от карты.\n\n"
+            "Попробуй ещё раз чуть позже."
+        )
+        return
+
+    if len(places) < 3:
+        await status.edit_text(
+            "🤔 Я нашёл слишком мало подходящих мест для хорошего квеста.\n\n"
+            "Попробуй выбрать более широкие интересы — например, "
+            "«История», «Фото» или «Необычное»."
+        )
+        return
+
+    # Keep enough candidates for the AI step; show only a short preview.
+    await state.update_data(poi_candidates=places[:20])
+    await state.set_state(QuestForm.choosing_style)
+
+    preview = places[:6]
+    lines = []
+    for index, place in enumerate(preview, start=1):
+        lines.append(f"{index}. <b>{place['name']}</b>")
+
+    city_label = city.get("input_name") or city.get("city") or "город"
+
+    await status.edit_text(
+        f"📍 <b>Нашёл реальные места в {city_label}</b>\n\n"
+        + "\n".join(lines)
+        + f"\n\nВсего подходящих кандидатов: <b>{len(places)}</b>.\n"
+        "Это пока не маршрут — из этих точек позже будут выбраны лучшие для квеста.\n\n"
+        "🎯 <b>Как будем исследовать город?</b>",
+        reply_markup=style_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("style:"))
+async def cb_style(callback: CallbackQuery, state: FSMContext):
+    style = callback.data.split(":", 1)[1]
+
+    if style not in STYLE_LABELS:
+        await callback.answer("Неизвестный стиль", show_alert=True)
+        return
+
+    await callback.answer()
+    await state.update_data(quest_style=style)
+    await state.set_state(QuestForm.ready_to_generate)
+
     data = await state.get_data()
     city = data.get("city", {})
-    await state.update_data(duration=duration)
+    duration = data.get("duration", "")
+    interests = data.get("interests", [])
+    places = data.get("poi_candidates", [])
+
+    selected_labels = ", ".join(
+        INTERESTS[key]["label"] for key in interests
+    )
 
     if callback.message:
         await callback.message.answer(
-            f"🏮 <b>{city.get('input_name') or city.get('city', 'Город')}</b> · {duration}\n\n"
-            "Город подтверждён через Geoapify ✅\n\n"
-            "Следующим шагом добавим выбор интересов."
+            "✅ <b>Основа квеста готова</b>\n\n"
+            f"🏮 Город: <b>{city.get('input_name') or city.get('city', '')}</b>\n"
+            f"⏱ Время: <b>{duration}</b>\n"
+            f"✨ Интересы: {selected_labels}\n"
+            f"🎯 Стиль: <b>{STYLE_LABELS[style]}</b>\n"
+            f"📍 Реальных мест в резерве: <b>{len(places)}</b>\n\n"
+            "Следующий шаг — подключить ИИ: он выберет из этих реальных точек "
+            "подходящие места и превратит их в персональные миссии."
         )
 
 
@@ -340,7 +678,7 @@ async def cb_about(callback: CallbackQuery):
         await callback.message.answer(
             "ℹ️ <b>Как работает CityQuest China</b>\n\n"
             "1. Ты выбираешь город, время и интересы.\n"
-            "2. Бот находит реальные места через картографический API.\n"
+            "2. Бот находит реальные места через Geoapify.\n"
             "3. ИИ превращает их в персональный городской квест.\n"
             "4. Ты отмечаешь выполненные миссии прямо в Telegram."
         )
@@ -353,6 +691,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+
     logger.info("Starting CityQuest China")
     await dp.start_polling(bot)
 
