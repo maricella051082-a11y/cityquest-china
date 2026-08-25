@@ -205,12 +205,7 @@ def db_archive_completed(user_id: int, data: dict):
                 (
                     int(user_id),
                     str(quest.get("title") or "CityQuest"),
-                    str(
-                        city.get("input_name")
-                        or city.get("city")
-                        or city.get("name")
-                        or ""
-                    ),
+                    city_display_ru(city),
                     payload["finished_at"],
                     int(xp),
                     int(len(photos)),
@@ -280,12 +275,7 @@ def active_quest_summary(data):
     photos = data.get("photos", {})
 
     title = str(quest.get("title") or "CityQuest")
-    city_name = str(
-        city.get("input_name")
-        or city.get("city")
-        or city.get("name")
-        or "Китай"
-    )
+    city_name = city_display_ru(city)
     total = len(quest.get("stops", []))
     xp = earned_xp(quest, completed, bonuses) if quest else 0
 
@@ -437,6 +427,40 @@ CHINA_REGION_RU = {
     "hong kong": "Гонконг",
     "macao": "Макао",
     "macau": "Макао",
+}
+
+PREFERRED_CITY_RU = {
+    "beijing": "Пекин",
+    "shanghai": "Шанхай",
+    "guangzhou": "Гуанчжоу",
+    "shenzhen": "Шэньчжэнь",
+    "chengdu": "Чэнду",
+    "xi'an": "Сиань",
+    "xian": "Сиань",
+    "hangzhou": "Ханчжоу",
+    "nanjing": "Нанкин",
+    "suzhou": "Сучжоу",
+    "wuhan": "Ухань",
+    "chongqing": "Чунцин",
+    "tianjin": "Тяньцзинь",
+    "qingdao": "Циндао",
+    "xiamen": "Сямэнь",
+    "kunming": "Куньмин",
+    "dalian": "Далянь",
+    "harbin": "Харбин",
+    "sanya": "Санья",
+    "guilin": "Гуйлинь",
+    "luoyang": "Лоян",
+    "zhangjiajie": "Чжанцзяцзе",
+    "kashgar": "Кашгар",
+    "urumqi": "Урумчи",
+    "lhasa": "Лхаса",
+    "macao": "Макао",
+    "macau": "Макао",
+    "hong kong": "Гонконг",
+    "langzhong": "Ланчжун",
+    "jianshui": "Цзяньшуй",
+    "shexian": "Шэсянь",
 }
 
 EXACT_RU_NAMES = {
@@ -591,6 +615,72 @@ def city_query_variants(text: str) -> list[str]:
                 seen.add(key)
                 out.append(query.strip())
     return out
+
+
+def city_display_ru(city: dict) -> str:
+    """
+    Russian UI name for a city. Works for old saved quests too:
+    it derives the display name at render time instead of requiring migration.
+    """
+    if not city:
+        return "Китай"
+
+    input_name = str(city.get("input_name") or "").strip()
+    canonical = str(
+        city.get("city")
+        or city.get("name")
+        or input_name
+        or ""
+    ).strip()
+
+    # If user entered a Russian name, preserve it.
+    if input_name and contains_cyrillic(input_name):
+        return input_name
+
+    # Direct canonical map.
+    key = canonical.casefold().strip()
+    key_simple = re.sub(r"\s+city$", "", key).strip()
+    if key in PREFERRED_CITY_RU:
+        return PREFERRED_CITY_RU[key]
+    if key_simple in PREFERRED_CITY_RU:
+        return PREFERRED_CITY_RU[key_simple]
+
+    # Existing Russian -> English aliases can be inverted for supported cities.
+    canonical_norm = re.sub(r"[\s'’`\\-_,.]+", "", key_simple)
+    for ru_name, english_name in RU_CITY_ALIASES.items():
+        english_norm = re.sub(
+            r"[\s'’`\\-_,.]+",
+            "",
+            str(english_name).casefold(),
+        )
+        if english_norm == canonical_norm:
+            return ru_name[:1].upper() + ru_name[1:]
+
+    # If the original input was Chinese and we have a canonical English form,
+    # use that as a safe fallback instead of exposing a lowercase technical value.
+    if canonical:
+        return canonical
+
+    return input_name or "Китай"
+
+
+def city_display_secondary(city: dict) -> str:
+    """
+    Optional original/canonical form shown after the Russian name when useful.
+    """
+    if not city:
+        return ""
+
+    ru = city_display_ru(city)
+    canonical = str(city.get("city") or city.get("name") or "").strip()
+    original = str(city.get("input_name") or "").strip()
+
+    choices = []
+    for value in (canonical, original):
+        if value and value.casefold() != ru.casefold() and value not in choices:
+            choices.append(value)
+
+    return " · ".join(choices[:2])
 
 
 def normalize_city_text(value: str) -> str:
@@ -1757,7 +1847,7 @@ async def groq_meta(city, duration, interests, style, places):
 Реальные места, их типы, названия, причины выбора и миссии уже определены программой.
 ТЫ НЕ ИМЕЕШЬ ПРАВА переименовывать точки, переводить их названия, менять их тип или придумывать факты.
 
-Город: {city.get('input_name')}
+Город: {city_display_ru(city)}
 Время: {duration}
 Интересы: {interest_text}
 Стиль: {STYLE_LABELS[style]}
@@ -2297,7 +2387,7 @@ def build_quest(city, interests, style, places, ai_meta, adaptive_mode="rich"):
         })
 
     return {
-        "title": str(ai_meta.get("title") or "").strip() or f"CityQuest · {city.get('input_name')}",
+        "title": str(ai_meta.get("title") or "").strip() or f"CityQuest · {city_display_ru(city)}",
         "intro": str(ai_meta.get("intro") or "").strip() or (
             "Реальный городской квест: разные типы мест, фото-трофеи и небольшие задания вместо обычного списка достопримечательностей."
         ),
@@ -2849,7 +2939,7 @@ async def send_quest(message, state):
     await message.answer(
         f"🏮 <b>{esc(quest['title'])}</b>\n\n"
         f"{esc(quest['intro'])}\n\n"
-        f"📍 {esc(city['input_name'])} · ⏱ {esc(duration)} · {esc(STYLE_LABELS[style])}\n\n"
+        f"📍 {esc(city_display_ru(city))} · ⏱ {esc(duration)} · {esc(STYLE_LABELS[style])}\n\n"
         f"{route_summary(route, quest, duration)}"
         f"{mode_block}"
     )
@@ -3003,9 +3093,14 @@ async def city_received(message: Message, state: FSMContext):
             "я покажу остальные одноимённые варианты."
         )
 
+    display_ru = city_display_ru(best)
+    secondary = city_display_secondary(best)
+    secondary_line = f"\n{esc(secondary)}" if secondary else ""
+
     await status.edit_text(
         f"🇨🇳 <b>Нашёл город!</b>\n\n"
-        f"<b>{esc(best.get('city') or best.get('name') or query)}</b>\n"
+        f"<b>{esc(display_ru)}</b>"
+        f"{secondary_line}\n"
         f"{esc(best['formatted'])}"
         f"{province}{county}\n"
         f"📍 {best['lat']:.5f}, {best['lon']:.5f}\n\n"
@@ -3039,9 +3134,14 @@ async def city_select(callback: CallbackQuery, state: FSMContext):
         if city.get("county") else ""
     )
 
+    display_ru = city_display_ru(city)
+    secondary = city_display_secondary(city)
+    secondary_line = f"\n{esc(secondary)}" if secondary else ""
+
     await callback.message.answer(
         f"🇨🇳 <b>Выбран город:</b>\n\n"
-        f"<b>{esc(city.get('city') or city['input_name'])}</b>\n"
+        f"<b>{esc(display_ru)}</b>"
+        f"{secondary_line}\n"
         f"{esc(city['formatted'])}"
         f"{province}{county}\n"
         f"📍 {city['lat']:.5f}, {city['lon']:.5f}\n\n"
@@ -3755,7 +3855,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Starting CityQuest China v6 Persistent Adventures")
+    logger.info("Starting CityQuest China v6.1 Russian City Names")
     await dp.start_polling(bot)
 
 
