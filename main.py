@@ -248,6 +248,50 @@ def db_completed_list(user_id: int, limit: int = 5):
         return []
 
 
+def db_recent_missions_for_city(user_id: int, city_name: str, limit: int = 12):
+    """Small memory used only to tell AI what not to repeat in the same city."""
+    if not PERSISTENCE_OK:
+        return []
+
+    try:
+        with db_connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT data_json
+                FROM completed_quests
+                WHERE user_id=? AND city=?
+                ORDER BY id DESC
+                LIMIT 5
+                """,
+                (int(user_id), str(city_name)),
+            ).fetchall()
+
+        seen = []
+        for row in rows:
+            try:
+                payload = json.loads(row["data_json"])
+            except Exception:
+                continue
+
+            quest = payload.get("quest") or {}
+            for stop in quest.get("stops", []):
+                mission = stop.get("mission") or {}
+                title = str(mission.get("title") or "").strip()
+                body = str(mission.get("text") or "").strip()
+                if not title:
+                    continue
+                memory = title if not body else f"{title}: {short_text(body, 110)}"
+                if memory not in seen:
+                    seen.append(memory)
+                if len(seen) >= limit:
+                    return seen
+
+        return seen
+    except Exception:
+        logger.exception("Failed to load mission memory for %s / %s", user_id, city_name)
+        return []
+
+
 def db_latest_card(user_id: int):
     if not PERSISTENCE_OK:
         return None
@@ -1925,42 +1969,186 @@ async def select_route(places, interests, duration):
     raise RuntimeError("No confirmed POI")
 
 
+AI_MISSION_MECHANICS = [
+    "detail",
+    "symbol",
+    "text",
+    "photo",
+    "contrast",
+    "nature",
+    "color",
+    "compare",
+    "menu",
+    "question",
+    "spicy",
+    "ingredients",
+    "object",
+]
+
+
 AI_META_SCHEMA = {
     "type": "object",
     "properties": {
         "title": {"type": "string"},
         "intro": {"type": "string"},
         "final_challenge": {"type": "string"},
+        "missions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "poi_index": {"type": "integer"},
+                    "mechanic": {"type": "string", "enum": AI_MISSION_MECHANICS},
+                    "title": {"type": "string"},
+                    "task": {"type": "string"},
+                    "hint": {"type": "string"},
+                    "photo": {"type": "string"},
+                },
+                "required": ["poi_index", "mechanic", "title", "task", "hint", "photo"],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["title", "intro", "final_challenge"],
+    "required": ["title", "intro", "final_challenge", "missions"],
     "additionalProperties": False,
 }
 
 
-async def groq_meta(city, duration, interests, style, places):
-    place_lines = "\n".join(
-        f"{i}. {safe_russian_name(p)} | {p['category_label']}"
-        for i, p in enumerate(places, 1)
-    )
+def verified_context_for_ai(place):
+    details = place.get("details") or {}
+    description = details.get("description")
+    if not isinstance(description, str):
+        description = ""
+
+    categories = [
+        str(value)
+        for value in (place.get("categories") or [])[:10]
+        if value
+    ]
+
+    return {
+        "name_ru": safe_russian_name(place),
+        "source_name": str(place.get("name") or ""),
+        "category": str(place.get("category_label") or ""),
+        "address": short_text(place.get("formatted") or "", 180),
+        "verified_description": short_text(description, 360),
+        "map_categories": categories,
+    }
+
+
+def allowed_mechanics_for_place(place, style):
+    group = place_group(place)
+
+    allowed = {
+        "heritage": {"detail", "symbol", "text", "photo", "contrast"},
+        "temple": {"detail", "symbol", "text", "photo", "contrast"},
+        "park": {"nature", "color", "photo", "contrast", "detail"},
+        "tea": {"compare", "menu", "text", "question"},
+        "restaurant": {"menu", "spicy", "ingredients", "text", "question"},
+        "cafe": {"menu", "spicy", "ingredients", "text", "question"},
+        "market": {"menu", "object", "symbol", "text", "photo", "detail"},
+        "museum": {"detail", "question", "text", "photo"},
+        "art": {"photo", "detail", "color", "contrast"},
+        "viewpoint": {"photo", "detail", "color", "contrast"},
+        "other": {"detail", "text", "photo", "contrast"},
+    }.get(group, {"detail", "text", "photo"})
+
+    # Calm mode should never require talking to a stranger or staff member.
+    if style == "calm":
+        allowed.discard("question")
+
+    return allowed
+
+
+def ai_rules_for_place(place, style):
+    group = place_group(place)
+    allowed = sorted(allowed_mechanics_for_place(place, style))
+
+    guidance = {
+        "heritage": "наблюдение за реально видимыми деталями, орнаментом, формой, надписью, контрастом или фотокомпозицией",
+        "temple": "наблюдение за реально видимыми деталями, символами, формой, надписью или фотокомпозицией; не утверждай значение символа заранее",
+        "park": "природа, свет, цвет, отражение, форма, контраст природы и города, фотокомпозиция",
+        "tea": "сравнение двух вариантов по меню/аромату, чтение названия, безопасный короткий вопрос; покупка не обязательна",
+        "restaurant": "меню, название блюда, предполагаемая острота или состав по доступной информации; покупка и еда не обязательны",
+        "cafe": "меню, название напитка/блюда, острота или состав по доступной информации; покупка не обязательна",
+        "market": "еда/меню ИЛИ предмет/декор/вывеска/символ; пользователь сам выбирает находку; ничего покупать не нужно",
+        "museum": "выбор реально увиденного объекта/изображения/детали или вопрос к нему; обязательно учитывать запрет на съёмку, если он есть",
+        "art": "ракурс, линия, цвет, форма, композиция, сравнение двух визуальных решений",
+        "viewpoint": "ракурс, передний план, линии, цвет, свет, сравнение кадров",
+        "other": "надпись, форма, цвет, необычная видимая деталь, контраст или фотокомпозиция",
+    }.get(group, "наблюдение за реально видимой деталью, надписью, формой или фотокомпозицией")
+
+    return {
+        "group": group,
+        "allowed_mechanics": allowed,
+        "guidance": guidance,
+    }
+
+
+async def groq_meta(city, duration, interests, style, places, avoid_missions=None):
+    fallback_missions = safe_fallback_missions(places, interests)
     interest_text = ", ".join(INTERESTS[k]["label"] for k in interests)
 
+    poi_payload = []
+    for i, (place, fallback) in enumerate(zip(places, fallback_missions), 1):
+        poi_payload.append({
+            "poi_index": i,
+            "verified_place": verified_context_for_ai(place),
+            "rules": ai_rules_for_place(place, style),
+            "safe_baseline": {
+                "title": fallback["title"],
+                "task": fallback["text"],
+                "hint": fallback["tip"],
+                "photo": fallback["photo"],
+            },
+        })
+
+    old_text = "\n".join(f"- {item}" for item in (avoid_missions or [])) or "- нет"
+
     prompt = f"""
-Ты редактор русскоязычного CityQuest China.
-Реальные места, их типы, названия, причины выбора и миссии уже определены программой.
-ТЫ НЕ ИМЕЕШЬ ПРАВА переименовывать точки, переводить их названия, менять их тип или придумывать факты.
+Ты создаёшь персональный CityQuest China для русскоязычного туриста.
+
+КРИТИЧЕСКАЯ АРХИТЕКТУРА:
+- Все места ниже уже найдены и проверены картографическим API.
+- Ты НЕ выбираешь POI, НЕ меняешь их названия, адреса, категории или координаты.
+- Ты создаёшь только творческую формулировку миссии ВНУТРИ разрешённого коридора для каждого конкретного POI.
+- Если verified_description пустой, у тебя НЕТ подтверждённых исторических фактов об этом месте.
 
 Город: {city_display_ru(city)}
 Время: {duration}
-Интересы: {interest_text}
+Интересы пользователя: {interest_text}
 Стиль: {STYLE_LABELS[style]}
 
-Верни только:
-- title: атмосферное название квеста на русском;
-- intro: 1–2 предложения на русском;
-- final_challenge: короткий финальный фото/рефлексивный челлендж.
+ПОЧЕМУ НУЖНА ПЕРСОНАЛИЗАЦИЯ:
+Миссии в разных городах и у разных точек не должны ощущаться одним и тем же шаблоном.
+Учитывай название конкретной точки, её подтверждённую категорию, интересы и стиль пользователя.
+Не ограничивайся заменой названия города в одинаковом тексте.
 
-Финальные точки для контекста:
-{place_lines}
+ЖЁСТКИЕ ПРАВИЛА БЕЗОПАСНОСТИ И ФАКТОВ:
+1. Используй ровно один объект из списка на каждый poi_index; верни ровно {len(places)} missions.
+2. mechanic должен входить в allowed_mechanics именно этого POI.
+3. Нельзя придумывать исторические факты, цены, часы работы, экспонаты, блюда, архитектурные элементы или традиции, которых нет в verified_description.
+4. Если конкретная деталь не подтверждена, формулируй задачу открыто: «найди одну видимую деталь», «выбери то, что заметишь», «если увидишь…».
+5. Никаких «здесь обязательно есть дракон/лев/фреска/блюдо». Наблюдение должно оставаться выполнимым даже если конкретного элемента нет.
+6. Еда/меню/чай допустимы только там, где rules это разрешают.
+7. Не требуй покупки, заказа, употребления еды/напитка или платной услуги.
+8. Не требуй заходить в закрытые зоны, перелезать ограждения, выходить на дорогу, нарушать правила объекта.
+9. Не требуй фотографировать незнакомых людей. Если взаимодействие разрешено стилем и категорией — оно должно быть коротким, вежливым и необязательным.
+10. Турист не обязан знать китайский. Не вставляй китайские фразы: приложение добавляет проверенные фразы само.
+11. Пиши только по-русски, естественно, конкретно, без Markdown и без рекламных формулировок.
+12. Каждая миссия должна заметно отличаться от других по механике или наблюдению.
+
+МИССИИ ИЗ ПРЕДЫДУЩИХ КВЕСТОВ ЭТОГО ПОЛЬЗОВАТЕЛЯ В ЭТОМ ГОРОДЕ — НЕ ПОВТОРЯЙ ИХ, ЕСЛИ МОЖНО:
+{old_text}
+
+РЕАЛЬНЫЕ ТОЧКИ И БЕЗОПАСНЫЕ КОРИДОРЫ:
+{json.dumps(poi_payload, ensure_ascii=False, indent=2)}
+
+Верни JSON по схеме:
+- title: атмосферное название всего квеста на русском;
+- intro: 1–2 коротких предложения;
+- final_challenge: короткий финальный фото/рефлексивный челлендж;
+- missions: для каждого poi_index ровно одна миссия: mechanic, title, task, hint, photo.
 """.strip()
 
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -1971,14 +2159,20 @@ async def groq_meta(city, duration, interests, style, places):
     payload = {
         "model": GROQ_MODEL,
         "messages": [
-            {"role": "system", "content": "Только русский JSON по схеме. Не переименовывай реальные места."},
+            {
+                "role": "system",
+                "content": (
+                    "Только русский JSON по схеме. Реальные POI неизменяемы. "
+                    "Персонализируй миссии, но не придумывай факты."
+                ),
+            },
             {"role": "user", "content": prompt},
         ],
         "reasoning_effort": "low",
         "response_format": {
             "type": "json_schema",
             "json_schema": {
-                "name": "cityquest_meta",
+                "name": "cityquest_ai_missions_v2",
                 "strict": True,
                 "schema": AI_META_SCHEMA,
             },
@@ -1993,12 +2187,16 @@ async def groq_meta(city, duration, interests, style, places):
                     body = await response.text()
                     if response.status == 200:
                         data = json.loads(body)
-                        return json.loads(data["choices"][0]["message"]["content"])
-                    logger.error("Groq meta HTTP %s: %s", response.status, body[:500])
+                        result = json.loads(data["choices"][0]["message"]["content"])
+                        if isinstance(result, dict):
+                            return result
+                    logger.error("Groq quest HTTP %s: %s", response.status, body[:700])
         except Exception:
-            logger.exception("Groq meta")
+            logger.exception("Groq quest AI Missions v2")
         if attempt == 0:
             await asyncio.sleep(2)
+
+    # Important: the current template mission engine remains the fallback.
     return {}
 
 
@@ -2147,14 +2345,151 @@ def park_mission_variants(photo_interest):
     ]
 
 
-def choose_unused_variant(variants, used_titles):
-    for variant in variants:
+def stable_variant_index(place, count, salt=0):
+    if count <= 1:
+        return 0
+    token = f"{place.get('place_id') or ''}|{place.get('name') or ''}|{salt}"
+    value = sum((i + 1) * ord(ch) for i, ch in enumerate(token))
+    return value % count
+
+
+def choose_unused_variant(variants, used_titles, preferred_index=0):
+    if not variants:
+        raise ValueError("Mission variants are empty")
+
+    count = len(variants)
+    preferred_index = int(preferred_index or 0) % count
+    ordered = [variants[(preferred_index + i) % count] for i in range(count)]
+
+    for variant in ordered:
         if variant["title"] not in used_titles:
             return dict(variant)
-    # If every template of this category was already used, rotate but alter title visibly.
-    fallback = dict(variants[len(used_titles) % len(variants)])
-    fallback["title"] = f"{fallback['title']} · второй раунд"
+
+    fallback = dict(ordered[len(used_titles) % count])
+    fallback["title"] = f"{fallback['title']} · другой ракурс"
     return fallback
+
+
+def clean_ai_mission_value(value, max_len):
+    value = str(value or "").strip()
+    value = re.sub(r"<[^>]+>", "", value)
+    value = value.replace("**", "").replace("```", "").replace("`", "")
+    value = re.sub(r"\s+", " ", value).strip()
+    return value[:max_len].rstrip()
+
+
+def phrase_for_ai_mechanic(place, mechanic, fallback):
+    group = place_group(place)
+
+    if group in {"restaurant", "cafe"}:
+        if mechanic == "spicy":
+            return PHRASES["spicy"]
+        if mechanic == "ingredients":
+            return PHRASES["inside"]
+        if mechanic in {"menu", "question"}:
+            return PHRASES["recommend"]
+        return None
+
+    if group == "tea":
+        if mechanic == "compare":
+            return PHRASES["smell"]
+        if mechanic in {"menu", "question"}:
+            return PHRASES["recommend"]
+        return None
+
+    return fallback.get("phrase")
+
+
+def ai_mission_is_safe(place, candidate, style):
+    if not isinstance(candidate, dict):
+        return False, "not_object"
+
+    mechanic = str(candidate.get("mechanic") or "").strip()
+    if mechanic not in allowed_mechanics_for_place(place, style):
+        return False, "mechanic_not_allowed"
+
+    values = {
+        "title": clean_ai_mission_value(candidate.get("title"), 70),
+        "task": clean_ai_mission_value(candidate.get("task"), 560),
+        "hint": clean_ai_mission_value(candidate.get("hint"), 340),
+        "photo": clean_ai_mission_value(candidate.get("photo"), 280),
+    }
+
+    if any(not value for value in values.values()):
+        return False, "empty_field"
+
+    if not contains_cyrillic(values["title"]) or not contains_cyrillic(values["task"]):
+        return False, "not_russian"
+
+    combined = " ".join(values.values()).casefold()
+
+    unsafe_patterns = [
+        r"перелез",
+        r"перепрыгн",
+        r"зайди\s+за\s+ограж",
+        r"закрыт(?:ую|ой)\s+зон",
+        r"служебн(?:ую|ой)\s+зон",
+        r"выйди\s+на\s+проезж",
+        r"сфотографируй\s+(?:незнаком|прохож|человек)",
+        r"сними\s+(?:незнаком|прохож|человек)\s+крупным",
+        r"обязательно\s+куп",
+        r"\bкупи\b",
+        r"\bзакажи\b",
+        r"\bсъешь\b",
+        r"\bвыпей\b",
+        r"попробуй\s+(?:блюдо|еду|напиток|чай)",
+    ]
+    if any(re.search(pattern, combined) for pattern in unsafe_patterns):
+        return False, "unsafe_action"
+
+    group = place_group(place)
+    if group not in {"restaurant", "cafe", "tea", "market"}:
+        food_terms = re.compile(
+            r"\b(?:меню|блюд\w*|еда|напит\w*|остр\w*|ингредиент\w*|чай\w*|аромат\w*|вкус\w*)\b"
+        )
+        if food_terms.search(combined):
+            return False, "food_mismatch"
+
+    if group != "museum" and re.search(r"\bэкспонат\w*\b", combined):
+        return False, "museum_mismatch"
+
+    return True, "ok"
+
+
+def merge_ai_mission(place, fallback, candidate, interests, style):
+    safe, reason = ai_mission_is_safe(place, candidate, style)
+    if not safe:
+        result = dict(fallback)
+        result["source"] = "template"
+        result["fallback_reason"] = reason
+        return result
+
+    mechanic = str(candidate.get("mechanic") or "").strip()
+    result = dict(fallback)
+    result.update({
+        "title": clean_ai_mission_value(candidate.get("title"), 70),
+        "text": clean_ai_mission_value(candidate.get("task"), 560),
+        "tip": clean_ai_mission_value(candidate.get("hint"), 340),
+        "photo": clean_ai_mission_value(candidate.get("photo"), 280),
+        "mechanic": mechanic,
+        "source": "ai_v2",
+    })
+
+    phrase = phrase_for_ai_mechanic(place, mechanic, fallback)
+    if phrase:
+        result["phrase"] = phrase
+    else:
+        result.pop("phrase", None)
+
+    return result
+
+
+def safe_fallback_missions(places, interests):
+    used_titles = set()
+    missions = []
+    for index, place in enumerate(places):
+        missions.append(mission_for_place(place, interests, index, used_titles))
+    return missions
 
 
 def mission_for_place(place, interests, index, used_titles):
@@ -2162,10 +2497,20 @@ def mission_for_place(place, interests, index, used_titles):
     photo_interest = "photo" in interests
 
     if group in {"heritage", "temple"}:
-        mission = choose_unused_variant(heritage_mission_variants(place), used_titles)
+        variants = heritage_mission_variants(place)
+        mission = choose_unused_variant(
+            variants,
+            used_titles,
+            stable_variant_index(place, len(variants), index),
+        )
 
     elif group == "park":
-        mission = choose_unused_variant(park_mission_variants(photo_interest), used_titles)
+        variants = park_mission_variants(photo_interest)
+        mission = choose_unused_variant(
+            variants,
+            used_titles,
+            stable_variant_index(place, len(variants), index),
+        )
 
     elif group == "tea":
         mission = {
@@ -2235,7 +2580,7 @@ def mission_for_place(place, interests, index, used_titles):
                 "phrase": PHRASES["inside"],
             },
         ]
-        mission = choose_unused_variant(variants, used_titles)
+        mission = choose_unused_variant(variants, used_titles, stable_variant_index(place, len(variants), index))
 
 
     elif group == "market":
@@ -2270,7 +2615,7 @@ def mission_for_place(place, interests, index, used_titles):
                 "minutes": 10,
             },
         ]
-        mission = choose_unused_variant(variants, used_titles)
+        mission = choose_unused_variant(variants, used_titles, stable_variant_index(place, len(variants), index))
 
     elif group == "museum":
         variants = [
@@ -2293,7 +2638,7 @@ def mission_for_place(place, interests, index, used_titles):
                 "minutes": 12,
             },
         ]
-        mission = choose_unused_variant(variants, used_titles)
+        mission = choose_unused_variant(variants, used_titles, stable_variant_index(place, len(variants), index))
 
     elif group in {"art", "viewpoint"}:
         variants = [
@@ -2316,7 +2661,7 @@ def mission_for_place(place, interests, index, used_titles):
                 "minutes": 12,
             },
         ]
-        mission = choose_unused_variant(variants, used_titles)
+        mission = choose_unused_variant(variants, used_titles, stable_variant_index(place, len(variants), index))
 
     else:
         variants = [
@@ -2339,7 +2684,7 @@ def mission_for_place(place, interests, index, used_titles):
                 "minutes": 10,
             },
         ]
-        mission = choose_unused_variant(variants, used_titles)
+        mission = choose_unused_variant(variants, used_titles, stable_variant_index(place, len(variants), index))
 
     used_titles.add(mission["title"])
     return mission
@@ -2465,10 +2810,40 @@ def build_quest(city, interests, style, places, ai_meta, adaptive_mode="rich"):
     social_used = False
     used_titles = set()
 
+    ai_candidates = {}
+    raw_missions = ai_meta.get("missions") if isinstance(ai_meta, dict) else None
+    if isinstance(raw_missions, list):
+        for item in raw_missions:
+            if not isinstance(item, dict):
+                continue
+            try:
+                poi_index = int(item.get("poi_index")) - 1
+            except Exception:
+                continue
+            if 0 <= poi_index < len(places) and poi_index not in ai_candidates:
+                ai_candidates[poi_index] = item
+
+    accepted_ai = 0
+
     for i, place in enumerate(places):
         name_ru = safe_russian_name(place)
         reason = reason_for_place(place, interests)
-        mission = mission_for_place(place, interests, i, used_titles)
+        fallback = mission_for_place(place, interests, i, used_titles)
+        mission = merge_ai_mission(
+            place,
+            fallback,
+            ai_candidates.get(i),
+            interests,
+            style,
+        )
+
+        if mission.get("source") == "ai_v2":
+            accepted_ai += 1
+
+        # The displayed titles must remain unique even after AI personalization.
+        base_title = mission["title"]
+        if base_title in {stop["mission"]["title"] for stop in stops}:
+            mission["title"] = f"{base_title} · {i+1}"
 
         bonus = None
         if (
@@ -2488,6 +2863,13 @@ def build_quest(city, interests, style, places, ai_meta, adaptive_mode="rich"):
             "bonus": bonus,
         })
 
+    logger.info(
+        "AI Missions v2 accepted %s/%s for %s",
+        accepted_ai,
+        len(places),
+        city_display_ru(city),
+    )
+
     return {
         "title": str(ai_meta.get("title") or "").strip() or f"CityQuest · {city_display_ru(city)}",
         "intro": str(ai_meta.get("intro") or "").strip() or (
@@ -2500,6 +2882,7 @@ def build_quest(city, interests, style, places, ai_meta, adaptive_mode="rich"):
         "final_challenge": str(ai_meta.get("final_challenge") or "").strip() or (
             "Выбери лучший кадр прогулки и придумай ему короткое название."
         ),
+        "ai_missions_accepted": accepted_ai,
     }
 
 
@@ -3970,10 +4353,22 @@ async def style_cb(callback: CallbackQuery, state: FSMContext):
     await status.edit_text(
         f"🤖 <b>Точки проверены.</b>\n\n"
         f"Пешком ~{fmt_distance(route['distance_m'])} · ~{fmt_minutes(route['time_s']/60)}.\n"
-        "ИИ теперь отвечает только за атмосферное название квеста — типы мест и причины он не придумывает."
+        "AI создаёт персональные миссии именно для этих реальных точек. "
+        "Названия, категории и координаты он менять не может; сомнительная миссия автоматически заменяется безопасной."
     )
 
-    ai_meta = await groq_meta(city, duration, interests, style, selected)
+    avoid_missions = db_recent_missions_for_city(
+        callback.from_user.id,
+        city_display_ru(city),
+    )
+    ai_meta = await groq_meta(
+        city,
+        duration,
+        interests,
+        style,
+        selected,
+        avoid_missions=avoid_missions,
+    )
     quest = build_quest(city, interests, style, selected, ai_meta, adaptive_mode=adaptive_mode)
 
     await state.update_data(quest=quest, route=route, style=style)
@@ -4895,7 +5290,8 @@ async def about(callback: CallbackQuery):
         "ℹ️ <b>Как работает CityQuest China</b>\n\n"
         "• Город можно написать по-русски, по-китайски или по-английски.\n"
         "• Geoapify находит реальные места и проверяет пеший маршрут.\n"
-        "• AI оформляет квест на русском.\n"
+        "• AI персонализирует миссии для конкретных реальных точек, интересов и стиля прогулки.\n"
+        "• Названия и координаты мест берутся только из Geoapify; если AI-миссия не проходит проверку, включается безопасный шаблон.\n"
         "• Vision AI разбирает фото, меню, надписи, символы, достопримечательности и памятники.\n"
         "• Если AI не уверен — бот даёт простую китайскую фразу, которую можно показать человеку.\n"
         "• Активный квест, прогресс, XP и фото сохраняются между перезапусками BotHost.\n"
@@ -4913,7 +5309,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Starting CityQuest China v7.3 Custom Impressions")
+    logger.info("Starting CityQuest China v8 Safe AI Missions v2")
     await dp.start_polling(bot)
 
 
