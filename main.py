@@ -180,6 +180,116 @@ def short_text(value: str, max_len: int = 25) -> str:
     return value[: max_len - 1].rstrip() + "…"
 
 
+def contains_cyrillic(text: str) -> bool:
+    return bool(re.search(r"[А-Яа-яЁё]", str(text or "")))
+
+
+def clean_category_ru(label: str) -> str:
+    """Remove leading emoji from a Russian category label."""
+    value = str(label or "").strip()
+    value = re.sub(r"^[^\wА-Яа-яЁё]+\s*", "", value)
+    return value or "интересное место"
+
+
+def russian_place_label(stop: dict) -> str:
+    """
+    Short human-readable Russian label for checklist/cards.
+    Priority:
+    1) AI-provided Russian name;
+    2) safe heuristic from the verified POI name;
+    3) verified Geoapify Russian category.
+    """
+    friendly = str(stop.get("friendly_name") or "").strip()
+    if friendly and contains_cyrillic(friendly):
+        return friendly
+
+    place = stop.get("place") or {}
+    original = str(place.get("name") or "").strip()
+
+    # Common Chinese POI names/suffixes. These are UI labels, not historical claims.
+    exact_map = {
+        "天府广场": "Площадь Тяньфу",
+        "钟楼": "Колокольная башня",
+        "鼓楼": "Барабанная башня",
+        "西安鼓楼博物馆": "Музей Барабанной башни Сианя",
+        "西安钟楼": "Колокольная башня Сианя",
+        "西安城墙": "Городская стена Сианя",
+        "大雁塔": "Большая пагода диких гусей",
+        "小雁塔": "Малая пагода диких гусей",
+        "星巴克": "Starbucks",
+        "喜茶": "Чайная HEYTEA",
+    }
+    if original in exact_map:
+        return exact_map[original]
+
+    # English names: keep recognizable brand/name, but add a Russian type if useful.
+    lower = original.casefold()
+    if original and not contains_han(original):
+        if "market" in lower:
+            return "Рынок"
+        if "museum" in lower:
+            return "Музей"
+        if "park" in lower:
+            return "Парк"
+        if "temple" in lower:
+            return "Храм"
+        if "cafe" in lower or "coffee" in lower:
+            return "Кафе"
+        if "tea" in lower:
+            return "Чайная"
+        # Brand or known Latin name is readable even without Chinese.
+        return original
+
+    # Chinese suffix/type heuristics.
+    if original:
+        if original.endswith("广场"):
+            base = original[:-2]
+            if base:
+                return f"Площадь {place.get('pinyin') or base}"
+            return "Площадь"
+        if original.endswith("博物馆"):
+            return "Музей"
+        if original.endswith("公园"):
+            return "Парк"
+        if original.endswith("花园") or original.endswith("园"):
+            return "Сад / парк"
+        if original.endswith("寺") or original.endswith("庙"):
+            return "Храм"
+        if original.endswith("塔"):
+            return "Пагода / башня"
+        if original.endswith("城墙"):
+            return "Городская стена"
+        if original.endswith("市场"):
+            return "Рынок"
+        if original.endswith("茶馆") or original.endswith("茶楼"):
+            return "Чайная"
+        if "咖啡" in original:
+            return "Кафе"
+        if original.endswith("街"):
+            return "Улица / квартал"
+
+    return clean_category_ru(place.get("category_label") or "интересное место")
+
+
+def bilingual_stop_label(stop: dict, max_len: int = 52) -> str:
+    """
+    Checklist label: Russian first; original only when it adds useful orientation.
+    Examples:
+      Колокольная башня · 钟楼
+      Рынок · Muslim Street Food Market
+    """
+    place = stop.get("place") or {}
+    original = str(place.get("name") or "").strip()
+    russian = russian_place_label(stop)
+
+    if original and original.casefold() != russian.casefold():
+        value = f"{russian} · {original}"
+    else:
+        value = russian
+
+    return short_text(value, max_len)
+
+
 def fmt_minutes(minutes: float) -> str:
     minutes = int(round(minutes))
     if minutes < 60:
@@ -264,7 +374,7 @@ def checklist_keyboard(quest: dict, completed: list[int]):
 
     for index, stop in enumerate(quest.get("stops", [])):
         done = index in completed_set
-        label = short_text(stop.get("friendly_name") or stop["place"]["name"], 28)
+        label = bilingual_stop_label(stop, 44)
         kb.button(
             text=f"{'✅' if done else '☐'} {index + 1} · {label}",
             callback_data=f"mission_toggle:{index}",
@@ -297,14 +407,22 @@ def checklist_text(quest: dict, completed: list[int]) -> str:
         mark = "✅" if index in completed_set else "☐"
         lines.append(
             f"{mark} <b>{index + 1}.</b> "
-            f"{esc(short_text(stop.get('friendly_name') or stop['place']['name'], 34))}"
+            f"{esc(bilingual_stop_label(stop, 62))}"
         )
+
+    earned_xp = sum(
+        int(stop.get("xp", 20))
+        for idx, stop in enumerate(quest.get("stops", []))
+        if idx in completed_set
+    )
+    total_xp = sum(int(stop.get("xp", 20)) for stop in quest.get("stops", []))
 
     lines.extend(
         [
             "",
             ("🟩" * len(completed_set)) + ("⬜" * max(0, total - len(completed_set))),
             f"Прогресс: <b>{len(completed_set)}/{total}</b>",
+            f"⭐ XP: <b>{earned_xp}/{total_xp}</b>",
         ]
     )
     return "\n".join(lines)
@@ -932,6 +1050,284 @@ async def select_compact_route(
     raise RuntimeError("No realistic route fits the selected duration")
 
 
+
+def category_key(place: dict) -> str:
+    label = (place.get("category_label") or "").lower()
+
+    if "чайная" in label:
+        return "tea"
+    if "кафе" in label or "ресторан" in label or "фуд" in label:
+        return "cafe"
+    if "музей" in label:
+        return "museum"
+    if "храм" in label or "религиоз" in label:
+        return "temple"
+    if "ворота" in label:
+        return "heritage"
+    if "истор" in label or "достопримеч" in label:
+        return "heritage"
+    if "сад" in label:
+        return "garden"
+    if "парк" in label or "природ" in label:
+        return "park"
+    if "арт" in label or "культур" in label:
+        return "art"
+    if "рынок" in label:
+        return "market"
+    if "смотров" in label:
+        return "viewpoint"
+
+    return "general"
+
+
+def mission_blueprint(
+    place: dict,
+    selected_interests: list[str],
+    style: str,
+    index: int,
+) -> dict:
+    """Safe mission that never assumes an unverified object exists at the POI."""
+    kind = category_key(place)
+    tradition_selected = "tradition" in selected_interests
+    photo_selected = "photo" in selected_interests
+
+    # Rotate mechanics so a route does not become four identical photo tasks.
+    rotation = index % 3
+
+    if kind in {"park", "garden"}:
+        if tradition_selected and rotation == 0:
+            return {
+                "mission_type": "tradition",
+                "mission": (
+                    "Осмотрись вокруг. Если увидишь элемент, который кажется традиционным — "
+                    "например, форму крыши, фонарь, ворота, каллиграфию или павильон — "
+                    "выбери самый интересный. Если ничего такого нет, выбери деталь, "
+                    "которая лучше всего передаёт характер этого места."
+                ),
+                "tip": "Ничего специально искать по карте не нужно — работай только с тем, что реально видишь вокруг.",
+                "xp": 30,
+            }
+        if photo_selected or rotation == 1:
+            return {
+                "mission_type": "photo",
+                "mission": (
+                    "Собери кадр из трёх слоёв: что-то природное на переднем плане, "
+                    "пространство парка в середине и любую заметную деталь вдали. "
+                    "Сделай один кадр, который лучше всего передаёт атмосферу места."
+                ),
+                "tip": "Не ищи конкретный объект — выбери любые реально видимые элементы.",
+                "xp": 20,
+            }
+        return {
+            "mission_type": "compare",
+            "mission": (
+                "Найди две разные фактуры или формы в этом месте — например, природную и созданную человеком. "
+                "Сравни их и выбери, какая сильнее задаёт настроение парку."
+            ),
+            "tip": "Подойдут листья, камень, вода, дорожка, ограда, здание или любой другой реально видимый элемент.",
+            "xp": 20,
+        }
+
+    if kind == "tea":
+        return {
+            "mission_type": "taste_smell",
+            "mission": (
+                "Миссия «Два аромата»: если сотрудники могут показать или дать понюхать два чая, "
+                "сравни их аромат и выбери более травянистый, цветочный, ореховый или просто более приятный тебе. "
+                "Если такой возможности нет, сравни два названия или описания в меню и выбери, какой напиток ты бы попробовал."
+            ),
+            "tip": "Покупать напиток не обязательно.",
+            "xp": 30,
+            "phrase": "我可以闻一下吗？",
+            "pinyin": "Wǒ kěyǐ wén yíxià ma?",
+            "ru_pronunciation": "Во кэ-и вэнь и-ся ма?",
+            "translation": "Можно понюхать?",
+        }
+
+    if kind == "cafe":
+        return {
+            "mission_type": "choice",
+            "mission": (
+                "Выбери две позиции или два вкусовых сочетания, которые видишь в меню. "
+                "Не покупая ничего, реши, какое кажется тебе более необычным для этой прогулки, и запомни свой выбор."
+            ),
+            "tip": "Если меню непонятно, ориентируйся на фотографии, английские слова или переводчик в телефоне.",
+            "xp": 20,
+        }
+
+    if kind in {"heritage", "temple"}:
+        return {
+            "mission_type": "tradition",
+            "mission": (
+                "Найди один реально видимый декоративный элемент: узор, цветовое сочетание, "
+                "форму крыши, ворота, надпись или другой архитектурный штрих. "
+                "Выбери тот, который тебе хочется рассмотреть дольше всего."
+            ),
+            "tip": "Тебе не нужно знать его значение. Задача — заметить форму, цвет или ритм.",
+            "xp": 30,
+        }
+
+    if kind == "museum":
+        return {
+            "mission_type": "observe",
+            "mission": (
+                "Если музей открыт, найди один предмет или изображение, о котором тебе захотелось бы узнать больше, "
+                "и сформулируй один вопрос к нему. Если музей закрыт или ты не заходишь внутрь — "
+                "сделай то же самое с любой деталью фасада или входной зоны."
+            ),
+            "tip": "Ответ искать не обязательно — хороший вопрос уже считается выполнением миссии.",
+            "xp": 30,
+        }
+
+    if kind == "market":
+        return {
+            "mission_type": "observe",
+            "mission": (
+                "Найди три повторяющихся цвета, формы или типа упаковки/вывесок. "
+                "Выбери один визуальный мотив, который сильнее всего отличает это место от привычных тебе магазинов."
+            ),
+            "tip": "Ничего покупать и фотографировать людей без разрешения не нужно.",
+            "xp": 20,
+        }
+
+    if kind in {"art", "viewpoint"}:
+        return {
+            "mission_type": "photo" if photo_selected else "compare",
+            "mission": (
+                "Посмотри на место с двух разных точек или дистанций. "
+                "Выбери ракурс, в котором оно кажется наиболее выразительным; если хочется — сделай один кадр."
+            ),
+            "tip": "Сравнивай композицию, линии и пространство, а не ищи заранее заданный объект.",
+            "xp": 20,
+        }
+
+    # Universal fallback, safe for any named POI.
+    return {
+        "mission_type": "observe",
+        "mission": (
+            "За две минуты найди три детали, которые отличают это место от предыдущей остановки. "
+            "Выбери одну и коротко сформулируй, почему именно она запомнилась."
+        ),
+        "tip": "Это могут быть цвет, звук, форма, запах, движение людей или устройство пространства.",
+        "xp": 20,
+    }
+
+
+def social_bonus_for_adventure() -> dict:
+    return {
+        "bonus": (
+            "Если тебе комфортно, попроси прохожего сфотографировать тебя. "
+            "Если не хочется обращаться к людям — просто сделай селфи."
+        ),
+        "chinese_phrase": "请帮我拍张照片，可以吗？",
+        "pinyin": "Qǐng bāng wǒ pāi zhāng zhàopiàn, kěyǐ ma?",
+        "ru_pronunciation": "Цин бан во пай чжан чжаопьен, кэ-и ма?",
+        "phrase_translation": "Можете меня сфотографировать, пожалуйста?",
+    }
+
+
+def build_safe_quest(
+    city: dict,
+    duration: str,
+    interests: list[str],
+    style: str,
+    places: list[dict],
+    ai_meta: dict | None = None,
+) -> dict:
+    """Deterministic, safe quest. AI may supply only atmosphere/title/reasons."""
+    ai_meta = ai_meta or {}
+    stops = []
+    social_added = False
+
+    ai_reasons = ai_meta.get("reasons") or []
+    ai_names = ai_meta.get("friendly_names") or []
+
+    for index, place in enumerate(places):
+        blueprint = mission_blueprint(place, interests, style, index)
+
+        stop = {
+            "poi_index": index + 1,
+            "place": place,
+            "friendly_name": (
+                str(ai_names[index]).strip()
+                if (
+                    index < len(ai_names)
+                    and str(ai_names[index]).strip()
+                    and contains_cyrillic(str(ai_names[index]))
+                )
+                else clean_category_ru(place.get("category_label") or "интересное место")
+            ),
+            "why_here": (
+                str(ai_reasons[index]).strip()
+                if index < len(ai_reasons) and str(ai_reasons[index]).strip()
+                else "Эта точка подходит под выбранные интересы и компактно входит в маршрут."
+            ),
+            "mission_type": blueprint["mission_type"],
+            "mission": blueprint["mission"],
+            "tip": blueprint["tip"],
+            "mission_minutes": 12 if blueprint["xp"] == 20 else 15,
+            "xp": blueprint["xp"],
+            "bonus": "",
+            "chinese_phrase": blueprint.get("phrase", ""),
+            "phrase_pinyin": blueprint.get("pinyin", ""),
+            "ru_pronunciation": blueprint.get("ru_pronunciation", ""),
+            "phrase_translation": blueprint.get("translation", ""),
+        }
+
+        # Add exactly one optional social bonus in Adventure mode.
+        if style == "adventure" and not social_added and index >= 1:
+            social = social_bonus_for_adventure()
+            stop.update(
+                {
+                    "bonus": social["bonus"],
+                    "chinese_phrase": social["chinese_phrase"],
+                    "phrase_pinyin": social["pinyin"],
+                    "ru_pronunciation": social["ru_pronunciation"],
+                    "phrase_translation": social["phrase_translation"],
+                }
+            )
+            social_added = True
+
+        stops.append(stop)
+
+    title = str(ai_meta.get("title") or f"CityQuest · {city.get('input_name') or city.get('city')}")
+    intro = str(
+        ai_meta.get("intro")
+        or "Небольшое приключение по реальным точкам города: наблюдай, сравнивай и собирай свои впечатления."
+    )
+    final_challenge = str(
+        ai_meta.get("final_challenge")
+        or "Выбери одну фотографию или одну деталь маршрута, которая лучше всего запомнилась, и дай ей своё название."
+    )
+
+    return {
+        "title": title,
+        "intro": intro,
+        "stops": stops,
+        "final_challenge": final_challenge,
+    }
+
+
+AI_META_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "intro": {"type": "string"},
+        "friendly_names": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "reasons": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "final_challenge": {"type": "string"},
+    },
+    "required": ["title", "intro", "friendly_names", "reasons", "final_challenge"],
+    "additionalProperties": False,
+}
+
+
 QUEST_SCHEMA = {
     "type": "object",
     "properties": {
@@ -986,112 +1382,72 @@ QUEST_SCHEMA = {
 }
 
 
-def build_groq_prompt(
+def build_ai_meta_prompt(
     city: dict,
     duration: str,
     interests: list[str],
     style: str,
-    stops: list[dict],
+    places: list[dict],
     route: dict,
-    feedback: str = "",
 ) -> str:
-    poi_lines = []
+    interest_text = ", ".join(INTERESTS[key]["label"] for key in interests)
+    place_lines = []
 
-    for index, place in enumerate(stops, start=1):
-        interest_labels = [
-            INTERESTS[key]["label"]
-            for key in place.get("interest_matches", [])
-            if key in INTERESTS
-        ]
-
-        poi_lines.append(
+    for index, place in enumerate(places, start=1):
+        place_lines.append(
             f"{index}. name={place['name']}; "
             f"pinyin={place.get('pinyin') or '-'}; "
-            f"type={place.get('category_label')}; "
-            f"matches={', '.join(interest_labels) or 'дополнительная остановка'}"
+            f"type={place.get('category_label') or 'место'}"
         )
 
-    interest_text = ", ".join(INTERESTS[key]["label"] for key in interests)
-    walk_minutes = round(route["time_s"] / 60)
-    distance_km = route["distance_m"] / 1000
-
-    social_rule = (
-        """
-Для стиля «Приключение» добавь ОДИН необязательный социальный бонус на подходящей точке.
-Он не должен быть основной миссией. Если бонус — попросить прохожего сфотографировать,
-используй ТОЧНО эту фразу:
-请帮我拍张照片，可以吗？
-и перевод:
-«Можете меня сфотографировать, пожалуйста?»
-Обязательно добавь альтернативу: «Если не хочется обращаться к людям — сделай селфи».
-"""
-        if style == "adventure"
-        else ""
-    )
-
     return f"""
-Создай городской квест по Китаю для туриста, который НЕ обязан знать китайский язык.
+Ты создаёшь только атмосферную оболочку для готового CityQuest.
+Миссии уже сформированы безопасными шаблонами в коде — НЕ придумывай задания,
+предметы, статуи, часы, старые карты, экспонаты, архитектурные детали, меню или услуги.
 
 ГОРОД: {city.get('input_name') or city.get('city')}
 ВРЕМЯ: {duration}
 ИНТЕРЕСЫ: {interest_text}
 СТИЛЬ: {STYLE_LABELS.get(style, style)}
-ОПИСАНИЕ СТИЛЯ: {STYLE_INSTRUCTIONS.get(style, '')}
 
-Маршрут УЖЕ проверен картографическим Routing API:
-- пешком примерно {distance_km:.1f} км;
-- переходы примерно {walk_minutes} минут.
+Нужно вернуть:
+- title: короткое цепляющее название квеста;
+- intro: 1–2 предложения;
+- friendly_names: по одному КОРОТКОМУ названию на русском для каждой точки;
+- reasons: по одной короткой фразе «почему здесь» для каждой точки, используя ТОЛЬКО тип места и выбранные интересы;
+- final_challenge: финальная рефлексия/фото-задание без необходимости искать внешний материал.
 
-Ниже дан окончательный список реальных точек УЖЕ В НУЖНОМ ПОРЯДКЕ.
-Верни РОВНО {len(stops)} остановок и используй каждую точку РОВНО ОДИН РАЗ.
-poi_index должен идти строго 1,2,3... без перестановок.
+Строго:
+- friendly_names и reasons должны иметь ровно {len(places)} элементов;
+- friendly_names ОБЯЗАТЕЛЬНО должны содержать короткое понятное русское название для туриста;
+- примеры хорошего формата: «Площадь Тяньфу», «Колокольная башня», «Чайная», «Храм», «Сад», «Рынок»;
+- если точный перевод названия неизвестен, дай безопасное русское описание по типу места
+  (например «историческое место», «парк», «чайная», «рынок»), не выдумывай перевод;
+- нельзя писать, что на месте точно есть башня, часы, статуя, старинная карта, конкретный аромат,
+  конкретное дерево или традиционная деталь, если этого нет во входных данных;
+- нельзя требовать от пользователя заранее подготовленных материалов;
+- язык русский, понятно человеку без знания китайского.
 
-КРИТИЧЕСКИЕ ПРАВИЛА:
-1. Не придумывай новые места.
-2. Не выдумывай исторические факты, статуи, здания, экспонаты, виды из окна,
-   традиционные элементы или услуги, если этих сведений нет во входных данных.
-3. Если миссия связана с традициями, формулируй условно:
-   «Если увидишь традиционный элемент — например, крышу, фонарь, каллиграфию,
-   ворота или павильон — выбери самый интересный».
-   Нельзя утверждать, что конкретный элемент точно есть.
-4. Не делай все задания фотографическими.
-5. Для 4 и более остановок используй минимум 3 разных mission_type.
-6. mission_type=photo — максимум у 2 остановок.
-7. Используй разные механики: наблюдение, сравнение, личный выбор, фото,
-   поиск традиционной детали, вкус/аромат там, где это уместно.
-8. Не требуй покупать еду или напиток. В кафе/чайной можно сделать миссию,
-   которую можно выполнить без покупки; покупка только как необязательный вариант.
-9. Не требуй знания китайского языка.
-10. Никаких опасных действий, закрытых зон, дороги, нарушений правил.
-11. Общение с незнакомцами — только как необязательный bonus.
-12. friendly_name: короткое русское пояснение или пиньинь.
-    Если точный перевод неизвестен — НЕ выдумывай его.
-13. why_here, mission, tip — короткие, максимум 2 предложения.
-14. mission_minutes — 5–25 минут.
-15. bonus, chinese_phrase, phrase_translation можно оставить пустыми строками,
-    если они не нужны.
-
-{social_rule}
-
-РЕАЛЬНЫЕ ТОЧКИ:
-{chr(10).join(poi_lines)}
-
-{feedback}
+ТОЧКИ:
+{chr(10).join(place_lines)}
 """.strip()
 
 
-async def call_groq(prompt: str) -> dict:
+async def call_groq_meta(prompt: str) -> dict:
     url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
-    payload = {
+    schema_payload = {
         "model": GROQ_MODEL,
         "messages": [
             {
                 "role": "system",
                 "content": (
-                    "Ты — CityQuest China, дизайнер городских квестов. "
-                    "Нельзя выдумывать сведения о реальных местах. "
-                    "Возвращай только JSON по заданной схеме."
+                    "Ты — редактор CityQuest China. Ты не создаёшь миссии и не выдумываешь факты о местах. "
+                    "Ты только даёшь название, короткое вступление, понятные названия точек и причины выбора."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -1100,116 +1456,99 @@ async def call_groq(prompt: str) -> dict:
         "response_format": {
             "type": "json_schema",
             "json_schema": {
-                "name": "cityquest",
+                "name": "cityquest_meta",
                 "strict": True,
-                "schema": QUEST_SCHEMA,
+                "schema": AI_META_SCHEMA,
             },
         },
     }
 
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
+    json_payload = {
+        "model": GROQ_MODEL,
+        "messages": schema_payload["messages"]
+        + [
+            {
+                "role": "system",
+                "content": (
+                    "Если строгая схема недоступна, верни только JSON-объект с ключами "
+                    "title, intro, friendly_names, reasons, final_challenge."
+                ),
+            }
+        ],
+        "reasoning_effort": "low",
+        "response_format": {"type": "json_object"},
     }
 
     timeout = aiohttp.ClientTimeout(total=75)
+    last_error = None
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, headers=headers, json=payload) as response:
-            body = await response.text()
-
-            if response.status != 200:
-                logger.error("Groq failed: HTTP %s %s", response.status, body[:800])
-                raise RuntimeError("Groq request failed")
-
-            data = json.loads(body)
-            content = data["choices"][0]["message"]["content"]
-            return json.loads(content)
-
-
-def normalize_ai_quest(
-    ai_data: dict,
-    places: list[dict],
-) -> dict:
-    by_index = {}
-
-    valid_types = set(MISSION_TYPE_LABELS)
-
-    for stop in ai_data.get("stops", []):
+    # First: strict schema, with retries for transient errors.
+    for attempt in range(3):
         try:
-            poi_index = int(stop.get("poi_index"))
-        except (TypeError, ValueError):
-            continue
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, headers=headers, json=schema_payload) as response:
+                    body = await response.text()
+                    if response.status == 200:
+                        data = json.loads(body)
+                        return json.loads(data["choices"][0]["message"]["content"])
 
-        if poi_index < 1 or poi_index > len(places):
-            continue
+                    last_error = RuntimeError(f"Groq strict HTTP {response.status}: {body[:600]}")
+                    logger.error("Groq strict failed: %s %s", response.status, body[:600])
 
-        mission_type = str(stop.get("mission_type") or "observe")
-        if mission_type not in valid_types:
-            mission_type = "observe"
+                    # 400 can be model/schema compatibility; go to JSON fallback.
+                    if response.status == 400:
+                        break
+        except Exception as exc:
+            last_error = exc
+            logger.exception("Groq strict exception")
 
-        minutes = stop.get("mission_minutes", 15)
+        if attempt < 2:
+            await asyncio.sleep(2 + attempt)
+
+    # Second: plain JSON object mode.
+    for attempt in range(2):
         try:
-            minutes = int(minutes)
-        except (TypeError, ValueError):
-            minutes = 15
-        minutes = max(5, min(25, minutes))
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, headers=headers, json=json_payload) as response:
+                    body = await response.text()
+                    if response.status == 200:
+                        data = json.loads(body)
+                        return json.loads(data["choices"][0]["message"]["content"])
 
-        place = places[poi_index - 1]
+                    last_error = RuntimeError(f"Groq JSON HTTP {response.status}: {body[:600]}")
+                    logger.error("Groq JSON fallback failed: %s %s", response.status, body[:600])
+        except Exception as exc:
+            last_error = exc
+            logger.exception("Groq JSON fallback exception")
 
-        by_index[poi_index] = {
-            "poi_index": poi_index,
-            "place": place,
-            "friendly_name": str(
-                stop.get("friendly_name")
-                or place.get("pinyin")
-                or place["name"]
-            ),
-            "why_here": str(stop.get("why_here") or ""),
-            "mission_type": mission_type,
-            "mission": str(stop.get("mission") or ""),
-            "tip": str(stop.get("tip") or ""),
-            "mission_minutes": minutes,
-            "bonus": str(stop.get("bonus") or ""),
-            "chinese_phrase": str(stop.get("chinese_phrase") or ""),
-            "phrase_translation": str(stop.get("phrase_translation") or ""),
-        }
+        if attempt == 0:
+            await asyncio.sleep(2)
 
-    if set(by_index) != set(range(1, len(places) + 1)):
-        raise RuntimeError("AI did not return every route stop")
+    raise RuntimeError("Groq meta generation failed") from last_error
 
-    stops = [by_index[i] for i in range(1, len(places) + 1)]
+
+def normalize_ai_meta(ai_data: dict, place_count: int) -> dict:
+    friendly_names = ai_data.get("friendly_names") or []
+    reasons = ai_data.get("reasons") or []
+
+    if not isinstance(friendly_names, list):
+        friendly_names = []
+    if not isinstance(reasons, list):
+        reasons = []
+
+    # We may use partial meta safely; missing elements fall back locally.
+    validated_names = []
+    for item in friendly_names[:place_count]:
+        value = str(item).strip()
+        validated_names.append(value if contains_cyrillic(value) else "")
 
     return {
-        "title": str(ai_data.get("title") or "CityQuest"),
-        "intro": str(ai_data.get("intro") or ""),
-        "stops": stops,
-        "final_challenge": str(
-            ai_data.get("final_challenge")
-            or "Выбери лучший момент прогулки."
-        ),
+        "title": str(ai_data.get("title") or "").strip(),
+        "intro": str(ai_data.get("intro") or "").strip(),
+        "friendly_names": validated_names,
+        "reasons": [str(x).strip() for x in reasons[:place_count]],
+        "final_challenge": str(ai_data.get("final_challenge") or "").strip(),
     }
-
-
-def mission_diversity_ok(quest: dict) -> tuple[bool, str]:
-    stops = quest.get("stops", [])
-    types = [stop.get("mission_type") for stop in stops]
-
-    if len(stops) >= 4 and len(set(types)) < 3:
-        return False, "Используй минимум 3 разных типа заданий."
-
-    if types.count("photo") > 2:
-        return False, "Слишком много фото-миссий. Фото может быть максимум у двух остановок."
-
-    normalized_missions = [
-        re.sub(r"\s+", " ", stop.get("mission", "").casefold()).strip()
-        for stop in stops
-    ]
-
-    if len(set(normalized_missions)) != len(normalized_missions):
-        return False, "Не повторяй одинаковые миссии."
-
-    return True, ""
 
 
 async def generate_ai_quest(
@@ -1220,39 +1559,34 @@ async def generate_ai_quest(
     places: list[dict],
     route: dict,
 ) -> dict:
-    feedback = ""
-    last_quest = None
+    # AI enriches the quest, but it is no longer allowed to invent the actual missions.
+    ai_meta = {}
 
-    for attempt in range(3):
-        prompt = build_groq_prompt(
+    try:
+        prompt = build_ai_meta_prompt(
             city,
             duration,
             interests,
             style,
             places,
             route,
-            feedback,
         )
+        raw_meta = await call_groq_meta(prompt)
+        ai_meta = normalize_ai_meta(raw_meta, len(places))
+        logger.info("AI meta generated successfully")
+    except Exception:
+        # Critical reliability feature: the bot still returns a valid quest when Groq is unavailable.
+        logger.exception("AI meta failed; using safe local quest fallback")
 
-        ai_data = await call_groq(prompt)
-        quest = normalize_ai_quest(ai_data, places)
-        last_quest = quest
+    return build_safe_quest(
+        city=city,
+        duration=duration,
+        interests=interests,
+        style=style,
+        places=places,
+        ai_meta=ai_meta,
+    )
 
-        ok, reason = mission_diversity_ok(quest)
-        if ok:
-            return quest
-
-        feedback = (
-            "\nПРЕДЫДУЩИЙ ВАРИАНТ ОТКЛОНЁН: "
-            + reason
-            + " Исправь это в новой версии."
-        )
-        logger.warning("AI mission diversity retry: %s", reason)
-
-    if last_quest:
-        return last_quest
-
-    raise RuntimeError("AI generation failed")
 
 
 def route_summary_text(
@@ -1367,14 +1701,23 @@ async def send_generated_quest(
             bonus_block += f"\n\n🎁 <b>Бонус:</b> {esc(stop['bonus'])}"
 
         if stop.get("chinese_phrase"):
-            bonus_block += (
-                f"\n🇨🇳 <b>{esc(stop['chinese_phrase'])}</b>"
-                f"\n💬 {esc(stop.get('phrase_translation'))}"
-            )
+            bonus_block += f"\n🇨🇳 <b>{esc(stop['chinese_phrase'])}</b>"
+
+            if stop.get("phrase_pinyin"):
+                bonus_block += f"\n🔤 <i>{esc(stop['phrase_pinyin'])}</i>"
+
+            if stop.get("ru_pronunciation"):
+                bonus_block += (
+                    f"\n🗣 <b>Если не знаешь китайского, попробуй примерно так:</b> "
+                    f"{esc(stop['ru_pronunciation'])}"
+                )
+
+            if stop.get("phrase_translation"):
+                bonus_block += f"\n💬 {esc(stop['phrase_translation'])}"
 
         await message.answer(
             f"📍 <b>{index + 1}/{len(quest['stops'])}. "
-            f"{esc(stop['friendly_name'])}</b>\n"
+            f"{esc(russian_place_label(stop))}</b>\n"
             f"{esc(place.get('category_label'))} — <b>{esc(place['name'])}</b>"
             f"{pinyin_line}"
             f"{transition}\n"
@@ -1382,7 +1725,8 @@ async def send_generated_quest(
             f"{esc(MISSION_TYPE_LABELS.get(stop['mission_type'], '🎯 Миссия'))}\n"
             f"🎯 <b>Миссия:</b> {esc(stop['mission'])}\n\n"
             f"🧭 <b>Подсказка:</b> {esc(stop['tip'])}\n"
-            f"⏱ На миссию: ~{stop['mission_minutes']} мин"
+            f"⏱ На миссию: ~{stop['mission_minutes']} мин\n"
+            f"⭐ Награда: <b>+{stop.get('xp', 20)} XP</b>"
             f"{bonus_block}",
             reply_markup=mission_map_keyboard(place),
         )
@@ -1762,7 +2106,7 @@ async def cb_style(
         "🤖 <b>Маршрут подходит. Теперь работает ИИ…</b>\n\n"
         f"Пешие переходы: ~{fmt_distance(route['distance_m'])}, "
         f"~{fmt_minutes(route['time_s'] / 60)}.\n"
-        "Создаю разные миссии без выдуманных фактов о местах."
+        "ИИ оформляет квест, а задания собираются из проверенных безопасных механик."
     )
 
     try:
