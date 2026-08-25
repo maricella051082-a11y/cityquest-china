@@ -137,6 +137,43 @@ RU_CITY_ALIASES = {
     "гонконг": "Hong Kong",
 }
 
+CHINA_REGION_RU = {
+    "anhui": "Аньхой",
+    "beijing": "Пекин",
+    "chongqing": "Чунцин",
+    "fujian": "Фуцзянь",
+    "gansu": "Ганьсу",
+    "guangdong": "Гуандун",
+    "guangxi": "Гуанси",
+    "guizhou": "Гуйчжоу",
+    "hainan": "Хайнань",
+    "hebei": "Хэбэй",
+    "heilongjiang": "Хэйлунцзян",
+    "henan": "Хэнань",
+    "hubei": "Хубэй",
+    "hunan": "Хунань",
+    "inner mongolia": "Внутренняя Монголия",
+    "jiangsu": "Цзянсу",
+    "jiangxi": "Цзянси",
+    "jilin": "Гирин",
+    "liaoning": "Ляонин",
+    "ningxia": "Нинся",
+    "qinghai": "Цинхай",
+    "shaanxi": "Шэньси",
+    "shandong": "Шаньдун",
+    "shanghai": "Шанхай",
+    "shanxi": "Шаньси",
+    "sichuan": "Сычуань",
+    "tianjin": "Тяньцзинь",
+    "tibet": "Тибет",
+    "xinjiang": "Синьцзян",
+    "yunnan": "Юньнань",
+    "zhejiang": "Чжэцзян",
+    "hong kong": "Гонконг",
+    "macao": "Макао",
+    "macau": "Макао",
+}
+
 EXACT_RU_NAMES = {
     "天府广场": "Площадь Тяньфу",
     "钟楼": "Колокольная башня",
@@ -295,15 +332,134 @@ def normalize_city_text(value: str) -> str:
     value = str(value or "").casefold().strip()
     value = value.replace("’", "'").replace("`", "'")
     value = re.sub(r"[\s'’`\\-_,.]+", "", value)
-    value = re.sub(r"[市县区]$", "", value)
+
+    # Administrative suffixes should not make the same city look different.
+    for suffix in ("city", "town", "county", "district", "市", "县", "区", "镇"):
+        if value.endswith(suffix):
+            value = value[:-len(suffix)]
     return value
+
+
+def region_ru(value: str) -> str:
+    raw = str(value or "").strip()
+    return CHINA_REGION_RU.get(raw.casefold(), raw or "регион не указан")
+
+
+def admin_ru(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+
+    low = raw.casefold()
+    if low.endswith(" county"):
+        return "уезд " + raw[:-7].strip()
+    if low.endswith(" city"):
+        return "город " + raw[:-5].strip()
+    if low.endswith(" district"):
+        return "район " + raw[:-9].strip()
+    if low.endswith(" town"):
+        return "посёлок " + raw[:-5].strip()
+    return raw
+
+
+def city_target_norms(city_query: str) -> set[str]:
+    targets = set()
+    original = str(city_query or "").strip()
+
+    if original:
+        targets.add(normalize_city_text(original))
+
+    alias = RU_CITY_ALIASES.get(original.casefold())
+    if alias:
+        targets.add(normalize_city_text(alias))
+
+    if contains_han(original):
+        stripped = re.sub(r"[市县区镇]$", "", original)
+        if stripped:
+            targets.add(normalize_city_text(stripped))
+            syllables = [
+                p for p in lazy_pinyin(stripped, style=Style.NORMAL, errors="ignore")
+                if p
+            ]
+            if syllables:
+                targets.add(normalize_city_text("".join(syllables)))
+
+    return {t for t in targets if t}
+
+
+def candidate_direct_name_norms(item: dict) -> set[str]:
+    fields = [
+        item.get("name"),
+        item.get("city"),
+        item.get("town"),
+        item.get("village"),
+    ]
+    return {normalize_city_text(v) for v in fields if v}
+
+
+def candidate_matches_requested_name(item: dict, targets: set[str]) -> bool:
+    """
+    IMPORTANT: match the actual settlement name, not a word hidden somewhere
+    in formatted address. This removes results like Puyang/Henan for 阆中.
+    """
+    names = candidate_direct_name_norms(item)
+    if not names:
+        return False
+
+    for name in names:
+        for target in targets:
+            if name == target:
+                return True
+
+    return False
+
+
+def candidate_admin_bonus(item: dict, targets: set[str]) -> float:
+    """
+    Prefer the real administrative city when the county/city field repeats the
+    requested name, e.g. Langzhong City, over a tiny same-named settlement in
+    an unrelated county.
+    """
+    bonus = 0.0
+    county_norm = normalize_city_text(item.get("county"))
+    city_norm = normalize_city_text(item.get("city"))
+    name_norm = normalize_city_text(item.get("name"))
+
+    if city_norm in targets:
+        bonus += 2.0
+    if name_norm in targets:
+        bonus += 1.5
+    if county_norm in targets:
+        bonus += 3.0
+
+    result_type = (item.get("result_type") or "").casefold()
+    if result_type == "city":
+        bonus += 1.5
+    elif result_type in {"county", "district"}:
+        bonus += 0.4
+
+    return bonus
+
+
+def same_city_nearby(a: dict, b: dict) -> bool:
+    if normalize_city_text(a.get("state")) != normalize_city_text(b.get("state")):
+        return False
+
+    # Same requested settlement can appear twice as POI/admin boundary.
+    lat1, lon1 = float(a["lat"]), float(a["lon"])
+    lat2, lon2 = float(b["lat"]), float(b["lon"])
+    dx = (lon1 - lon2) * 111000 * math.cos(math.radians((lat1 + lat2) / 2))
+    dy = (lat1 - lat2) * 111000
+    distance = math.hypot(dx, dy)
+    return distance <= 5000
 
 
 def city_candidate_label(city: dict) -> str:
     name = city.get("city") or city.get("name") or city.get("formatted") or "Город"
-    state = city.get("state") or "регион не указан"
-    county = city.get("county")
-    if county and county.casefold() not in str(name).casefold():
+    state = region_ru(city.get("state"))
+    county = admin_ru(city.get("county"))
+
+    if county and normalize_city_text(county) != normalize_city_text(name):
         return f"{name} · {state} · {county}"
     return f"{name} · {state}"
 
@@ -634,13 +790,13 @@ async def enrich_final_places(places):
 
 async def geocode_city_candidates(city_query):
     """
-    Geoapify can return several same-named cities/towns.
-    Collect candidates from ALL query variants and let the user choose
-    when provinces/locations differ instead of silently taking the most popular one.
+    Collect same-name Chinese settlements, but reject results where the query
+    appears only somewhere in the address. Then merge near-duplicate admin results.
     """
     url = "https://api.geoapify.com/v1/geocode/search"
     timeout = aiohttp.ClientTimeout(total=30)
     collected = {}
+    targets = city_target_norms(city_query)
 
     variants = city_query_variants(city_query)
 
@@ -669,8 +825,6 @@ async def geocode_city_candidates(city_query):
                 if (item.get("country_code") or "").lower() != "cn":
                     continue
 
-                # With type=city Geoapify searches cities/towns/villages. Keep city-like
-                # administrative results only.
                 result_type = (item.get("result_type") or "").lower()
                 if result_type not in {"city", "county", "district"}:
                     continue
@@ -680,6 +834,10 @@ async def geocode_city_candidates(city_query):
                 if lat is None or lon is None:
                     continue
 
+                # Core fix: actual city/name must match the requested city.
+                if not candidate_matches_requested_name(item, targets):
+                    continue
+
                 place_id = item.get("place_id")
                 dedupe_key = place_id or f"{float(lat):.5f}:{float(lon):.5f}"
 
@@ -687,28 +845,14 @@ async def geocode_city_candidates(city_query):
                 confidence_city = float(rank.get("confidence_city_level") or 0)
                 confidence = float(rank.get("confidence") or 0)
                 popularity = float(rank.get("popularity") or 0)
-
-                # Prefer results returned by the more exact query variants, but do not
-                # hide same-name alternatives in another province.
                 specificity_bonus = max(0, 1.2 - variant_index * 0.08)
-
-                query_norm = normalize_city_text(city_query)
-                searchable = " ".join([
-                    str(item.get("name") or ""),
-                    str(item.get("city") or ""),
-                    str(item.get("county") or ""),
-                    str(item.get("formatted") or ""),
-                ])
-                searchable_norm = normalize_city_text(searchable)
-
-                match_bonus = 1.0 if query_norm and query_norm in searchable_norm else 0.0
 
                 score = (
                     confidence_city * 5.0
                     + confidence * 3.0
                     + min(popularity, 20.0) * 0.08
                     + specificity_bonus
-                    + match_bonus
+                    + candidate_admin_bonus(item, targets)
                 )
 
                 candidate = {
@@ -718,6 +862,7 @@ async def geocode_city_candidates(city_query):
                     "city": item.get("city") or item.get("name") or city_query,
                     "county": item.get("county"),
                     "state": item.get("state"),
+                    "result_type": result_type,
                     "lat": float(lat),
                     "lon": float(lon),
                     "input_name": city_query,
@@ -728,30 +873,35 @@ async def geocode_city_candidates(city_query):
                 if not old or candidate["_score"] > old["_score"]:
                     collected[dedupe_key] = candidate
 
-    candidates = sorted(
+    ranked = sorted(
         collected.values(),
         key=lambda x: x.get("_score", 0),
         reverse=True,
     )
 
-    # Avoid showing duplicates that are effectively the same coordinates/admin area.
+    # Merge near-identical results for the same city/province.
     final = []
-    seen_labels = set()
-    for item in candidates:
-        label_key = (
-            normalize_city_text(item.get("city")),
-            normalize_city_text(item.get("state")),
-            normalize_city_text(item.get("county")),
-        )
-        if label_key in seen_labels:
-            continue
-        seen_labels.add(label_key)
-        item.pop("_score", None)
-        final.append(item)
-        if len(final) >= 5:
-            break
+    for candidate in ranked:
+        merged = False
+        for i, existing in enumerate(final):
+            same_name = (
+                normalize_city_text(candidate.get("city"))
+                == normalize_city_text(existing.get("city"))
+            )
+            if same_name and same_city_nearby(candidate, existing):
+                if candidate.get("_score", 0) > existing.get("_score", 0):
+                    final[i] = candidate
+                merged = True
+                break
 
-    return final
+        if not merged:
+            final.append(candidate)
+
+    # Remove internal score.
+    for item in final:
+        item.pop("_score", None)
+
+    return final[:5]
 
 
 async def fetch_places_source(session, city, source_key, categories, limit=20):
@@ -2414,11 +2564,11 @@ async def city_received(message: Message, state: FSMContext):
         city = candidates[0]
         await state.update_data(city=city)
         province = (
-            f"\nПровинция / регион: <b>{esc(city.get('state'))}</b>"
+            f"\nПровинция / регион: <b>{esc(region_ru(city.get('state')))}</b>"
             if city.get("state") else ""
         )
         county = (
-            f"\nОкруг / county: <b>{esc(city.get('county'))}</b>"
+            f"\nАдминистративный район: <b>{esc(admin_ru(city.get('county')))}</b>"
             if city.get("county") else ""
         )
         await status.edit_text(
@@ -2440,8 +2590,9 @@ async def city_received(message: Message, state: FSMContext):
     ]
 
     for i, city in enumerate(candidates, 1):
-        region = city.get("state") or "регион не указан"
-        county = f" · {city.get('county')}" if city.get("county") else ""
+        region = region_ru(city.get("state"))
+        county_value = admin_ru(city.get("county"))
+        county = f" · {county_value}" if county_value else ""
         lines.append(
             f"<b>{i}.</b> {esc(city.get('city') or city.get('name') or query)} "
             f"— {esc(region)}{esc(county)}"
@@ -2469,11 +2620,11 @@ async def city_select(callback: CallbackQuery, state: FSMContext):
     await state.update_data(city=city, interests=[])
 
     province = (
-        f"\nПровинция / регион: <b>{esc(city.get('state'))}</b>"
+        f"\nПровинция / регион: <b>{esc(region_ru(city.get('state')))}</b>"
         if city.get("state") else ""
     )
     county = (
-        f"\nОкруг / county: <b>{esc(city.get('county'))}</b>"
+        f"\nАдминистративный район: <b>{esc(admin_ru(city.get('county')))}</b>"
         if city.get("county") else ""
     )
 
@@ -3051,7 +3202,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Starting CityQuest China v5.2 Clear Food Missions + Local POI Preference")
+    logger.info("Starting CityQuest China v5.3 Exact City Match + Clean Disambiguation")
     await dp.start_polling(bot)
 
 
