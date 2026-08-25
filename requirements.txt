@@ -1,4 +1,4 @@
 aiogram==3.30.0
 aiohttp==3.14.3
 python-dotenv==1.1.1
-Unidecode==1.4.0
+pypinyin==0.55.0

@@ -14,7 +14,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
-from unidecode import unidecode
+from pypinyin import lazy_pinyin, Style
 
 load_dotenv()
 
@@ -65,152 +65,96 @@ def duration_keyboard():
     return kb.as_markup()
 
 
-def has_han(text: str) -> bool:
+def contains_han(text: str) -> bool:
     return bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", text))
 
 
-def latin_fallback(text: str) -> str:
-    """
-    Transliterate Chinese/Cyrillic/etc. to Latin for a second Geoapify attempt.
-    Examples:
-      成都 -> Cheng Du
-      西安 -> Xi An
-      Чэнду -> Chendu
-    """
-    value = unidecode(text).strip()
-    value = re.sub(r"\s+", " ", value)
-    return value
+def chinese_to_pinyin(text: str) -> str:
+    parts = lazy_pinyin(text, style=Style.NORMAL, errors="ignore")
+    return "".join(parts).replace(" ", "").strip().lower()
 
 
-async def _geo_request(session: aiohttp.ClientSession, params: dict) -> list[dict]:
+async def geo_search(session: aiohttp.ClientSession, query: str) -> list[dict]:
     url = "https://api.geoapify.com/v1/geocode/search"
+    params = {
+        "text": query,
+        "filter": "countrycode:cn",
+        "limit": 5,
+        "format": "json",
+        "lang": "en",
+        "apiKey": GEOAPIFY_API_KEY,
+    }
 
     async with session.get(url, params=params) as response:
         if response.status != 200:
             body = await response.text()
-            logger.error("Geoapify search failed: %s %s", response.status, body)
+            logger.error("Geoapify failed: %s %s", response.status, body)
             raise RuntimeError("Geoapify request failed")
-
         data = await response.json()
         return data.get("results", [])
 
 
-def _choose_city_result(results: list[dict]) -> dict | None:
+def choose_city(results: list[dict]) -> dict | None:
     if not results:
         return None
 
-    city_types = {"city", "town", "village", "locality", "suburb", "district"}
+    preferred_types = {"city", "town", "village", "locality", "district"}
 
-    # Prefer China + a city-like result.
     for item in results:
         country_code = (item.get("country_code") or "").lower()
         result_type = (item.get("result_type") or "").lower()
-        if country_code == "cn" and result_type in city_types:
+        if country_code == "cn" and result_type in preferred_types:
             return item
 
-    # The API request is already filtered to China, so fall back to first result.
-    return results[0]
+    for item in results:
+        if (item.get("country_code") or "").lower() == "cn":
+            return item
+
+    return None
 
 
 async def geocode_city(city_query: str) -> dict | None:
-    """
-    Search a city in China.
+    original = city_query.strip()
+    queries = [original]
 
-    Geoapify may not resolve every Chinese/Russian spelling in free-text mode,
-    so we try several safe variants:
-      1) original spelling as a city;
-      2) structured city field;
-      3) Latin transliteration (成都 -> Cheng Du, Чэнду -> Chendu);
-      4) broader China-only search.
-    """
-    common = {
-        "filter": "countrycode:cn",
-        "limit": 5,
-        "format": "json",
-        "apiKey": GEOAPIFY_API_KEY,
-    }
+    if contains_han(original):
+        pinyin = chinese_to_pinyin(original)
+        logger.info("Chinese city input %r converted to pinyin %r", original, pinyin)
+        if pinyin and pinyin.casefold() != original.casefold():
+            queries = [pinyin, f"{pinyin}, China", original]
 
-    transliterated = latin_fallback(city_query)
-    attempts: list[dict] = []
-
-    # Original input. lang controls the returned address language.
-    attempts.append({
-        **common,
-        "text": city_query,
-        "type": "city",
-        "lang": "zh" if has_han(city_query) else "en",
-    })
-
-    # Structured city search can behave better for local spellings.
-    attempts.append({
-        **common,
-        "city": city_query,
-        "country": "China",
-        "type": "city",
-        "lang": "zh" if has_han(city_query) else "en",
-    })
-
-    # Latin fallback for Chinese and Cyrillic input.
-    if transliterated and transliterated.casefold() != city_query.casefold():
-        attempts.append({
-            **common,
-            "text": transliterated,
-            "type": "city",
-            "lang": "en",
-        })
-
-        # Also try joined pinyin-like form: "Cheng Du" -> "ChengDu".
-        joined = transliterated.replace(" ", "")
-        if joined.casefold() != transliterated.casefold():
-            attempts.append({
-                **common,
-                "text": joined,
-                "type": "city",
-                "lang": "en",
-            })
-
-    # Last-resort broader searches, still restricted to China.
-    attempts.append({
-        **common,
-        "text": city_query,
-        "lang": "zh" if has_han(city_query) else "en",
-    })
-
-    if transliterated and transliterated.casefold() != city_query.casefold():
-        attempts.append({
-            **common,
-            "text": transliterated,
-            "lang": "en",
-        })
+    unique_queries = []
+    seen = set()
+    for query in queries:
+        key = query.casefold()
+        if key not in seen:
+            seen.add(key)
+            unique_queries.append(query)
 
     timeout = aiohttp.ClientTimeout(total=25)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        for params in attempts:
-            results = await _geo_request(session, params)
-            item = _choose_city_result(results)
+        for query in unique_queries:
+            logger.info("Geoapify city lookup query=%r", query)
+            results = await geo_search(session, query)
+            item = choose_city(results)
+
             if item:
-                logger.info(
-                    "City found for input=%r using query=%r",
-                    city_query,
-                    params.get("text") or params.get("city"),
-                )
+                logger.info("Geoapify matched %r -> %r", original, item.get("formatted"))
                 return {
                     "place_id": item.get("place_id"),
-                    "formatted": item.get("formatted")
-                        or item.get("address_line1")
-                        or city_query,
+                    "formatted": item.get("formatted") or item.get("address_line1") or original,
                     "city": item.get("city")
                         or item.get("town")
                         or item.get("village")
                         or item.get("county")
-                        or city_query,
+                        or original,
                     "state": item.get("state"),
                     "country": item.get("country") or "China",
                     "lat": item.get("lat"),
                     "lon": item.get("lon"),
-                    "input_name": city_query,
-                    "used_query": params.get("text") or params.get("city"),
+                    "input_name": original,
+                    "search_name": query,
                 }
 
     return None
@@ -221,11 +165,11 @@ async def ask_for_city(message: Message, state: FSMContext):
     await message.answer(
         "🧭 <b>Новый CityQuest</b>\n\n"
         "Напиши город Китая, который хочешь исследовать.\n\n"
-        "Можно написать по-китайски, по-английски или по-русски.\n\n"
+        "Можно написать по-китайски или по-английски.\n\n"
         "Например:\n"
         "• 成都\n"
-        "• Chengdu\n"
-        "• Чэнду"
+        "• 西安\n"
+        "• Hangzhou"
     )
 
 
@@ -233,14 +177,14 @@ async def ask_for_city(message: Message, state: FSMContext):
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     first_name = message.from_user.first_name if message.from_user else "путешественник"
-    text = (
+    await message.answer(
         f"🏮 <b>CityQuest China 城市奇遇</b>\n\n"
         f"Привет, {first_name}!\n\n"
         "Я превращаю прогулки по городам Китая в персональные квесты. "
         "Выбери город, время и интересы — а затем выполняй миссии прямо в Telegram.\n\n"
-        "С чего начнём?"
+        "С чего начнём?",
+        reply_markup=main_menu(),
     )
-    await message.answer(text, reply_markup=main_menu())
 
 
 @router.message(Command("help"))
@@ -257,10 +201,7 @@ async def cmd_help(message: Message):
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer(
-        "Текущий квест отменён.",
-        reply_markup=main_menu(),
-    )
+    await message.answer("Текущий квест отменён.", reply_markup=main_menu())
 
 
 @router.message(Command("newquest"))
@@ -290,15 +231,13 @@ async def process_city(message: Message, state: FSMContext):
     except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError):
         logger.exception("Geoapify error")
         await status_message.edit_text(
-            "🗺 Карта сейчас не ответила.\n\n"
-            "Попробуй ещё раз через несколько секунд."
+            "🗺 Карта сейчас не ответила.\n\nПопробуй ещё раз через несколько секунд."
         )
         return
 
     if not city:
         await status_message.edit_text(
-            "🤔 Не получилось найти этот город в Китае.\n\n"
-            "Попробуй другое написание — например, по-английски или по-китайски."
+            "🤔 Не получилось найти этот город в Китае.\n\nПопробуй другое написание."
         )
         return
 
@@ -309,25 +248,20 @@ async def process_city(message: Message, state: FSMContext):
     if city.get("lat") is not None and city.get("lon") is not None:
         coords = f"\n📍 {city['lat']:.5f}, {city['lon']:.5f}"
 
-    input_name = city.get("input_name", "").strip()
-    formatted = city["formatted"].strip()
+    input_name = city["input_name"]
+    formatted = city["formatted"]
 
-    # Preserve the user's Chinese/Russian spelling when Geoapify returns English.
-    if input_name and input_name.casefold() not in formatted.casefold():
+    if input_name.casefold() not in formatted.casefold():
         place_line = f"<b>{input_name}</b> · {formatted}"
     else:
         place_line = f"<b>{formatted}</b>"
 
-    text = (
+    await status_message.edit_text(
         "🇨🇳 <b>Нашёл!</b>\n\n"
         f"{place_line}"
         f"{state_line}"
         f"{coords}\n\n"
-        "Это тот город?"
-    )
-
-    await status_message.edit_text(
-        text,
+        "Это тот город?",
         reply_markup=city_confirmation_keyboard(),
     )
 
@@ -337,9 +271,7 @@ async def cb_city_retry(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(QuestForm.waiting_city)
     if callback.message:
-        await callback.message.answer(
-            "✏️ Хорошо. Напиши другой город Китая:"
-        )
+        await callback.message.answer("✏️ Хорошо. Напиши другой город Китая:")
 
 
 @router.callback_query(F.data == "city_confirm")
@@ -381,14 +313,13 @@ async def cb_duration(callback: CallbackQuery, state: FSMContext):
     duration = duration_map.get(callback.data, "не указано")
     data = await state.get_data()
     city = data.get("city", {})
-
     await state.update_data(duration=duration)
 
     if callback.message:
         await callback.message.answer(
             f"🏮 <b>{city.get('input_name') or city.get('city', 'Город')}</b> · {duration}\n\n"
             "Город подтверждён через Geoapify ✅\n\n"
-            "Следующим шагом добавим выбор интересов: чай, еда, история, фото, природа и необычные места."
+            "Следующим шагом добавим выбор интересов."
         )
 
 
@@ -398,8 +329,7 @@ async def cb_my_quests(callback: CallbackQuery):
     if callback.message:
         await callback.message.answer(
             "🎒 <b>Мои приключения</b>\n\n"
-            "Здесь будут храниться созданные и завершённые CityQuest.\n"
-            "Базу данных подключим после генерации первого полноценного квеста."
+            "Здесь будут храниться созданные и завершённые CityQuest."
         )
 
 
@@ -421,10 +351,8 @@ async def main():
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-
     logger.info("Starting CityQuest China")
     await dp.start_polling(bot)
 
