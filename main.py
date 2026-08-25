@@ -442,16 +442,71 @@ def candidate_admin_bonus(item: dict, targets: set[str]) -> float:
 
 
 def same_city_nearby(a: dict, b: dict) -> bool:
-    if normalize_city_text(a.get("state")) != normalize_city_text(b.get("state")):
+    """
+    Treat duplicate geocoding records for the same named settlement as one city.
+    A missing province on one record must not create a fake second choice.
+    """
+    if normalize_city_text(a.get("city")) != normalize_city_text(b.get("city")):
         return False
 
-    # Same requested settlement can appear twice as POI/admin boundary.
     lat1, lon1 = float(a["lat"]), float(a["lon"])
     lat2, lon2 = float(b["lat"]), float(b["lon"])
     dx = (lon1 - lon2) * 111000 * math.cos(math.radians((lat1 + lat2) / 2))
     dy = (lat1 - lat2) * 111000
     distance = math.hypot(dx, dy)
-    return distance <= 5000
+
+    state_a = normalize_city_text(a.get("state"))
+    state_b = normalize_city_text(b.get("state"))
+
+    # If both regions are known and explicitly different, keep them separate.
+    if state_a and state_b and state_a != state_b:
+        return False
+
+    # Duplicate city/admin records can have slightly different centroids.
+    # 35 km safely collapses central/admin representations of a large city
+    # without merging same-name cities in different provinces.
+    return distance <= 35000
+
+
+def city_record_richness(city: dict) -> float:
+    score = 0.0
+    if city.get("state"):
+        score += 5.0
+    if city.get("county"):
+        score += 2.0
+    if city.get("city"):
+        score += 2.0
+    if city.get("name"):
+        score += 1.0
+    if city.get("place_id"):
+        score += 1.0
+
+    result_type = (city.get("result_type") or "").casefold()
+    if result_type == "city":
+        score += 2.5
+    elif result_type in {"county", "district"}:
+        score += 0.5
+
+    # Keep original search score as a tie-breaker.
+    score += float(city.get("_score") or 0) * 0.05
+    return score
+
+
+def merge_city_records(existing: dict, candidate: dict) -> dict:
+    """
+    Keep the richer record, but backfill any missing administrative fields
+    from the other duplicate.
+    """
+    if city_record_richness(candidate) > city_record_richness(existing):
+        best, other = dict(candidate), existing
+    else:
+        best, other = dict(existing), candidate
+
+    for field in ("state", "county", "city", "name", "formatted", "place_id"):
+        if not best.get(field) and other.get(field):
+            best[field] = other[field]
+
+    return best
 
 
 def city_candidate_label(city: dict) -> str:
@@ -464,15 +519,20 @@ def city_candidate_label(city: dict) -> str:
     return f"{name} · {state}"
 
 
-def city_choices_keyboard(candidates):
+def city_choices_keyboard(candidates, indexes=None):
     kb = InlineKeyboardBuilder()
-    for i, city in enumerate(candidates[:5]):
-        label = city_candidate_label(city)
+
+    if indexes is None:
+        indexes = list(range(len(candidates)))
+
+    for candidate, original_index in zip(candidates[:5], indexes[:5]):
+        label = city_candidate_label(candidate)
         kb.button(
-            text=f"{i+1}. {short_text(label, 52)}",
-            callback_data=f"city_select:{i}",
+            text=f"{original_index+1}. {short_text(label, 52)}",
+            callback_data=f"city_select:{original_index}",
         )
-    kb.button(text="✏️ Ввести другой город", callback_data="city_retry")
+
+    kb.button(text="⌨️ Ввести город вручную", callback_data="city_manual")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -788,90 +848,133 @@ async def enrich_final_places(places):
     return list(enriched)
 
 
+async def _fetch_city_variant(session, url, query):
+    params = {
+        "text": query,
+        "filter": "countrycode:cn",
+        "type": "city",
+        "limit": 20,
+        "format": "json",
+        "lang": "en",
+        "apiKey": GEOAPIFY_API_KEY,
+    }
+
+    try:
+        async with session.get(url, params=params) as response:
+            if response.status != 200:
+                logger.warning("City geocode %s HTTP %s", query, response.status)
+                return query, []
+            data = await response.json()
+            return query, data.get("results", [])
+    except asyncio.TimeoutError:
+        logger.warning("City geocode timed out: %s", query)
+        return query, []
+    except Exception:
+        logger.exception("City geocode query failed: %s", query)
+        return query, []
+
+
 async def geocode_city_candidates(city_query):
     """
-    Collect same-name Chinese settlements, but reject results where the query
-    appears only somewhere in the address. Then merge near-duplicate admin results.
+    v5.3 exact city matching, but query variants run in parallel.
+    The whole lookup is bounded so the user never waits for minutes.
     """
     url = "https://api.geoapify.com/v1/geocode/search"
-    timeout = aiohttp.ClientTimeout(total=30)
-    collected = {}
-    targets = city_target_norms(city_query)
-
     variants = city_query_variants(city_query)
+    targets = city_target_norms(city_query)
+    collected = {}
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for variant_index, query in enumerate(variants):
-            params = {
-                "text": query,
-                "filter": "countrycode:cn",
-                "type": "city",
-                "limit": 20,
-                "format": "json",
-                "lang": "en",
-                "apiKey": GEOAPIFY_API_KEY,
-            }
+    # Limit the number of variants: exact original/official/pinyin forms are enough.
+    variants = variants[:8]
 
+    request_timeout = aiohttp.ClientTimeout(
+        total=10,
+        connect=5,
+        sock_connect=5,
+        sock_read=8,
+    )
+
+    try:
+        async with aiohttp.ClientSession(timeout=request_timeout) as session:
+            tasks = [
+                asyncio.create_task(_fetch_city_variant(session, url, query))
+                for query in variants
+            ]
+
+            # Hard cap for the complete multi-query search.
             try:
-                async with session.get(url, params=params) as response:
-                    if response.status != 200:
-                        continue
-                    results = (await response.json()).get("results", [])
-            except Exception:
-                logger.exception("City geocode query failed: %s", query)
+                query_results = await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=False),
+                    timeout=12,
+                )
+            except asyncio.TimeoutError:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                logger.warning("Overall city lookup timeout for %s", city_query)
+                query_results = []
+
+    except Exception:
+        logger.exception("City lookup session failed for %s", city_query)
+        query_results = []
+
+    variant_index = {query: i for i, query in enumerate(variants)}
+
+    for query, results in query_results:
+        v_index = variant_index.get(query, 99)
+
+        for item in results:
+            if (item.get("country_code") or "").lower() != "cn":
                 continue
 
-            for item in results:
-                if (item.get("country_code") or "").lower() != "cn":
-                    continue
+            result_type = (item.get("result_type") or "").lower()
+            if result_type not in {"city", "county", "district"}:
+                continue
 
-                result_type = (item.get("result_type") or "").lower()
-                if result_type not in {"city", "county", "district"}:
-                    continue
+            lat = item.get("lat")
+            lon = item.get("lon")
+            if lat is None or lon is None:
+                continue
 
-                lat = item.get("lat")
-                lon = item.get("lon")
-                if lat is None or lon is None:
-                    continue
+            # Core v5.3 rule: the settlement name itself must match,
+            # not merely appear somewhere in the formatted address.
+            if not candidate_matches_requested_name(item, targets):
+                continue
 
-                # Core fix: actual city/name must match the requested city.
-                if not candidate_matches_requested_name(item, targets):
-                    continue
+            place_id = item.get("place_id")
+            dedupe_key = place_id or f"{float(lat):.5f}:{float(lon):.5f}"
 
-                place_id = item.get("place_id")
-                dedupe_key = place_id or f"{float(lat):.5f}:{float(lon):.5f}"
+            rank = item.get("rank") or {}
+            confidence_city = float(rank.get("confidence_city_level") or 0)
+            confidence = float(rank.get("confidence") or 0)
+            popularity = float(rank.get("popularity") or 0)
+            specificity_bonus = max(0, 1.2 - v_index * 0.08)
 
-                rank = item.get("rank") or {}
-                confidence_city = float(rank.get("confidence_city_level") or 0)
-                confidence = float(rank.get("confidence") or 0)
-                popularity = float(rank.get("popularity") or 0)
-                specificity_bonus = max(0, 1.2 - variant_index * 0.08)
+            score = (
+                confidence_city * 5.0
+                + confidence * 3.0
+                + min(popularity, 20.0) * 0.08
+                + specificity_bonus
+                + candidate_admin_bonus(item, targets)
+            )
 
-                score = (
-                    confidence_city * 5.0
-                    + confidence * 3.0
-                    + min(popularity, 20.0) * 0.08
-                    + specificity_bonus
-                    + candidate_admin_bonus(item, targets)
-                )
+            candidate = {
+                "place_id": place_id,
+                "formatted": item.get("formatted") or city_query,
+                "name": item.get("name"),
+                "city": item.get("city") or item.get("name") or city_query,
+                "county": item.get("county"),
+                "state": item.get("state"),
+                "result_type": result_type,
+                "lat": float(lat),
+                "lon": float(lon),
+                "input_name": city_query,
+                "_score": score,
+            }
 
-                candidate = {
-                    "place_id": place_id,
-                    "formatted": item.get("formatted") or city_query,
-                    "name": item.get("name"),
-                    "city": item.get("city") or item.get("name") or city_query,
-                    "county": item.get("county"),
-                    "state": item.get("state"),
-                    "result_type": result_type,
-                    "lat": float(lat),
-                    "lon": float(lon),
-                    "input_name": city_query,
-                    "_score": score,
-                }
-
-                old = collected.get(dedupe_key)
-                if not old or candidate["_score"] > old["_score"]:
-                    collected[dedupe_key] = candidate
+            old = collected.get(dedupe_key)
+            if not old or candidate["_score"] > old["_score"]:
+                collected[dedupe_key] = candidate
 
     ranked = sorted(
         collected.values(),
@@ -879,25 +982,22 @@ async def geocode_city_candidates(city_query):
         reverse=True,
     )
 
-    # Merge near-identical results for the same city/province.
     final = []
     for candidate in ranked:
         merged = False
+
         for i, existing in enumerate(final):
-            same_name = (
-                normalize_city_text(candidate.get("city"))
-                == normalize_city_text(existing.get("city"))
-            )
-            if same_name and same_city_nearby(candidate, existing):
-                if candidate.get("_score", 0) > existing.get("_score", 0):
-                    final[i] = candidate
+            if same_city_nearby(candidate, existing):
+                final[i] = merge_city_records(existing, candidate)
                 merged = True
                 break
 
         if not merged:
             final.append(candidate)
 
-    # Remove internal score.
+    # Sort AFTER merging so richer records with province/admin data come first.
+    final.sort(key=city_record_richness, reverse=True)
+
     for item in final:
         item.pop("_score", None)
 
@@ -2453,7 +2553,7 @@ async def ask_city(message, state):
     await state.set_state(QuestForm.waiting_city)
     await message.answer(
         "🧭 <b>Новый CityQuest</b>\n\n"
-        "Напиши город Китая. Можно по-русски, по-китайски или по-английски. Если есть одноимённые города, я покажу варианты по провинциям.\n\n"
+        "Напиши город Китая. Можно по-русски, по-китайски или по-английски. Сначала я предложу самый вероятный вариант. Если это не он — покажу другие одноимённые города по провинциям.\n\n"
         "Например:\n"
         "• Чэнду · 成都 · Chengdu\n"
         "• Сиань · 西安 · Xi'an\n"
@@ -2540,10 +2640,35 @@ async def newquest_cb(callback: CallbackQuery, state: FSMContext):
     await ask_city(callback.message, state)
 
 
+def choices_are_one_city(candidates):
+    if not candidates:
+        return False
+    if len(candidates) == 1:
+        return True
+
+    first = candidates[0]
+    first_name = normalize_city_text(first.get("city"))
+    first_state = normalize_city_text(first.get("state"))
+
+    for candidate in candidates[1:]:
+        if normalize_city_text(candidate.get("city")) != first_name:
+            return False
+
+        state = normalize_city_text(candidate.get("state"))
+        # Missing region does not create a second city.
+        if first_state and state and state != first_state:
+            return False
+
+        if not same_city_nearby(first, candidate):
+            return False
+
+    return True
+
+
 @router.message(QuestForm.waiting_city)
 async def city_received(message: Message, state: FSMContext):
     query = (message.text or "").strip()
-    status = await message.answer("🗺 Ищу город в Китае и проверяю одноимённые варианты…")
+    status = await message.answer("🗺 Ищу город в Китае…")
 
     try:
         candidates = await geocode_city_candidates(query)
@@ -2553,54 +2678,45 @@ async def city_received(message: Message, state: FSMContext):
 
     if not candidates:
         await status.edit_text(
-            "🤔 Не удалось найти подходящий город в Китае.\n\n"
-            "Попробуй другое написание: например Сиань, 西安 или Xi'an."
+            "🤔 Не удалось быстро подтвердить город.\n\n"
+            "Попробуй название с провинцией, например: Langzhong, Sichuan, "
+            "или другое написание: Сиань · 西安 · Xi'an."
         )
         return
 
-    await state.update_data(city_candidates=candidates, interests=[])
+    # Keep every valid alternative in state, but do NOT overload the user with them.
+    best = candidates[0]
+    await state.update_data(
+        city_candidates=candidates,
+        city=best,
+        interests=[],
+    )
 
-    if len(candidates) == 1:
-        city = candidates[0]
-        await state.update_data(city=city)
-        province = (
-            f"\nПровинция / регион: <b>{esc(region_ru(city.get('state')))}</b>"
-            if city.get("state") else ""
-        )
-        county = (
-            f"\nАдминистративный район: <b>{esc(admin_ru(city.get('county')))}</b>"
-            if city.get("county") else ""
-        )
-        await status.edit_text(
-            f"🇨🇳 <b>Нашёл город!</b>\n\n"
-            f"<b>{esc(city.get('city') or city['input_name'])}</b>\n"
-            f"{esc(city['formatted'])}"
-            f"{province}{county}\n"
-            f"📍 {city['lat']:.5f}, {city['lon']:.5f}\n\n"
-            "Это тот город?",
-            reply_markup=city_confirmation_keyboard(),
-        )
-        return
+    province = (
+        f"\nПровинция / регион: <b>{esc(region_ru(best.get('state')))}</b>"
+        if best.get("state") else ""
+    )
+    county = (
+        f"\nАдминистративный район: <b>{esc(admin_ru(best.get('county')))}</b>"
+        if best.get("county") else ""
+    )
 
-    lines = [
-        "🔎 <b>Нашла несколько подходящих вариантов.</b>",
-        "",
-        "Выбери нужный город по провинции:",
-        "",
-    ]
-
-    for i, city in enumerate(candidates, 1):
-        region = region_ru(city.get("state"))
-        county_value = admin_ru(city.get("county"))
-        county = f" · {county_value}" if county_value else ""
-        lines.append(
-            f"<b>{i}.</b> {esc(city.get('city') or city.get('name') or query)} "
-            f"— {esc(region)}{esc(county)}"
+    extra_hint = ""
+    if len(candidates) > 1:
+        extra_hint = (
+            "\n\nЕсли это не тот город, нажми «Другой город» — "
+            "я покажу остальные одноимённые варианты."
         )
 
     await status.edit_text(
-        "\n".join(lines),
-        reply_markup=city_choices_keyboard(candidates),
+        f"🇨🇳 <b>Нашёл город!</b>\n\n"
+        f"<b>{esc(best.get('city') or best.get('name') or query)}</b>\n"
+        f"{esc(best['formatted'])}"
+        f"{province}{county}\n"
+        f"📍 {best['lat']:.5f}, {best['lon']:.5f}\n\n"
+        "Это тот город?"
+        f"{extra_hint}",
+        reply_markup=city_confirmation_keyboard(),
     )
 
 
@@ -2642,8 +2758,55 @@ async def city_select(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "city_retry")
 async def city_retry(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
+    data = await state.get_data()
+    candidates = data.get("city_candidates") or []
+
+    # First show the alternative results we already found for the SAME query.
+    if len(candidates) > 1:
+        alternatives = candidates[1:]
+        indexes = list(range(1, len(candidates)))
+
+        lines = [
+            "🔎 <b>Другие варианты с таким названием</b>",
+            "",
+            "Выбери по провинции / административному району:",
+            "",
+        ]
+
+        for original_index, city in zip(indexes, alternatives):
+            region = region_ru(city.get("state"))
+            county_value = admin_ru(city.get("county"))
+            county = f" · {county_value}" if county_value else ""
+            lines.append(
+                f"<b>{original_index+1}.</b> "
+                f"{esc(city.get('city') or city.get('name') or 'Город')} "
+                f"— {esc(region)}{esc(county)}"
+            )
+
+        await callback.message.answer(
+            "\n".join(lines),
+            reply_markup=city_choices_keyboard(alternatives, indexes=indexes),
+        )
+        return
+
+    # No alternatives from the same search — ask for a new name.
     await state.set_state(QuestForm.waiting_city)
-    await callback.message.answer("✏️ Напиши другой город:")
+    await callback.message.answer(
+        "✏️ Напиши другой город.\n\n"
+        "Можно добавить провинцию, если название неоднозначное: "
+        "например <b>Langzhong, Sichuan</b>."
+    )
+
+
+@router.callback_query(F.data == "city_manual")
+async def city_manual(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(QuestForm.waiting_city)
+    await callback.message.answer(
+        "⌨️ Напиши город заново.\n\n"
+        "Можно по-русски, по-китайски или по-английски. "
+        "Для маленького одноимённого города можно сразу добавить провинцию."
+    )
 
 
 @router.callback_query(F.data == "city_confirm")
@@ -3202,7 +3365,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Starting CityQuest China v5.3 Exact City Match + Clean Disambiguation")
+    logger.info("Starting CityQuest China v5.3.3 Staged City Confirmation")
     await dp.start_polling(bot)
 
 
