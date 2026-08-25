@@ -1,4 +1,6 @@
 import asyncio
+import html
+import json
 import logging
 import os
 import re
@@ -11,21 +13,24 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
-from pypinyin import lazy_pinyin, Style
+from pypinyin import Style, lazy_pinyin
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEOAPIFY_API_KEY = os.getenv("GEOAPIFY_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
-
 if not GEOAPIFY_API_KEY:
     raise RuntimeError("GEOAPIFY_API_KEY is not set")
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY is not set")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cityquest")
@@ -38,7 +43,9 @@ class QuestForm(StatesGroup):
     city_confirmed = State()
     choosing_interests = State()
     choosing_style = State()
-    ready_to_generate = State()
+    generating = State()
+    quest_active = State()
+    quest_finished = State()
 
 
 INTERESTS = {
@@ -115,6 +122,25 @@ STYLE_LABELS = {
     "adventure": "🔥 Приключение",
 }
 
+STYLE_INSTRUCTIONS = {
+    "calm": (
+        "Спокойный стиль: наблюдение, атмосфера, красивые детали, "
+        "минимум спешки и никаких обязательных разговоров с незнакомцами."
+    ),
+    "explorer": (
+        "Стиль исследователя: сравнивать, замечать детали, делать маленькие открытия, "
+        "искать особенности места."
+    ),
+    "adventure": (
+        "Приключенческий стиль: игровые фото-задания, поиск деталей, небольшие вызовы, "
+        "но без риска, нарушения правил и необходимости знать китайский."
+    ),
+}
+
+
+def esc(value) -> str:
+    return html.escape(str(value or ""))
+
 
 def main_menu():
     kb = InlineKeyboardBuilder()
@@ -155,17 +181,16 @@ def interests_keyboard(selected: list[str] | None = None):
         )
 
     kb.adjust(2)
-
     markup = kb.as_markup()
 
-    # Add the continue button manually after the grid.
     if selected_set:
-        from aiogram.types import InlineKeyboardButton
         markup.inline_keyboard.append(
-            [InlineKeyboardButton(
-                text=f"Продолжить ({len(selected_set)}/3) →",
-                callback_data="interests_continue",
-            )]
+            [
+                InlineKeyboardButton(
+                    text=f"Продолжить ({len(selected_set)}/3) →",
+                    callback_data="interests_continue",
+                )
+            ]
         )
     return markup
 
@@ -179,6 +204,35 @@ def style_keyboard():
     return kb.as_markup()
 
 
+def checklist_keyboard(total: int, completed: list[int]):
+    completed_set = set(completed)
+    kb = InlineKeyboardBuilder()
+
+    for index in range(total):
+        done = index in completed_set
+        kb.button(
+            text=f"{'✅' if done else '☐'} {index + 1}",
+            callback_data=f"mission_toggle:{index}",
+        )
+
+    kb.adjust(3)
+
+    if total > 0 and len(completed_set) == total:
+        kb.row(
+            InlineKeyboardButton(
+                text="🏁 Завершить квест",
+                callback_data="quest_finish",
+            )
+        )
+
+    return kb.as_markup()
+
+
+def progress_bar(total: int, completed: list[int]) -> str:
+    completed_count = len(set(completed))
+    return "🟩" * completed_count + "⬜" * max(0, total - completed_count)
+
+
 def contains_han(text: str) -> bool:
     return bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", text))
 
@@ -189,7 +243,6 @@ def chinese_to_pinyin(text: str) -> str:
 
 
 def place_name_pinyin(text: str) -> str:
-    """Readable pinyin for Chinese POI names shown to a non-Chinese-speaking user."""
     if not contains_han(text):
         return ""
 
@@ -205,7 +258,6 @@ def place_name_pinyin(text: str) -> str:
 
 
 def place_category_label(categories: list[str]) -> str:
-    """Convert Geoapify categories into a short Russian label for the UI."""
     cats = categories or []
 
     def has(prefix: str) -> bool:
@@ -265,7 +317,7 @@ async def geo_search(session: aiohttp.ClientSession, query: str) -> list[dict]:
     async with session.get(url, params=params) as response:
         if response.status != 200:
             body = await response.text()
-            logger.error("Geoapify geocoding failed: %s %s", response.status, body)
+            logger.error("Geoapify geocoding failed: %s %s", response.status, body[:800])
             raise RuntimeError("Geoapify request failed")
         data = await response.json()
         return data.get("results", [])
@@ -321,11 +373,13 @@ async def geocode_city(city_query: str) -> dict | None:
                 return {
                     "place_id": item.get("place_id"),
                     "formatted": item.get("formatted") or item.get("address_line1") or original,
-                    "city": item.get("city")
+                    "city": (
+                        item.get("city")
                         or item.get("town")
                         or item.get("village")
                         or item.get("county")
-                        or original,
+                        or original
+                    ),
                     "state": item.get("state"),
                     "country": item.get("country") or "China",
                     "lat": item.get("lat"),
@@ -357,7 +411,6 @@ async def search_places(city: dict, interests: list[str]) -> list[dict]:
 
     url = "https://api.geoapify.com/v2/places"
 
-    # Prefer exact city boundary. If place_id is missing, fall back to a circle.
     if city.get("place_id"):
         spatial_filter = f"place:{city['place_id']}"
     else:
@@ -378,9 +431,8 @@ async def search_places(city: dict, interests: list[str]) -> list[dict]:
         async with session.get(url, params=params) as response:
             if response.status != 200:
                 body = await response.text()
-                logger.error("Geoapify Places failed: %s %s", response.status, body)
+                logger.error("Geoapify Places failed: %s %s", response.status, body[:800])
                 raise RuntimeError("Geoapify Places request failed")
-
             data = await response.json()
 
     candidates = []
@@ -408,19 +460,259 @@ async def search_places(city: dict, interests: list[str]) -> list[dict]:
 
         raw_categories = props.get("categories") or []
 
-        candidates.append({
-            "place_id": place_id,
-            "name": name,
-            "pinyin": place_name_pinyin(name),
-            "category_label": place_category_label(raw_categories),
-            "formatted": props.get("formatted") or "",
-            "categories": raw_categories,
-            "lat": lat,
-            "lon": lon,
-            "distance": props.get("distance"),
-        })
+        candidates.append(
+            {
+                "place_id": place_id,
+                "name": name,
+                "pinyin": place_name_pinyin(name),
+                "category_label": place_category_label(raw_categories),
+                "formatted": props.get("formatted") or "",
+                "categories": raw_categories,
+                "lat": lat,
+                "lon": lon,
+                "distance": props.get("distance"),
+            }
+        )
 
     return candidates
+
+
+def stop_count_for_duration(duration: str) -> int:
+    return {
+        "2 часа": 3,
+        "4 часа": 4,
+        "6 часов": 5,
+        "весь день": 6,
+    }.get(duration, 4)
+
+
+def build_groq_prompt(
+    city: dict,
+    duration: str,
+    interests: list[str],
+    style: str,
+    places: list[dict],
+) -> str:
+    stop_count = stop_count_for_duration(duration)
+
+    poi_lines = []
+    for index, place in enumerate(places, start=1):
+        poi_lines.append(
+            f"{index}. name={place['name']}; "
+            f"pinyin={place.get('pinyin') or '-'}; "
+            f"type={place.get('category_label') or 'место'}; "
+            f"lat={place['lat']}; lon={place['lon']}"
+        )
+
+    interest_text = ", ".join(INTERESTS[key]["label"] for key in interests)
+
+    return f"""
+Создай персональный городской квест по Китаю для туриста, который НЕ обязан знать китайский язык.
+
+ГОРОД: {city.get('input_name') or city.get('city')}
+ВРЕМЯ: {duration}
+ИНТЕРЕСЫ: {interest_text}
+СТИЛЬ: {STYLE_LABELS.get(style, style)}
+ОПИСАНИЕ СТИЛЯ: {STYLE_INSTRUCTIONS.get(style, '')}
+
+Нужно выбрать РОВНО {stop_count} разных точек только из списка POI ниже и расположить их
+в приблизительно логичном географическом порядке по координатам, чтобы не делать
+очевидных зигзагов. Не заявляй точные расстояния и время в пути: маршрутизация будет
+подключена отдельно.
+
+Для каждой выбранной точки:
+- poi_index — номер точки из списка, никаких новых мест;
+- friendly_name — короткое понятное русское название или транслитерация.
+  Если точный перевод названия неизвестен, используй пиньинь и НЕ выдумывай перевод;
+- why_here — 1 короткая фраза, почему эта точка подходит под интересы;
+- mission — конкретная игровая миссия, которую реально выполнить на месте;
+- tip — короткая практическая подсказка;
+- mission_minutes — примерное время именно на выполнение миссии, от 5 до 30 минут.
+
+Правила:
+1. Нельзя придумывать новые POI или менять их номера.
+2. Не выдумывай исторические факты, архитектурные детали, экспонаты или услуги,
+   которых нет во входных данных.
+3. Миссии должны быть наблюдательными и универсальными: найти интересную деталь,
+   сравнить элементы, сделать фото, выбрать любимый вид/аромат/объект и т.п.
+4. Не требуй знания китайского языка.
+5. Не требуй покупать что-либо. Покупка может быть только необязательным вариантом.
+6. Никаких опасных действий, выхода на проезжую часть, проникновения в закрытые зоны,
+   нарушения правил, навязчивого общения с незнакомцами.
+7. Пиши по-русски, живо, но коротко.
+8. intro — максимум 2 предложения.
+9. why_here, mission и tip — каждое максимум 2 коротких предложения.
+10. final_challenge — приятное финальное задание, которое подводит итог прогулке.
+
+РЕАЛЬНЫЕ POI:
+{chr(10).join(poi_lines)}
+""".strip()
+
+
+QUEST_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "intro": {"type": "string"},
+        "stops": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "poi_index": {"type": "integer"},
+                    "friendly_name": {"type": "string"},
+                    "why_here": {"type": "string"},
+                    "mission": {"type": "string"},
+                    "tip": {"type": "string"},
+                    "mission_minutes": {"type": "integer"},
+                },
+                "required": [
+                    "poi_index",
+                    "friendly_name",
+                    "why_here",
+                    "mission",
+                    "tip",
+                    "mission_minutes",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "final_challenge": {"type": "string"},
+    },
+    "required": ["title", "intro", "stops", "final_challenge"],
+    "additionalProperties": False,
+}
+
+
+async def call_groq(prompt: str) -> dict:
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Ты — CityQuest China, методист путешествий и дизайнер городских квестов. "
+                    "Строго используй только переданные реальные POI. "
+                    "Возвращай ответ только по заданной JSON-схеме."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "reasoning_effort": "low",
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "cityquest",
+                "strict": True,
+                "schema": QUEST_SCHEMA,
+            },
+        },
+    }
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    timeout = aiohttp.ClientTimeout(total=75)
+
+    last_error = None
+
+    for attempt in range(2):
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, headers=headers, json=payload) as response:
+                    body = await response.text()
+
+                    if response.status == 200:
+                        data = json.loads(body)
+                        content = data["choices"][0]["message"]["content"]
+                        return json.loads(content)
+
+                    last_error = RuntimeError(
+                        f"Groq HTTP {response.status}: {body[:800]}"
+                    )
+                    logger.error("Groq failed: HTTP %s %s", response.status, body[:800])
+
+                    if response.status not in {429, 500, 502, 503, 504}:
+                        break
+
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
+            last_error = exc
+            logger.exception("Groq network/JSON error")
+
+        if attempt == 0:
+            await asyncio.sleep(2)
+
+    raise RuntimeError("Groq request failed") from last_error
+
+
+def normalize_ai_quest(ai_data: dict, places: list[dict], desired_count: int) -> dict:
+    normalized_stops = []
+    used = set()
+
+    for stop in ai_data.get("stops", []):
+        try:
+            poi_index = int(stop.get("poi_index"))
+        except (TypeError, ValueError):
+            continue
+
+        if poi_index < 1 or poi_index > len(places):
+            continue
+        if poi_index in used:
+            continue
+
+        used.add(poi_index)
+        place = places[poi_index - 1]
+
+        minutes = stop.get("mission_minutes", 15)
+        try:
+            minutes = int(minutes)
+        except (TypeError, ValueError):
+            minutes = 15
+        minutes = max(5, min(30, minutes))
+
+        normalized_stops.append(
+            {
+                "poi_index": poi_index,
+                "place": place,
+                "friendly_name": str(stop.get("friendly_name") or place.get("pinyin") or place["name"]),
+                "why_here": str(stop.get("why_here") or ""),
+                "mission": str(stop.get("mission") or ""),
+                "tip": str(stop.get("tip") or ""),
+                "mission_minutes": minutes,
+            }
+        )
+
+        if len(normalized_stops) >= desired_count:
+            break
+
+    if len(normalized_stops) < 2:
+        raise RuntimeError("AI returned too few valid POIs")
+
+    return {
+        "title": str(ai_data.get("title") or "CityQuest"),
+        "intro": str(ai_data.get("intro") or ""),
+        "stops": normalized_stops,
+        "final_challenge": str(ai_data.get("final_challenge") or "Выбери лучший момент прогулки."),
+    }
+
+
+async def generate_ai_quest(
+    city: dict,
+    duration: str,
+    interests: list[str],
+    style: str,
+    places: list[dict],
+) -> dict:
+    prompt = build_groq_prompt(city, duration, interests, style, places)
+    ai_data = await call_groq(prompt)
+    return normalize_ai_quest(
+        ai_data,
+        places,
+        stop_count_for_duration(duration),
+    )
 
 
 async def ask_for_city(message: Message, state: FSMContext):
@@ -449,10 +741,57 @@ async def show_interests(message: Message, state: FSMContext):
     )
 
 
+async def send_generated_quest(message: Message, state: FSMContext):
+    data = await state.get_data()
+    quest = data["generated_quest"]
+    city = data.get("city", {})
+    duration = data.get("duration", "")
+    style = data.get("quest_style", "")
+
+    await message.answer(
+        f"🏮 <b>{esc(quest['title'])}</b>\n\n"
+        f"{esc(quest['intro'])}\n\n"
+        f"📍 {esc(city.get('input_name') or city.get('city'))} · "
+        f"⏱ {esc(duration)} · {esc(STYLE_LABELS.get(style, style))}\n\n"
+        "🤖 <i>Квест создан ИИ на основе реальных точек Geoapify.</i>"
+    )
+
+    for index, stop in enumerate(quest["stops"], start=1):
+        place = stop["place"]
+        pinyin_line = (
+            f"\n<i>{esc(place.get('pinyin'))}</i>"
+            if place.get("pinyin")
+            else ""
+        )
+
+        await message.answer(
+            f"📍 <b>{index}/{len(quest['stops'])}. {esc(stop['friendly_name'])}</b>\n"
+            f"{esc(place.get('category_label'))} — <b>{esc(place['name'])}</b>"
+            f"{pinyin_line}\n\n"
+            f"💡 <b>Почему здесь:</b> {esc(stop['why_here'])}\n\n"
+            f"🎯 <b>Миссия:</b> {esc(stop['mission'])}\n\n"
+            f"🧭 <b>Подсказка:</b> {esc(stop['tip'])}\n"
+            f"⏱ На миссию: ~{stop['mission_minutes']} мин"
+        )
+
+    completed = []
+    await state.update_data(completed_missions=completed)
+    await state.set_state(QuestForm.quest_active)
+
+    total = len(quest["stops"])
+    await message.answer(
+        "✅ <b>Чек-лист квеста</b>\n\n"
+        "Отмечай миссии прямо здесь по мере выполнения.\n\n"
+        f"{progress_bar(total, completed)}\n"
+        f"Прогресс: <b>0/{total}</b>",
+        reply_markup=checklist_keyboard(total, completed),
+    )
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    first_name = message.from_user.first_name if message.from_user else "путешественник"
+    first_name = esc(message.from_user.first_name if message.from_user else "путешественник")
 
     await message.answer(
         f"🏮 <b>CityQuest China 城市奇遇</b>\n\n"
@@ -489,6 +828,7 @@ async def cmd_newquest(message: Message, state: FSMContext):
 @router.callback_query(F.data == "new_quest")
 async def cb_new_quest(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
+    await state.clear()
     if callback.message:
         await ask_for_city(callback.message, state)
 
@@ -520,7 +860,12 @@ async def process_city(message: Message, state: FSMContext):
 
     await state.update_data(city=city, interests=[])
 
-    state_line = f"\nПровинция / регион: <b>{city['state']}</b>" if city.get("state") else ""
+    state_line = (
+        f"\nПровинция / регион: <b>{esc(city['state'])}</b>"
+        if city.get("state")
+        else ""
+    )
+
     coords = ""
     if city.get("lat") is not None and city.get("lon") is not None:
         coords = f"\n📍 {city['lat']:.5f}, {city['lon']:.5f}"
@@ -529,9 +874,9 @@ async def process_city(message: Message, state: FSMContext):
     formatted = city["formatted"]
 
     if input_name.casefold() not in formatted.casefold():
-        place_line = f"<b>{input_name}</b> · {formatted}"
+        place_line = f"<b>{esc(input_name)}</b> · {esc(formatted)}"
     else:
-        place_line = f"<b>{formatted}</b>"
+        place_line = f"<b>{esc(formatted)}</b>"
 
     await status_message.edit_text(
         "🇨🇳 <b>Нашёл!</b>\n\n"
@@ -570,7 +915,7 @@ async def cb_city_confirm(callback: CallbackQuery, state: FSMContext):
 
     if callback.message:
         await callback.message.answer(
-            f"✅ Отлично! Берём <b>{city['input_name']}</b>.\n\n"
+            f"✅ Отлично! Берём <b>{esc(city['input_name'])}</b>.\n\n"
             "⏱ <b>Сколько времени у тебя есть?</b>",
             reply_markup=duration_keyboard(),
         )
@@ -644,9 +989,7 @@ async def cb_interests_continue(callback: CallbackQuery, state: FSMContext):
     if not callback.message:
         return
 
-    selected_labels = " · ".join(
-        INTERESTS[key]["label"] for key in interests
-    )
+    selected_labels = " · ".join(INTERESTS[key]["label"] for key in interests)
 
     status = await callback.message.answer(
         "🔎 <b>Ищу реальные места…</b>\n\n"
@@ -672,30 +1015,30 @@ async def cb_interests_continue(callback: CallbackQuery, state: FSMContext):
         )
         return
 
-    # Keep enough candidates for the AI step; show only a short preview.
     await state.update_data(poi_candidates=places[:20])
     await state.set_state(QuestForm.choosing_style)
 
     preview = places[:6]
     lines = []
+
     for index, place in enumerate(preview, start=1):
         line = (
-            f"{index}. {place.get('category_label', '📍 место')} — "
-            f"<b>{place['name']}</b>"
+            f"{index}. {esc(place.get('category_label', '📍 место'))} — "
+            f"<b>{esc(place['name'])}</b>"
         )
         if place.get("pinyin"):
-            line += f"\n   <i>{place['pinyin']}</i>"
+            line += f"\n   <i>{esc(place['pinyin'])}</i>"
         lines.append(line)
 
     city_label = city.get("input_name") or city.get("city") or "город"
 
     await status.edit_text(
-        f"📍 <b>Нашёл реальные места в {city_label}</b>\n\n"
+        f"📍 <b>Нашёл реальные места в {esc(city_label)}</b>\n\n"
         "Вот несколько примеров:\n\n"
         + "\n".join(lines)
         + f"\n\nВсего подходящих кандидатов: <b>{len(places)}</b>.\n\n"
         "Сейчас ничего выбирать не нужно — это предварительный список. "
-        "После выбора стиля бот сам выберет лучшие точки для квеста.\n\n"
+        "После выбора стиля ИИ сам выберет лучшие точки для квеста.\n\n"
         "🎯 <b>Как будем исследовать город?</b>",
         reply_markup=style_keyboard(),
     )
@@ -709,30 +1052,127 @@ async def cb_style(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Неизвестный стиль", show_alert=True)
         return
 
-    await callback.answer()
-    await state.update_data(quest_style=style)
-    await state.set_state(QuestForm.ready_to_generate)
+    current_state = await state.get_state()
+    if current_state == QuestForm.generating.state:
+        await callback.answer("Квест уже создаётся 🤖", show_alert=True)
+        return
 
     data = await state.get_data()
-    city = data.get("city", {})
-    duration = data.get("duration", "")
+    city = data.get("city")
+    duration = data.get("duration")
     interests = data.get("interests", [])
     places = data.get("poi_candidates", [])
 
-    selected_labels = ", ".join(
-        INTERESTS[key]["label"] for key in interests
+    if not city or not duration or not interests or len(places) < 2:
+        await callback.answer(
+            "Не хватает данных. Начни новый квест через /start.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer()
+    await state.update_data(quest_style=style)
+    await state.set_state(QuestForm.generating)
+
+    if not callback.message:
+        return
+
+    status = await callback.message.answer(
+        "🤖 <b>ИИ собирает твой CityQuest…</b>\n\n"
+        "Выбираю реальные точки, связываю их с интересами и придумываю миссии."
     )
 
+    try:
+        quest = await generate_ai_quest(
+            city=city,
+            duration=duration,
+            interests=interests,
+            style=style,
+            places=places,
+        )
+    except Exception:
+        logger.exception("AI quest generation failed")
+        await state.set_state(QuestForm.choosing_style)
+        await status.edit_text(
+            "🤖 ИИ сейчас не смог собрать квест.\n\n"
+            "Попробуй ещё раз через несколько секунд или выбери другой стиль.",
+            reply_markup=style_keyboard(),
+        )
+        return
+
+    await state.update_data(generated_quest=quest)
+    await status.edit_text("✅ <b>Квест готов!</b>")
+
+    await send_generated_quest(callback.message, state)
+
+
+@router.callback_query(F.data.startswith("mission_toggle:"))
+async def cb_mission_toggle(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    quest = data.get("generated_quest")
+
+    if not quest:
+        await callback.answer("Квест не найден. Начни новый через /start.", show_alert=True)
+        return
+
+    try:
+        index = int(callback.data.split(":", 1)[1])
+    except (TypeError, ValueError):
+        await callback.answer()
+        return
+
+    total = len(quest["stops"])
+    if index < 0 or index >= total:
+        await callback.answer()
+        return
+
+    completed = list(data.get("completed_missions", []))
+
+    if index in completed:
+        completed.remove(index)
+    else:
+        completed.append(index)
+
+    completed = sorted(set(completed))
+    await state.update_data(completed_missions=completed)
+    await callback.answer("Готово ✅" if index in completed else "Отметка снята")
+
     if callback.message:
-        await callback.message.answer(
-            "✅ <b>Основа квеста готова</b>\n\n"
-            f"🏮 Город: <b>{city.get('input_name') or city.get('city', '')}</b>\n"
-            f"⏱ Время: <b>{duration}</b>\n"
-            f"✨ Интересы: {selected_labels}\n"
-            f"🎯 Стиль: <b>{STYLE_LABELS[style]}</b>\n"
-            f"📍 Реальных мест в резерве: <b>{len(places)}</b>\n\n"
-            "Следующий шаг — подключить ИИ: он выберет из этих реальных точек "
-            "подходящие места и превратит их в персональные миссии."
+        await callback.message.edit_text(
+            "✅ <b>Чек-лист квеста</b>\n\n"
+            "Отмечай миссии прямо здесь по мере выполнения.\n\n"
+            f"{progress_bar(total, completed)}\n"
+            f"Прогресс: <b>{len(completed)}/{total}</b>",
+            reply_markup=checklist_keyboard(total, completed),
+        )
+
+
+@router.callback_query(F.data == "quest_finish")
+async def cb_quest_finish(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    quest = data.get("generated_quest")
+    completed = set(data.get("completed_missions", []))
+
+    if not quest:
+        await callback.answer("Квест не найден.", show_alert=True)
+        return
+
+    total = len(quest["stops"])
+
+    if len(completed) != total:
+        await callback.answer("Сначала отметь все миссии.", show_alert=True)
+        return
+
+    await callback.answer()
+    await state.set_state(QuestForm.quest_finished)
+
+    if callback.message:
+        await callback.message.edit_text(
+            "🏆 <b>CityQuest завершён!</b>\n\n"
+            f"{progress_bar(total, list(completed))}\n"
+            f"Все миссии выполнены: <b>{total}/{total}</b>\n\n"
+            f"🎁 <b>Финальный штрих:</b> {esc(quest.get('final_challenge'))}\n\n"
+            "Спасибо за приключение! Чтобы создать новый квест, нажми /start."
         )
 
 
@@ -742,7 +1182,8 @@ async def cb_my_quests(callback: CallbackQuery):
     if callback.message:
         await callback.message.answer(
             "🎒 <b>Мои приключения</b>\n\n"
-            "Здесь будут храниться созданные и завершённые CityQuest."
+            "Сохранение истории квестов подключим следующим этапом. "
+            "Текущий активный квест и чек-лист уже работают в рамках запущенного бота."
         )
 
 
@@ -753,9 +1194,9 @@ async def cb_about(callback: CallbackQuery):
         await callback.message.answer(
             "ℹ️ <b>Как работает CityQuest China</b>\n\n"
             "1. Ты выбираешь город, время и интересы.\n"
-            "2. Бот находит реальные места через Geoapify.\n"
-            "3. ИИ превращает их в персональный городской квест.\n"
-            "4. Ты отмечаешь выполненные миссии прямо в Telegram."
+            "2. Geoapify находит реальные места.\n"
+            "3. ИИ через Groq выбирает подходящие точки и создаёт персональные миссии.\n"
+            "4. Миссии можно отмечать галочками прямо в Telegram."
         )
 
 
@@ -764,10 +1205,11 @@ async def main():
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    logger.info("Starting CityQuest China")
+    logger.info("Starting CityQuest China with Geoapify + Groq AI")
     await dp.start_polling(bot)
 
 
