@@ -60,6 +60,7 @@ ACTIVE_DATA_KEYS = (
     "completed",
     "bonuses",
     "photos",
+    "photo_versions",
     "travel_card_path",
     "travel_caption",
 )
@@ -2575,45 +2576,48 @@ def phrase_show_keyboard(keys, idx):
     return kb.as_markup()
 
 
-def photo_actions_keyboard(stop, index):
+def photo_actions_keyboard(stop, index, version=0):
     group = place_group(stop["place"])
     kb = InlineKeyboardBuilder()
 
+    suffix = f":{index}:{int(version)}"
+
     if group in {"restaurant", "cafe", "tea"}:
-        kb.button(text="🍜 Что на фото / в меню?", callback_data=f"vision:menu:{index}")
-        kb.button(text="🌶 Острое или нет?", callback_data=f"vision:spicy:{index}")
-        kb.button(text="🥢 Из чего это?", callback_data=f"vision:ingredients:{index}")
-        kb.button(text="🔤 Прочитать / перевести", callback_data=f"vision:text:{index}")
+        kb.button(text="🍜 Что на фото / в меню?", callback_data=f"vision:menu{suffix}")
+        kb.button(text="🌶 Острое или нет?", callback_data=f"vision:spicy{suffix}")
+        kb.button(text="🥢 Из чего это?", callback_data=f"vision:ingredients{suffix}")
+        kb.button(text="🔤 Прочитать / перевести", callback_data=f"vision:text{suffix}")
 
     elif group == "market":
-        # Market is not automatically a food stop.
-        kb.button(text="🍜 Это еда / меню", callback_data=f"vision:menu:{index}")
-        kb.button(text="🧧 Это предмет / символ", callback_data=f"vision:monument:{index}")
-        kb.button(text="🏮 Что здесь традиционного?", callback_data=f"vision:tradition:{index}")
-        kb.button(text="🔤 Прочитать / перевести", callback_data=f"vision:text:{index}")
-        kb.button(text="🏯 Что это за место?", callback_data=f"vision:place:{index}")
+        kb.button(text="🍜 Это еда / меню", callback_data=f"vision:menu{suffix}")
+        kb.button(text="🧧 Это предмет / символ", callback_data=f"vision:monument{suffix}")
+        kb.button(text="🏮 Что здесь традиционного?", callback_data=f"vision:tradition{suffix}")
+        kb.button(text="🔤 Прочитать / перевести", callback_data=f"vision:text{suffix}")
+        kb.button(text="🏯 Что это за место?", callback_data=f"vision:place{suffix}")
 
     elif group in {"heritage", "temple"}:
-        kb.button(text="🏯 Что это за место?", callback_data=f"vision:place:{index}")
-        kb.button(text="🗿 Что за памятник / объект?", callback_data=f"vision:monument:{index}")
-        kb.button(text="🧠 Что за символ?", callback_data=f"vision:symbol:{index}")
-        kb.button(text="🏮 Что здесь традиционного?", callback_data=f"vision:tradition:{index}")
-        kb.button(text="🔤 Что написано?", callback_data=f"vision:text:{index}")
+        kb.button(text="🏯 Что это за место?", callback_data=f"vision:place{suffix}")
+        kb.button(text="🗿 Что за памятник / объект?", callback_data=f"vision:monument{suffix}")
+        kb.button(text="🧠 Что за символ?", callback_data=f"vision:symbol{suffix}")
+        kb.button(text="🏮 Что здесь традиционного?", callback_data=f"vision:tradition{suffix}")
+        kb.button(text="🔤 Что написано?", callback_data=f"vision:text{suffix}")
 
     elif group == "museum":
-        kb.button(text="🏯 Что это за место?", callback_data=f"vision:place:{index}")
-        kb.button(text="🗿 Что за объект?", callback_data=f"vision:monument:{index}")
-        kb.button(text="🧠 Что можно понять по фото?", callback_data=f"vision:object:{index}")
-        kb.button(text="🔤 Прочитать надпись", callback_data=f"vision:text:{index}")
+        kb.button(text="🏯 Что это за место?", callback_data=f"vision:place{suffix}")
+        kb.button(text="🗿 Что за объект?", callback_data=f"vision:monument{suffix}")
+        kb.button(text="🧠 Что можно понять по фото?", callback_data=f"vision:object{suffix}")
+        kb.button(text="🔤 Прочитать надпись", callback_data=f"vision:text{suffix}")
 
     else:
-        kb.button(text="🏯 Что это за место?", callback_data=f"vision:place:{index}")
-        kb.button(text="🗿 Что за памятник / объект?", callback_data=f"vision:monument:{index}")
-        kb.button(text="🏮 Найти китайские элементы", callback_data=f"vision:tradition:{index}")
-        kb.button(text="📸 Оценить кадр", callback_data=f"vision:photo:{index}")
-        kb.button(text="🔤 Что написано?", callback_data=f"vision:text:{index}")
+        kb.button(text="🏯 Что это за место?", callback_data=f"vision:place{suffix}")
+        kb.button(text="🗿 Что за памятник / объект?", callback_data=f"vision:monument{suffix}")
+        kb.button(text="🏮 Найти китайские элементы", callback_data=f"vision:tradition{suffix}")
+        kb.button(text="📸 Оценить кадр", callback_data=f"vision:photo{suffix}")
+        kb.button(text="🔤 Что написано?", callback_data=f"vision:text{suffix}")
 
     kb.button(text="🔄 Другое фото", callback_data=f"photo_replace:{index}")
+    kb.button(text="➡️ Продолжить квест", callback_data=f"photo_continue:{index}")
+    kb.button(text="✅ Чек-лист", callback_data="show_checklist")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -3008,29 +3012,66 @@ async def generate_travel_caption(data):
 
 
 def load_card_font(size, bold=False):
+    """
+    Use DejaVu bundled with matplotlib.
+    It supports Cyrillic reliably even when the BotHost image has no system fonts.
+    """
     candidates = []
+
+    try:
+        import matplotlib
+        font_dir = os.path.join(
+            os.path.dirname(matplotlib.__file__),
+            "mpl-data",
+            "fonts",
+            "ttf",
+        )
+        candidates.append(
+            os.path.join(
+                font_dir,
+                "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
+            )
+        )
+    except Exception:
+        logger.exception("Could not locate matplotlib bundled font")
 
     if bold:
         candidates.extend([
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
         ])
     else:
         candidates.extend([
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
         ])
 
     for path in candidates:
-        if os.path.exists(path):
+        if path and os.path.exists(path):
             try:
                 return ImageFont.truetype(path, size=size)
             except Exception:
                 pass
 
-    return ImageFont.load_default()
+    raise RuntimeError(
+        "No Cyrillic-capable font found for travel card"
+    )
+
+
+def clean_card_text(value):
+    """
+    Travel card is Russian-first. Remove emoji/CJK/unsupported decorative symbols
+    from the raster image; the Telegram messages can still contain them.
+    """
+    value = str(value or "")
+    value = re.sub(r"[\u3400-\u4dbf\u4e00-\u9fff]", "", value)
+    value = re.sub(
+        r"[\U0001F000-\U0001FAFF\u2600-\u27BF]",
+        "",
+        value,
+    )
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
 
 
 def wrap_by_pixels(draw, text_value, font, max_width):
@@ -3076,8 +3117,8 @@ def rounded_photo(source, size, radius=28):
 
 
 def photo_layout_boxes(count):
-    x0, y0 = 70, 360
-    width, height = 940, 650
+    x0, y0 = 64, 415
+    width, height = 952, 560
     gap = 16
 
     if count <= 1:
@@ -3091,13 +3132,13 @@ def photo_layout_boxes(count):
         ]
 
     if count == 3:
-        top_h = 390
-        bottom_h = height - top_h - gap
-        bottom_w = (width - gap) // 2
+        left_w = 565
+        right_w = width - left_w - gap
+        right_h = (height - gap) // 2
         return [
-            (x0, y0, width, top_h),
-            (x0, y0 + top_h + gap, bottom_w, bottom_h),
-            (x0 + bottom_w + gap, y0 + top_h + gap, bottom_w, bottom_h),
+            (x0, y0, left_w, height),
+            (x0 + left_w + gap, y0, right_w, right_h),
+            (x0 + left_w + gap, y0 + right_h + gap, right_w, right_h),
         ]
 
     if count == 4:
@@ -3110,8 +3151,7 @@ def photo_layout_boxes(count):
             (x0 + w + gap, y0 + h + gap, w, h),
         ]
 
-    # 5 photos: 2 large above + 3 below.
-    top_h = 340
+    top_h = 305
     bottom_h = height - top_h - gap
     top_w = (width - gap) // 2
     bottom_w = (width - 2 * gap) // 3
@@ -3126,22 +3166,29 @@ def photo_layout_boxes(count):
 
 def render_travel_card(data, photo_images, caption):
     width, height = 1080, 1350
-    bg = (247, 242, 232)
-    ink = (45, 45, 42)
-    muted = (104, 100, 92)
-    red = (164, 61, 50)
-    gold = (181, 143, 70)
-    line = (220, 211, 194)
+
+    bg = (246, 241, 230)
+    paper = (255, 252, 245)
+    ink = (39, 42, 38)
+    muted = (104, 101, 92)
+    red = (165, 61, 49)
+    deep_red = (125, 42, 35)
+    gold = (191, 148, 62)
+    soft_gold = (239, 226, 190)
+    line = (221, 213, 195)
 
     image = Image.new("RGB", (width, height), bg)
     draw = ImageDraw.Draw(image)
 
-    title_font = load_card_font(54, bold=True)
-    city_font = load_card_font(38, bold=True)
-    label_font = load_card_font(23, bold=True)
-    stat_font = load_card_font(25, bold=True)
-    body_font = load_card_font(27, bold=False)
-    footer_font = load_card_font(20, bold=False)
+    city_font = load_card_font(76, bold=True)
+    title_font = load_card_font(38, bold=True)
+    kicker_font = load_card_font(19, bold=True)
+    stat_value_font = load_card_font(30, bold=True)
+    stat_label_font = load_card_font(17, bold=True)
+    body_font = load_card_font(25, bold=False)
+    route_font = load_card_font(18, bold=False)
+    route_bold_font = load_card_font(18, bold=True)
+    footer_font = load_card_font(16, bold=False)
 
     quest = data.get("quest") or {}
     city = data.get("city") or {}
@@ -3149,77 +3196,198 @@ def render_travel_card(data, photo_images, caption):
     completed = data.get("completed") or []
     bonuses = data.get("bonuses") or []
 
-    title = str(quest.get("title") or "CityQuest China")
-    city_name = city_display_ru(city)
+    city_name = clean_card_text(city_display_ru(city)).upper()
+    title = clean_card_text(
+        quest.get("title") or f"CityQuest {city_display_ru(city)}"
+    )
+    caption = clean_card_text(caption)
+
     xp = earned_xp(quest, completed, bonuses) if quest else 0
     distance = fmt_distance(float(route.get("distance_m") or 0))
-    duration = str(data.get("duration") or "")
+    duration = clean_card_text(data.get("duration") or "")
+    stop_count = len(quest.get("stops", []))
+    photo_count = min(len(photo_images), 5)
 
-    # Header decoration.
-    draw.rounded_rectangle((70, 55, 306, 103), radius=24, fill=red)
-    draw.text((91, 67), "CITYQUEST CHINA", font=label_font, fill=(255, 250, 242))
-    draw.ellipse((932, 54, 978, 100), fill=gold)
-    draw.ellipse((987, 54, 1018, 85), outline=red, width=5)
+    # Background decorations: subtle travel/postcard feel.
+    draw.rounded_rectangle(
+        (40, 35, 1040, 1315),
+        radius=36,
+        fill=paper,
+    )
+    draw.rectangle((40, 35, 55, 1315), fill=red)
 
-    y = 135
-    draw.text((70, y), city_name, font=city_font, fill=red)
-    y += 58
+    # Top identity.
+    draw.text((78, 68), "CITYQUEST CHINA", font=kicker_font, fill=gold)
+    draw.line((78, 102, 1000, 102), fill=line, width=2)
 
-    title_lines = wrap_by_pixels(draw, title, title_font, 930)[:2]
+    # Decorative seal, drawn without unsupported glyphs.
+    draw.ellipse((915, 58, 1000, 143), fill=red)
+    seal_font = load_card_font(24, bold=True)
+    draw.text((934, 84), "CQ", font=seal_font, fill=(255, 247, 235))
+
+    # Large Russian city.
+    draw.text((78, 132), city_name, font=city_font, fill=deep_red)
+
+    # Quest title.
+    title_lines = wrap_by_pixels(draw, title, title_font, 790)[:2]
+    ty = 230
     for line_text in title_lines:
-        draw.text((70, y), line_text, font=title_font, fill=ink)
-        y += 64
+        draw.text((80, ty), line_text, font=title_font, fill=ink)
+        ty += 47
 
-    # Stats row.
-    stats_y = 292
-    draw.line((70, stats_y - 18, 1010, stats_y - 18), fill=line, width=2)
+    # Stats as proper cards, no emoji/symbol glyph dependency.
     stats = [
-        f"✓ {len(completed)}/{len(quest.get('stops', []))} миссий",
-        f"★ {xp} XP",
-        f"↟ {distance}",
-        f"◷ {duration}",
+        ("МИССИИ", f"{len(completed)}/{stop_count}"),
+        ("XP", str(xp)),
+        ("МАРШРУТ", distance),
+        ("ВРЕМЯ", duration or "—"),
     ]
 
-    x_positions = [70, 315, 550, 775]
-    for x, value in zip(x_positions, stats):
-        draw.text((x, stats_y), value, font=stat_font, fill=muted)
+    card_y = 325
+    card_w = 218
+    card_h = 72
+    gap = 18
+
+    for i, (label, value) in enumerate(stats):
+        x = 78 + i * (card_w + gap)
+        draw.rounded_rectangle(
+            (x, card_y, x + card_w, card_y + card_h),
+            radius=18,
+            fill=(249, 244, 233),
+            outline=soft_gold,
+            width=2,
+        )
+        draw.text(
+            (x + 16, card_y + 12),
+            clean_card_text(value),
+            font=stat_value_font,
+            fill=ink,
+        )
+        draw.text(
+            (x + 16, card_y + 46),
+            label,
+            font=stat_label_font,
+            fill=muted,
+        )
 
     # Photo area.
-    count = min(len(photo_images), 5)
-    boxes = photo_layout_boxes(max(count, 1))
+    boxes = photo_layout_boxes(max(photo_count, 1))
 
-    if count:
+    if photo_count:
         for photo, box in zip(photo_images[:5], boxes):
-            x, yb, w, h = box
-            card = rounded_photo(photo, (w, h), radius=26)
-            image.paste(card, (x, yb))
+            x, y, w, h = box
+
+            # Shadow.
+            draw.rounded_rectangle(
+                (x + 7, y + 8, x + w + 7, y + h + 8),
+                radius=28,
+                fill=(226, 218, 202),
+            )
+
+            card = rounded_photo(photo, (w, h), radius=28)
+            image.paste(card, (x, y))
+
+        # Small label above the collage/poster.
+        label = (
+            "ФОТО-ТРОФЕЙ"
+            if photo_count == 1
+            else f"ФОТО-ТРОФЕИ · {photo_count}"
+        )
+        draw.rounded_rectangle(
+            (78, 424, 78 + 225, 458),
+            radius=16,
+            fill=red,
+        )
+        draw.text(
+            (93, 432),
+            label,
+            font=stat_label_font,
+            fill=(255, 247, 236),
+        )
     else:
-        # Text-only fallback.
-        x, yb, w, h = boxes[0]
-        draw.rounded_rectangle((x, yb, x + w, yb + h), radius=28, outline=line, width=3)
-        placeholder_font = load_card_font(36, bold=True)
-        draw.text((x + 115, yb + 270), "Фото-трофеи появятся здесь", font=placeholder_font, fill=muted)
+        x, y, w, h = boxes[0]
+        draw.rounded_rectangle(
+            (x, y, x + w, y + h),
+            radius=28,
+            outline=line,
+            width=3,
+        )
+        empty_font = load_card_font(32, bold=True)
+        draw.text(
+            (x + 205, y + 245),
+            "Здесь будут фото-трофеи",
+            font=empty_font,
+            fill=muted,
+        )
 
-    # Caption block.
-    cap_top = 1045
-    draw.line((70, cap_top, 1010, cap_top), fill=line, width=2)
-    draw.text((70, cap_top + 32), "МОЯ ЗАМЕТКА", font=label_font, fill=gold)
-
-    cap_lines = wrap_by_pixels(draw, caption, body_font, 920)[:4]
-    cy = cap_top + 76
-    for line_text in cap_lines:
-        draw.text((70, cy), line_text, font=body_font, fill=ink)
-        cy += 39
+    # Bottom: personal caption + route stops.
+    bottom_top = 1002
+    draw.line((78, bottom_top, 1000, bottom_top), fill=line, width=2)
 
     draw.text(
-        (70, 1302),
-        "CityQuest China · AI-квест по реальным местам Китая",
+        (78, bottom_top + 25),
+        "МОЯ ЗАМЕТКА",
+        font=kicker_font,
+        fill=gold,
+    )
+
+    cap_lines = wrap_by_pixels(
+        draw,
+        caption or "Моя прогулка по Китаю.",
+        body_font,
+        900,
+    )[:3]
+
+    cy = bottom_top + 60
+    for line_text in cap_lines:
+        draw.text((78, cy), line_text, font=body_font, fill=ink)
+        cy += 34
+
+    # Compact route line(s): user sees actual places included.
+    stops = [
+        clean_card_text(stop.get("name_ru") or "")
+        for stop in quest.get("stops", [])
+        if clean_card_text(stop.get("name_ru") or "")
+    ][:4]
+
+    if stops:
+        route_y = 1162
+        draw.text(
+            (78, route_y),
+            "МАРШРУТ",
+            font=kicker_font,
+            fill=gold,
+        )
+
+        route_text = "  •  ".join(stops)
+        route_lines = wrap_by_pixels(
+            draw,
+            route_text,
+            route_font,
+            900,
+        )[:2]
+
+        ry = route_y + 34
+        for line_text in route_lines:
+            draw.text((78, ry), line_text, font=route_bold_font, fill=muted)
+            ry += 27
+
+    draw.line((78, 1280, 1000, 1280), fill=line, width=2)
+    draw.text(
+        (78, 1292),
+        "CITYQUEST CHINA  ·  PERSONAL TRAVEL CARD",
         font=footer_font,
         fill=muted,
     )
 
     buffer = io.BytesIO()
-    image.save(buffer, format="JPEG", quality=92, optimize=True)
+    image.save(
+        buffer,
+        format="JPEG",
+        quality=93,
+        optimize=True,
+        progressive=True,
+    )
     return buffer.getvalue()
 
 
@@ -3353,7 +3521,7 @@ async def send_quest(message, state):
                 "Это дополнительная исследовательская миссия — она не требует отдельной точки на карте."
             )
 
-    await state.update_data(completed=[], bonuses=[], photos={})
+    await state.update_data(completed=[], bonuses=[], photos={}, photo_versions={})
     await state.set_state(QuestForm.quest_active)
     await persist_active_state(message.from_user.id, state)
     await message.answer(
@@ -3735,6 +3903,45 @@ async def style_cb(callback: CallbackQuery, state: FSMContext):
     await send_quest(callback.message, state)
 
 
+@router.callback_query(F.data.startswith("photo_continue:"))
+async def photo_continue(callback: CallbackQuery, state: FSMContext):
+    idx = int(callback.data.split(":", 1)[1])
+    data = await restore_active_state(callback.from_user.id, state)
+    quest = data.get("quest")
+    route = data.get("route") or {"distance_m": 0, "time_s": 0, "legs": []}
+
+    if not quest:
+        await callback.answer("Активный квест не найден.", show_alert=True)
+        return
+
+    await callback.answer()
+
+    if idx + 1 < len(quest["stops"]):
+        next_idx = idx + 1
+        await callback.message.answer(
+            f"➡️ <b>Продолжаем: миссия {next_idx + 1}</b>"
+        )
+        await send_stop_card(
+            callback.message,
+            quest,
+            route,
+            next_idx,
+        )
+        await callback.message.answer(
+            "🧭 <b>Навигация:</b>",
+            reply_markup=mission_nav_keyboard(quest, next_idx),
+        )
+    else:
+        await callback.message.answer(
+            "🏁 Это последняя точка маршрута.\n"
+            "Открой чек-лист и отметь выполненные миссии.",
+            reply_markup=checklist_keyboard(
+                quest,
+                data.get("completed", []),
+            ),
+        )
+
+
 @router.callback_query(F.data.startswith("mission_toggle:"))
 async def mission_toggle(callback: CallbackQuery, state: FSMContext):
     data = await restore_active_state(callback.from_user.id, state)
@@ -3857,22 +4064,39 @@ async def receive_photo(message: Message, state: FSMContext):
         await message.answer("Не удалось определить миссию.")
         return
 
-    suitable = [p for p in message.photo if not p.file_size or p.file_size <= 2_500_000]
+    suitable = [
+        p for p in message.photo
+        if not p.file_size or p.file_size <= 2_500_000
+    ]
     chosen = suitable[-1] if suitable else message.photo[0]
 
     photos = dict(data.get("photos", {}))
-    photos[str(idx)] = chosen.file_id
+    versions = dict(data.get("photo_versions", {}))
 
-    await state.update_data(photos=photos, photo_target=None)
+    key = str(idx)
+    previous_exists = bool(photos.get(key))
+
+    photos[key] = chosen.file_id
+    versions[key] = int(versions.get(key, 0)) + 1
+    version = versions[key]
+
+    await state.update_data(
+        photos=photos,
+        photo_versions=versions,
+        photo_target=None,
+    )
     await state.set_state(QuestForm.quest_active)
     await persist_active_state(message.from_user.id, state)
 
     stop = quest["stops"][idx]
+    verb = "заменено" if previous_exists else "сохранено"
+
     await message.answer(
-        f"📷 <b>Фото сохранено: {esc(stop['name_ru'])}</b>\n\n"
-        "Выбери, что именно нужно узнать по ЭТОМУ снимку. "
-        "Если прислал не то — нажми «🔄 Другое фото».",
-        reply_markup=photo_actions_keyboard(stop, idx),
+        f"📷 <b>Фото {verb}: {esc(stop['name_ru'])}</b>\n\n"
+        "Для каждой миссии хранится <b>один фото-трофей</b>. "
+        "Если нажать «🔄 Другое фото», этот снимок будет заменён.\n\n"
+        "AI-разбор необязателен: можно сразу нажать «➡️ Продолжить квест».",
+        reply_markup=photo_actions_keyboard(stop, idx, version=version),
     )
 
 
@@ -3883,29 +4107,77 @@ async def not_photo(message: Message):
 
 @router.callback_query(F.data.startswith("vision:"))
 async def vision_callback(callback: CallbackQuery, state: FSMContext):
-    _, mode, idx_raw = callback.data.split(":", 2)
-    idx = int(idx_raw)
+    parts = callback.data.split(":")
+    if len(parts) < 3:
+        await callback.answer("Некорректная кнопка.", show_alert=True)
+        return
+
+    mode = parts[1]
+    idx = int(parts[2])
+    expected_version = int(parts[3]) if len(parts) >= 4 and parts[3].isdigit() else None
 
     data = await restore_active_state(callback.from_user.id, state)
     quest = data.get("quest")
     photos = data.get("photos", {})
+    versions = data.get("photo_versions", {})
+
     file_id = photos.get(str(idx))
+    current_version = int(versions.get(str(idx), 0))
 
     if not quest or not file_id:
         await callback.answer("Сначала добавь фото.", show_alert=True)
         return
 
+    # New v7.1 buttons are tied to the exact photo revision.
+    if expected_version is not None and expected_version != current_version:
+        await callback.answer(
+            "Это кнопка от предыдущего фото. Используй кнопки под новым снимком.",
+            show_alert=True,
+        )
+        await callback.message.answer(
+            "🔄 <b>Фото этой миссии уже заменено.</b>\n"
+            "Ниже — действия для текущего снимка.",
+            reply_markup=photo_actions_keyboard(
+                quest["stops"][idx],
+                idx,
+                version=current_version,
+            ),
+        )
+        return
+
+    request_file_id = file_id
+    request_version = current_version
+
     await callback.answer()
     status = await callback.message.answer("🤖 <b>Смотрю фотографию…</b>")
 
     try:
-        image_bytes = await download_photo_bytes(callback.bot, file_id)
-        result = await analyze_photo_with_groq(image_bytes, mode, quest["stops"][idx])
+        image_bytes = await download_photo_bytes(callback.bot, request_file_id)
+        result = await analyze_photo_with_groq(
+            image_bytes,
+            mode,
+            quest["stops"][idx],
+        )
     except Exception:
         logger.exception("Vision")
+
+        latest = await restore_active_state(callback.from_user.id, state)
+        latest_photos = latest.get("photos", {})
+        latest_versions = latest.get("photo_versions", {})
+
+        if (
+            latest_photos.get(str(idx)) != request_file_id
+            or int(latest_versions.get(str(idx), 0)) != request_version
+        ):
+            await status.edit_text(
+                "🔄 Пока я анализировал снимок, ты уже заменил фото. "
+                "Старый результат не показываю."
+            )
+            return
+
         await status.edit_text(
             "🤖 Сейчас не получилось разобрать фото.\n\n"
-            "Можно попробовать ещё раз или спросить человека на месте."
+            "Можно попробовать ещё раз или просто продолжить квест."
         )
 
         keys = followup_phrase_keys(mode)
@@ -3918,6 +4190,22 @@ async def vision_callback(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer(
             "🧭 <b>Продолжить квест:</b>",
             reply_markup=mission_nav_keyboard(quest, idx),
+        )
+        return
+
+    # Stale-response protection: do not show analysis for a photo that has
+    # already been replaced while the AI request was running.
+    latest = await restore_active_state(callback.from_user.id, state)
+    latest_photos = latest.get("photos", {})
+    latest_versions = latest.get("photo_versions", {})
+
+    if (
+        latest_photos.get(str(idx)) != request_file_id
+        or int(latest_versions.get(str(idx), 0)) != request_version
+    ):
+        await status.edit_text(
+            "🔄 Пока я анализировал снимок, ты уже заменил фото. "
+            "Старый AI-разбор скрыт — используй кнопки под новым снимком."
         )
         return
 
@@ -4127,7 +4415,7 @@ async def quest_finish(callback: CallbackQuery, state: FSMContext):
     if photos:
         card_status = await callback.message.answer(
             "🎨 <b>Собираю твою travel-открытку…</b>\n"
-            "Использую фото-трофеи из этого квеста."
+            "Если фото несколько — получится коллаж; если одно — постер с фото-трофеем."
         )
 
         try:
@@ -4346,7 +4634,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Starting CityQuest China v7 Travel Card Finale")
+    logger.info("Starting CityQuest China v7.1 Photo Flow + Travel Card Redesign")
     await dp.start_polling(bot)
 
 

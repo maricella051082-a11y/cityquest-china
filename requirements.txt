@@ -3,3 +3,4 @@ aiohttp==3.14.3
 python-dotenv==1.1.1
 pypinyin==0.55.0
 Pillow==11.3.0
+matplotlib==3.10.5
