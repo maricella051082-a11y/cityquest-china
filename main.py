@@ -67,6 +67,7 @@ ACTIVE_DATA_KEYS = (
     "interests",
     "start_mode",
     "start_point",
+    "replacement_history",
     "completed",
     "bonuses",
     "photos",
@@ -257,6 +258,153 @@ def db_completed_list(user_id: int, limit: int = 5):
     except Exception:
         logger.exception("Failed to list completed quests for user %s", user_id)
         return []
+
+
+def db_completed_all(user_id: int):
+    """All completed quests for the compact travel passport."""
+    if not PERSISTENCE_OK:
+        return []
+
+    try:
+        with db_connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, title, city, finished_at, xp, photos, data_json
+                FROM completed_quests
+                WHERE user_id=?
+                ORDER BY id DESC
+                """,
+                (int(user_id),),
+            ).fetchall()
+
+        output = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["payload"] = json.loads(item.get("data_json") or "{}")
+            except Exception:
+                item["payload"] = {}
+            output.append(item)
+        return output
+    except Exception:
+        logger.exception("Failed to load travel passport for user %s", user_id)
+        return []
+
+
+def db_completed_record(user_id: int, record_id: int):
+    if not PERSISTENCE_OK:
+        return None
+
+    try:
+        with db_connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, title, city, finished_at, xp, photos, data_json
+                FROM completed_quests
+                WHERE user_id=? AND id=?
+                LIMIT 1
+                """,
+                (int(user_id), int(record_id)),
+            ).fetchone()
+
+        if not row:
+            return None
+
+        item = dict(row)
+        try:
+            item["payload"] = json.loads(item.get("data_json") or "{}")
+        except Exception:
+            item["payload"] = {}
+        return item
+    except Exception:
+        logger.exception(
+            "Failed to load completed quest %s for user %s",
+            record_id,
+            user_id,
+        )
+        return None
+
+
+def db_completed_for_city(user_id: int, city_name: str):
+    if not PERSISTENCE_OK:
+        return []
+
+    try:
+        with db_connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, title, city, finished_at, xp, photos, data_json
+                FROM completed_quests
+                WHERE user_id=? AND city=?
+                ORDER BY id DESC
+                """,
+                (int(user_id), str(city_name)),
+            ).fetchall()
+
+        output = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["payload"] = json.loads(item.get("data_json") or "{}")
+            except Exception:
+                item["payload"] = {}
+            output.append(item)
+        return output
+    except Exception:
+        logger.exception(
+            "Failed to load completed quests for %s / %s",
+            user_id,
+            city_name,
+        )
+        return []
+
+
+def completed_record_progress(record):
+    payload = (record or {}).get("payload") or {}
+    quest = payload.get("quest") or {}
+    completed = payload.get("completed") or []
+    total = len(quest.get("stops") or [])
+    return len(completed), total
+
+
+def passport_city_groups(records):
+    groups = {}
+
+    for record in records:
+        city = str(record.get("city") or "Китай")
+        completed_count, total_count = completed_record_progress(record)
+
+        if city not in groups:
+            groups[city] = {
+                "city": city,
+                "quests": 0,
+                "completed": 0,
+                "total": 0,
+                "xp": 0,
+                "latest_id": int(record.get("id") or 0),
+                "records": [],
+            }
+
+        group = groups[city]
+        group["quests"] += 1
+        group["completed"] += int(completed_count)
+        group["total"] += int(total_count)
+        group["xp"] += int(record.get("xp") or 0)
+        group["records"].append(record)
+
+    return list(groups.values())
+
+
+def format_passport_date(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt.strftime("%d.%m.%Y")
+    except Exception:
+        return raw[:10]
 
 
 def db_recent_missions_for_city(user_id: int, city_name: str, limit: int = 12):
@@ -3330,6 +3478,245 @@ def checklist_text(quest, completed, bonuses, photos):
     return "\n".join(lines)
 
 
+def place_unique_key(place):
+    return (
+        str(place.get("place_id") or "").strip()
+        or f"{place.get('name')}:{float(place['lat']):.5f}:{float(place['lon']):.5f}"
+    )
+
+
+def replacement_candidate_score(candidate, quest, index, interests, start_point=None):
+    original = quest["stops"][index]["place"]
+    score = 0.0
+
+    # Prefer the same broad type so replacing a restaurant does not suddenly
+    # turn the user's food stop into a random monument.
+    if place_group(candidate) == place_group(original):
+        score -= 4200.0
+
+    original_matches = set(original.get("interest_matches") or [])
+    candidate_matches = set(candidate.get("interest_matches") or [])
+    score -= 700.0 * len(
+        candidate_matches.intersection(original_matches or set(interests))
+    )
+
+    # Keep the replacement useful in the existing route.
+    if index > 0:
+        score += haversine(
+            quest["stops"][index - 1]["place"],
+            candidate,
+        )
+    elif start_point:
+        score += haversine(start_point, candidate)
+
+    if index + 1 < len(quest["stops"]):
+        score += haversine(
+            candidate,
+            quest["stops"][index + 1]["place"],
+        )
+
+    # A gentle penalty stops the replacement drifting to the other side
+    # of a large city when several equally good options exist.
+    score += 0.25 * haversine(original, candidate)
+
+    return score
+
+
+async def find_replacement_candidate(data, index):
+    quest = data.get("quest") or {}
+    city = data.get("city") or {}
+    duration = data.get("duration")
+    interests = data.get("interests") or []
+    start_point = data.get("start_point")
+
+    if not quest or index < 0 or index >= len(quest.get("stops") or []):
+        return None, None
+
+    try:
+        candidates = await search_places(
+            city,
+            interests,
+            duration,
+            start_point=start_point,
+        )
+    except Exception:
+        logger.exception("Replacement place search failed")
+        return None, None
+
+    current_places = [
+        stop["place"]
+        for stop in quest.get("stops") or []
+    ]
+    current_keys = {
+        place_unique_key(place)
+        for place in current_places
+    }
+    old_history = {
+        str(value)
+        for value in (data.get("replacement_history") or [])
+    }
+
+    pool = []
+    for candidate in candidates:
+        key = place_unique_key(candidate)
+
+        if key in current_keys or key in old_history:
+            continue
+
+        # Avoid a second map feature that is effectively the same physical
+        # place under another name.
+        if any(
+            haversine(candidate, place) < 80
+            for place in current_places
+        ):
+            continue
+
+        pool.append(candidate)
+
+    if not pool:
+        return None, None
+
+    pool.sort(
+        key=lambda candidate: replacement_candidate_score(
+            candidate,
+            quest,
+            index,
+            interests,
+            start_point=start_point,
+        )
+    )
+
+    old_route = data.get("route") or {}
+    old_distance = float(old_route.get("distance_m") or 0)
+
+    # Six real routing checks are enough for a useful replacement and keep
+    # Geoapify consumption bounded.
+    for candidate in pool[:6]:
+        new_places = list(current_places)
+        new_places[index] = candidate
+
+        if not route_order_ok(new_places):
+            continue
+
+        try:
+            new_route = await walking_route(
+                new_places,
+                start_point=start_point,
+            )
+        except Exception:
+            continue
+
+        if not route_fits(
+            new_route,
+            duration,
+            len(new_places),
+            relaxed=True,
+        ):
+            continue
+
+        if old_distance:
+            max_reasonable = max(
+                old_distance * 1.35,
+                old_distance + 2000,
+            )
+            if float(new_route.get("distance_m") or 0) > max_reasonable:
+                continue
+
+        return candidate, new_route
+
+    return None, None
+
+
+async def build_replacement_stop(data, index, candidate):
+    city = data.get("city") or {}
+    duration = data.get("duration")
+    interests = data.get("interests") or []
+    style = data.get("style") or "explorer"
+    quest = data.get("quest") or {}
+
+    enriched = await enrich_final_places([candidate])
+    place = enriched[0] if enriched else candidate
+
+    used_titles = {
+        str((stop.get("mission") or {}).get("title") or "").strip()
+        for i, stop in enumerate(quest.get("stops") or [])
+        if i != index
+    }
+    used_titles.discard("")
+
+    fallback = mission_for_place(
+        place,
+        interests,
+        index,
+        set(used_titles),
+    )
+
+    avoid_missions = db_recent_missions_for_city(
+        data.get("_user_id", 0),
+        city_display_ru(city),
+    )
+    avoid_missions.extend(sorted(used_titles))
+
+    try:
+        ai_meta = await groq_meta(
+            city,
+            duration,
+            interests,
+            style,
+            [place],
+            avoid_missions=avoid_missions,
+        )
+    except Exception:
+        logger.exception("Replacement AI mission failed")
+        ai_meta = {}
+
+    candidate_ai = None
+    raw_missions = (
+        ai_meta.get("missions")
+        if isinstance(ai_meta, dict)
+        else None
+    )
+    if isinstance(raw_missions, list) and raw_missions:
+        candidate_ai = raw_missions[0]
+
+    mission = merge_ai_mission(
+        place,
+        fallback,
+        candidate_ai,
+        interests,
+        style,
+    )
+
+    if str(mission.get("title") or "").strip() in used_titles:
+        mission = fallback
+
+    bonus = None
+    if style == "adventure" and is_outdoor_social_place(place):
+        bonus = optional_social_bonus(place)
+
+    return {
+        "place": place,
+        "name_ru": safe_russian_name(place),
+        "why_here": reason_for_place(place, interests),
+        "mission": mission,
+        "bonus": bonus,
+    }
+
+
+def replace_confirmation_keyboard(index):
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text="✅ Да, заменить",
+        callback_data=f"replace_confirm:{index}",
+    )
+    kb.button(
+        text="↩️ Оставить как есть",
+        callback_data=f"quest_stop:{index}",
+    )
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 def checklist_keyboard(quest, completed):
     completed_set = set(completed)
     kb = InlineKeyboardBuilder()
@@ -3356,6 +3743,12 @@ def stop_keyboard(place, index, has_bonus):
         InlineKeyboardButton(text="📷 Добавить фото", callback_data=f"photo_add:{index}"),
         InlineKeyboardButton(text="✅ Выполнено", callback_data=f"mission_toggle:{index}"),
     )
+    kb.row(
+        InlineKeyboardButton(
+            text="🔄 Заменить эту точку",
+            callback_data=f"replace_point:{index}",
+        )
+    )
     if has_bonus:
         kb.row(InlineKeyboardButton(text="🎁 Засчитать бонус +10 XP", callback_data=f"bonus_toggle:{index}"))
     return kb.as_markup()
@@ -3377,6 +3770,12 @@ def mission_nav_keyboard(quest, idx):
     kb.row(
         InlineKeyboardButton(text="🔄 Другое фото", callback_data=f"photo_replace:{idx}"),
         InlineKeyboardButton(text="✅ Чек-лист", callback_data="show_checklist"),
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text="🔄 Заменить эту точку",
+            callback_data=f"replace_point:{idx}",
+        )
     )
 
     try:
@@ -4483,6 +4882,284 @@ def travel_card_actions_keyboard(custom=False, initial=False, editable=True):
     return kb.as_markup()
 
 
+def ru_count_word(value, one, few, many):
+    value = abs(int(value))
+    last_two = value % 100
+    last = value % 10
+
+    if 11 <= last_two <= 14:
+        return many
+    if last == 1:
+        return one
+    if 2 <= last <= 4:
+        return few
+    return many
+
+
+def passport_main_keyboard(city_groups, has_active=False):
+    kb = InlineKeyboardBuilder()
+
+    if has_active:
+        kb.button(
+            text="▶️ Продолжить активный квест",
+            callback_data="resume_quest",
+        )
+
+    for group in city_groups:
+        city = short_text(group["city"], 30)
+        missions = f"{group['completed']}/{group['total']}"
+        kb.button(
+            text=f"🟥 {city} · {missions} · {group['xp']} XP",
+            callback_data=f"passport_city:{group['latest_id']}",
+        )
+
+    kb.button(text="🧭 Новый квест", callback_data="new_quest")
+    kb.button(text="🏠 Главное меню", callback_data="home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def passport_city_keyboard(records):
+    kb = InlineKeyboardBuilder()
+
+    for record in records:
+        completed_count, total_count = completed_record_progress(record)
+        date = format_passport_date(record.get("finished_at"))
+        title = short_text(record.get("title") or "CityQuest", 30)
+        prefix = f"{date} · " if date else ""
+        kb.button(
+            text=f"🏮 {prefix}{title} · {completed_count}/{total_count}",
+            callback_data=f"passport_quest:{int(record['id'])}",
+        )
+
+    kb.button(text="🎒 Все города", callback_data="my_quests")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def passport_quest_keyboard(record_id, city_anchor_id, has_card=False, has_photos=False):
+    kb = InlineKeyboardBuilder()
+
+    if has_card:
+        kb.button(
+            text="🖼 Travel-card",
+            callback_data=f"passport_card:{int(record_id)}",
+        )
+    if has_photos:
+        kb.button(
+            text="📷 Фото-трофеи",
+            callback_data=f"passport_photos:{int(record_id)}",
+        )
+
+    kb.button(
+        text="⬅️ К городской печати",
+        callback_data=f"passport_city:{int(city_anchor_id)}",
+    )
+    kb.button(text="🎒 Все города", callback_data="my_quests")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def render_passport_card(city_groups, total_missions, total_xp):
+    width = 1080
+    height = 760
+
+    bg = (246, 241, 230)
+    paper = (255, 252, 245)
+    ink = (45, 43, 39)
+    muted = (110, 103, 93)
+    red = (159, 48, 39)
+    deep_red = (119, 35, 30)
+    gold = (190, 148, 63)
+    pale = (239, 228, 203)
+    line = (222, 212, 192)
+
+    image = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(image)
+
+    title_font = load_card_font(56, bold=True)
+    sub_font = load_card_font(22, bold=True)
+    stat_font = load_card_font(38, bold=True)
+    stat_label_font = load_card_font(18, bold=True)
+    city_font = load_card_font(24, bold=True)
+    small_font = load_card_font(16, bold=False)
+
+    draw.rounded_rectangle(
+        (38, 32, width - 38, height - 32),
+        radius=34,
+        fill=paper,
+        outline=line,
+        width=2,
+    )
+    draw.rectangle((38, 32, 52, height - 32), fill=red)
+
+    draw.text((78, 65), "CITYQUEST CHINA", font=sub_font, fill=gold)
+    draw.text((78, 105), "МОИ ПРИКЛЮЧЕНИЯ", font=title_font, fill=deep_red)
+    draw.line((78, 178, width - 78, 178), fill=line, width=2)
+
+    stats = [
+        (
+            str(len(city_groups)),
+            ru_count_word(len(city_groups), "ГОРОД", "ГОРОДА", "ГОРОДОВ"),
+        ),
+        (
+            str(total_missions),
+            ru_count_word(total_missions, "МИССИЯ", "МИССИИ", "МИССИЙ"),
+        ),
+        (str(total_xp), "XP"),
+    ]
+
+    stat_w = 280
+    for i, (value, label) in enumerate(stats):
+        x = 78 + i * 310
+        draw.rounded_rectangle(
+            (x, 205, x + stat_w, 292),
+            radius=18,
+            fill=(249, 244, 234),
+            outline=pale,
+            width=2,
+        )
+        draw.text((x + 18, 220), value, font=stat_font, fill=ink)
+        draw.text((x + 18, 265), label, font=stat_label_font, fill=muted)
+
+    draw.text((78, 325), "ГОРОДСКИЕ ПЕЧАТИ", font=sub_font, fill=gold)
+
+    # Up to six seals on the compact passport card. All cities still remain
+    # accessible as Telegram buttons below the image.
+    shown = city_groups[:6]
+    cols = 3
+    seal_w = 286
+    seal_h = 150
+    gap_x = 28
+    gap_y = 24
+    start_y = 370
+
+    for i, group in enumerate(shown):
+        row = i // cols
+        col = i % cols
+        x = 78 + col * (seal_w + gap_x)
+        y = start_y + row * (seal_h + gap_y)
+
+        draw.rounded_rectangle(
+            (x, y, x + seal_w, y + seal_h),
+            radius=14,
+            fill=(252, 245, 231),
+            outline=red,
+            width=4,
+        )
+        draw.rounded_rectangle(
+            (x + 8, y + 8, x + seal_w - 8, y + seal_h - 8),
+            radius=10,
+            outline=gold,
+            width=2,
+        )
+
+        city = clean_card_text(group["city"]).upper()
+        city_lines = wrap_by_pixels(draw, city, city_font, seal_w - 34)[:2]
+        cy = y + 24
+        for line_text in city_lines:
+            draw.text(
+                (x + 18, cy),
+                line_text,
+                font=city_font,
+                fill=deep_red,
+            )
+            cy += 30
+
+        draw.text(
+            (x + 18, y + 100),
+            f"{group['completed']}/{group['total']}  ·  {group['xp']} XP",
+            font=small_font,
+            fill=muted,
+        )
+        draw.text(
+            (x + seal_w - 48, y + 18),
+            "CQ",
+            font=small_font,
+            fill=red,
+        )
+
+    if len(city_groups) > 6:
+        extra = len(city_groups) - 6
+        draw.text(
+            (78, height - 68),
+            f"+ ещё {extra} {ru_count_word(extra, 'город', 'города', 'городов')} — в списке ниже",
+            font=small_font,
+            fill=muted,
+        )
+    else:
+        draw.text(
+            (78, height - 68),
+            "Каждый завершённый город получает свою красную печать.",
+            font=small_font,
+            fill=muted,
+        )
+
+    buffer = io.BytesIO()
+    image.save(
+        buffer,
+        format="JPEG",
+        quality=92,
+        optimize=True,
+        progressive=True,
+    )
+    return buffer.getvalue()
+
+
+async def send_passport_quest_detail(message, user_id, record_id):
+    record = db_completed_record(user_id, record_id)
+    if not record:
+        await message.answer("🤔 Этот завершённый квест не найден.")
+        return
+
+    payload = record.get("payload") or {}
+    quest = payload.get("quest") or {}
+    route = payload.get("route") or {}
+    completed = payload.get("completed") or []
+    photos = payload.get("photos") or {}
+
+    city = str(record.get("city") or "Китай")
+    city_records = db_completed_for_city(user_id, city)
+    city_anchor_id = (
+        int(city_records[0]["id"])
+        if city_records
+        else int(record_id)
+    )
+
+    total = len(quest.get("stops") or [])
+    xp = int(record.get("xp") or 0)
+    distance = fmt_distance(float(route.get("distance_m") or 0))
+    duration = str(payload.get("duration") or "—")
+    date = format_passport_date(record.get("finished_at"))
+    impression = str(payload.get("travel_caption") or "").strip()
+    impression_block = (
+        f"\n\n✍️ <b>Впечатления:</b>\n{esc(short_text(impression, 600))}"
+        if impression
+        else ""
+    )
+
+    await message.answer(
+        f"🟥 <b>ГОРОДСКАЯ ПЕЧАТЬ · {esc(city)}</b>\n\n"
+        f"🏮 <b>{esc(record.get('title') or 'CityQuest')}</b>\n"
+        f"📅 {esc(date or 'Дата не сохранена')}\n"
+        f"✅ Миссии: <b>{len(completed)}/{total}</b>\n"
+        f"⭐ XP: <b>{xp}</b>\n"
+        f"📷 Фото-трофеи: <b>{len(photos)}</b>\n"
+        f"🚶 Маршрут: <b>{esc(distance)}</b>\n"
+        f"⏱ Время: <b>{esc(duration)}</b>"
+        f"{impression_block}",
+        reply_markup=passport_quest_keyboard(
+            record_id,
+            city_anchor_id,
+            has_card=bool(
+                payload.get("travel_card_path")
+                and os.path.exists(payload.get("travel_card_path"))
+            ),
+            has_photos=bool(photos),
+        ),
+    )
+
+
 def route_summary(route, quest, duration):
     walk = route["time_s"] / 60
     missions = sum(int(s["mission"].get("minutes", 12)) for s in quest["stops"])
@@ -5390,6 +6067,202 @@ async def museum_phrase(callback: CallbackQuery):
     )
 
 
+@router.callback_query(F.data.startswith("replace_point:"))
+async def replace_point_request(callback: CallbackQuery, state: FSMContext):
+    data = await restore_active_state(callback.from_user.id, state)
+    quest = data.get("quest")
+
+    if not quest:
+        await callback.answer(
+            "Активный квест не найден.",
+            show_alert=True,
+        )
+        return
+
+    try:
+        idx = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("Миссия не найдена.", show_alert=True)
+        return
+
+    if idx < 0 or idx >= len(quest.get("stops") or []):
+        await callback.answer("Миссия не найдена.", show_alert=True)
+        return
+
+    if idx in set(data.get("completed") or []):
+        await callback.answer(
+            "Эта миссия уже выполнена. Сначала сними отметку в чек-листе, если действительно хочешь заменить точку.",
+            show_alert=True,
+        )
+        return
+
+    stop = quest["stops"][idx]
+    has_photo = bool((data.get("photos") or {}).get(str(idx)))
+
+    photo_warning = (
+        "\n\n📷 Фото-трофей этой миссии тоже будет удалён, "
+        "потому что он относится к старому месту."
+        if has_photo
+        else ""
+    )
+
+    await callback.answer()
+    await callback.message.answer(
+        f"🔄 <b>Заменить точку?</b>\n\n"
+        f"Сейчас: <b>{esc(stop.get('name_ru') or '')}</b>\n\n"
+        "Я поищу другую реальную точку, которая подходит к твоим интересам "
+        "и не ломает пеший маршрут. Если удобной замены не найдётся, "
+        "текущий квест останется без изменений."
+        f"{photo_warning}",
+        reply_markup=replace_confirmation_keyboard(idx),
+    )
+
+
+@router.callback_query(F.data.startswith("replace_confirm:"))
+async def replace_point_confirm(callback: CallbackQuery, state: FSMContext):
+    data = await restore_active_state(callback.from_user.id, state)
+    quest = data.get("quest")
+
+    if not quest:
+        await callback.answer(
+            "Активный квест не найден.",
+            show_alert=True,
+        )
+        return
+
+    try:
+        idx = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("Миссия не найдена.", show_alert=True)
+        return
+
+    if idx < 0 or idx >= len(quest.get("stops") or []):
+        await callback.answer("Миссия не найдена.", show_alert=True)
+        return
+
+    if idx in set(data.get("completed") or []):
+        await callback.answer(
+            "Эта миссия уже отмечена выполненной.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer()
+
+    old_stop = quest["stops"][idx]
+    old_name = str(old_stop.get("name_ru") or "")
+    status = await callback.message.answer(
+        "🔎 <b>Ищу замену…</b>\n\n"
+        "Проверяю реальные места и новый пеший маршрут. "
+        "Случайную далёкую точку подставлять не буду."
+    )
+
+    data_for_build = dict(data)
+    data_for_build["_user_id"] = callback.from_user.id
+
+    try:
+        candidate, new_route = await find_replacement_candidate(
+            data_for_build,
+            idx,
+        )
+    except Exception:
+        logger.exception("Replacement candidate selection failed")
+        candidate, new_route = None, None
+
+    if not candidate or not new_route:
+        await status.edit_text(
+            "🤔 <b>Удобной замены сейчас не нашлось.</b>\n\n"
+            "Я оставила текущую точку как есть, чтобы не ухудшать маршрут. "
+            "Можно попробовать заменить её позже."
+        )
+        return
+
+    try:
+        new_stop = await build_replacement_stop(
+            data_for_build,
+            idx,
+            candidate,
+        )
+    except Exception:
+        logger.exception("Replacement stop construction failed")
+        await status.edit_text(
+            "🤔 Нашла альтернативу на карте, но не получилось безопасно "
+            "собрать для неё миссию. Текущая точка оставлена без изменений."
+        )
+        return
+
+    # Replace only this stop; the rest of the quest stays intact.
+    new_quest = dict(quest)
+    new_stops = list(quest.get("stops") or [])
+    new_stops[idx] = new_stop
+    new_quest["stops"] = new_stops
+
+    photos = dict(data.get("photos") or {})
+    photo_versions = dict(data.get("photo_versions") or {})
+    photos.pop(str(idx), None)
+    photo_versions[str(idx)] = int(
+        photo_versions.get(str(idx), 0)
+    ) + 1
+
+    bonuses = [
+        value
+        for value in (data.get("bonuses") or [])
+        if int(value) != idx
+    ]
+    completed = [
+        value
+        for value in (data.get("completed") or [])
+        if int(value) != idx
+    ]
+
+    history = list(data.get("replacement_history") or [])
+    old_key = place_unique_key(old_stop["place"])
+    if old_key not in history:
+        history.append(old_key)
+    history = history[-30:]
+
+    await state.update_data(
+        quest=new_quest,
+        route=new_route,
+        photos=photos,
+        photo_versions=photo_versions,
+        bonuses=bonuses,
+        completed=completed,
+        replacement_history=history,
+    )
+    await persist_active_state(callback.from_user.id, state)
+
+    new_name = str(new_stop.get("name_ru") or "")
+    await status.edit_text(
+        "✅ <b>Точка заменена.</b>\n\n"
+        f"Было: <s>{esc(old_name)}</s>\n"
+        f"Стало: <b>{esc(new_name)}</b>\n\n"
+        f"🚶 Новый маршрут: ~{fmt_distance(new_route['distance_m'])} · "
+        f"~{fmt_minutes(new_route['time_s']/60)} пешком.\n\n"
+        "Для новой точки создана новая миссия."
+    )
+
+    await send_stop_card(
+        callback.message,
+        new_quest,
+        new_route,
+        idx,
+    )
+
+    await callback.message.answer(
+        checklist_text(
+            new_quest,
+            completed,
+            bonuses,
+            photos,
+        ),
+        reply_markup=checklist_keyboard(
+            new_quest,
+            completed,
+        ),
+    )
+
+
 @router.callback_query(F.data.startswith("mission_toggle:"))
 async def mission_toggle(callback: CallbackQuery, state: FSMContext):
     data = await restore_active_state(callback.from_user.id, state)
@@ -5984,47 +6857,262 @@ async def my_quests(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
     active = db_load_active(callback.from_user.id)
-    history = db_completed_list(callback.from_user.id, limit=5)
+    records = db_completed_all(callback.from_user.id)
+    groups = passport_city_groups(records)
 
-    lines = ["🎒 <b>Мои приключения</b>"]
+    total_missions = sum(group["completed"] for group in groups)
+    total_xp = sum(int(record.get("xp") or 0) for record in records)
 
-    if active and active.get("quest"):
-        lines += [
+    if not records:
+        lines = [
+            "🎒 <b>МОИ ПРИКЛЮЧЕНИЯ</b>",
             "",
-            "▶️ <b>Активный квест</b>",
-            active_quest_summary(active),
+            "Красные городские печати появятся здесь после завершения квестов.",
         ]
-    else:
-        lines += ["", "Сейчас нет незавершённого квеста."]
 
-    if history:
-        lines += ["", "🏆 <b>Завершённые квесты</b>"]
-        for i, item in enumerate(history, 1):
-            city = item.get("city") or "Китай"
-            title = item.get("title") or "CityQuest"
+        if active and active.get("quest"):
             lines += [
                 "",
-                f"<b>{i}. {esc(title)}</b>",
-                f"📍 {esc(city)} · ⭐ {int(item.get('xp') or 0)} XP · 📷 {int(item.get('photos') or 0)}",
+                "▶️ <b>Сейчас в пути</b>",
+                active_quest_summary(active),
             ]
-    else:
-        lines += ["", "Завершённых квестов пока нет."]
+        else:
+            lines += ["", "Завершённых городов пока нет."]
 
-    if not PERSISTENCE_OK:
-        lines += [
-            "",
-            "⚠️ Постоянное хранилище сейчас недоступно; данные будут жить только до перезапуска.",
-        ]
+        await callback.message.answer(
+            "\n".join(lines),
+            reply_markup=passport_main_keyboard(
+                [],
+                has_active=bool(active and active.get("quest")),
+            ),
+        )
+        return
 
-    latest_card = db_latest_card(callback.from_user.id)
+    passport_bytes = render_passport_card(
+        groups,
+        total_missions=total_missions,
+        total_xp=total_xp,
+    )
 
-    await callback.message.answer(
-        "\n".join(lines),
-        reply_markup=adventures_keyboard(
+    city_word = ru_count_word(
+        len(groups),
+        "город исследован",
+        "города исследовано",
+        "городов исследовано",
+    )
+    mission_word = ru_count_word(
+        total_missions,
+        "миссия выполнена",
+        "миссии выполнено",
+        "миссий выполнено",
+    )
+
+    caption = (
+        "🎒 <b>МОИ ПРИКЛЮЧЕНИЯ</b>\n\n"
+        f"<b>{len(groups)}</b> {city_word}\n"
+        f"<b>{total_missions}</b> {mission_word}\n"
+        f"⭐ <b>{total_xp} XP</b>\n\n"
+        "Нажми на городскую печать в списке ниже."
+    )
+
+    if active and active.get("quest"):
+        caption += (
+            "\n\n▶️ <b>Есть незавершённый квест.</b> "
+            "Его можно продолжить отдельной кнопкой."
+        )
+
+    await callback.message.answer_photo(
+        BufferedInputFile(
+            passport_bytes,
+            filename="cityquest_passport.jpg",
+        ),
+        caption=caption,
+        reply_markup=passport_main_keyboard(
+            groups,
             has_active=bool(active and active.get("quest")),
-            has_card=bool(latest_card),
         ),
     )
+
+
+@router.callback_query(F.data.startswith("passport_city:"))
+async def passport_city(callback: CallbackQuery):
+    await callback.answer()
+
+    try:
+        anchor_id = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.message.answer("🤔 Не удалось открыть городскую печать.")
+        return
+
+    anchor = db_completed_record(callback.from_user.id, anchor_id)
+    if not anchor:
+        await callback.message.answer("🤔 Эта городская печать не найдена.")
+        return
+
+    city = str(anchor.get("city") or "Китай")
+    records = db_completed_for_city(callback.from_user.id, city)
+
+    if not records:
+        await callback.message.answer("🤔 Завершённые квесты этого города не найдены.")
+        return
+
+    # One city / one quest: go straight to the useful detail screen.
+    if len(records) == 1:
+        await send_passport_quest_detail(
+            callback.message,
+            callback.from_user.id,
+            int(records[0]["id"]),
+        )
+        return
+
+    completed_total = 0
+    missions_total = 0
+    xp_total = 0
+
+    for record in records:
+        done, total = completed_record_progress(record)
+        completed_total += done
+        missions_total += total
+        xp_total += int(record.get("xp") or 0)
+
+    await callback.message.answer(
+        f"🟥 <b>ГОРОДСКАЯ ПЕЧАТЬ · {esc(city)}</b>\n\n"
+        f"🏮 Завершено квестов: <b>{len(records)}</b>\n"
+        f"✅ Миссии: <b>{completed_total}/{missions_total}</b>\n"
+        f"⭐ XP: <b>{xp_total}</b>\n\n"
+        "Выбери конкретный квест:",
+        reply_markup=passport_city_keyboard(records),
+    )
+
+
+@router.callback_query(F.data.startswith("passport_quest:"))
+async def passport_quest(callback: CallbackQuery):
+    await callback.answer()
+
+    try:
+        record_id = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.message.answer("🤔 Не удалось открыть квест.")
+        return
+
+    await send_passport_quest_detail(
+        callback.message,
+        callback.from_user.id,
+        record_id,
+    )
+
+
+@router.callback_query(F.data.startswith("passport_card:"))
+async def passport_card(callback: CallbackQuery):
+    await callback.answer()
+
+    try:
+        record_id = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.message.answer("🤔 Не удалось открыть travel-card.")
+        return
+
+    record = db_completed_record(callback.from_user.id, record_id)
+    if not record:
+        await callback.message.answer("🤔 Этот квест не найден.")
+        return
+
+    payload = record.get("payload") or {}
+    path = payload.get("travel_card_path")
+
+    if not path or not os.path.exists(path):
+        await callback.message.answer(
+            "🖼 Для этого квеста сохранённая travel-card не найдена."
+        )
+        return
+
+    try:
+        with open(path, "rb") as f:
+            card_bytes = f.read()
+
+        await callback.message.answer_photo(
+            BufferedInputFile(
+                card_bytes,
+                filename="cityquest_travel_card.jpg",
+            ),
+            caption=(
+                f"🖼 <b>{esc(record.get('title') or 'CityQuest')}</b>\n"
+                f"🟥 {esc(record.get('city') or 'Китай')}"
+            ),
+        )
+    except Exception:
+        logger.exception("Failed to open passport travel card")
+        await callback.message.answer(
+            "🤔 Не получилось открыть эту travel-card."
+        )
+
+
+@router.callback_query(F.data.startswith("passport_photos:"))
+async def passport_photos(callback: CallbackQuery):
+    await callback.answer()
+
+    try:
+        record_id = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.message.answer("🤔 Не удалось открыть фото-трофеи.")
+        return
+
+    record = db_completed_record(callback.from_user.id, record_id)
+    if not record:
+        await callback.message.answer("🤔 Этот квест не найден.")
+        return
+
+    payload = record.get("payload") or {}
+    quest = payload.get("quest") or {}
+    photos = payload.get("photos") or {}
+
+    if not photos:
+        await callback.message.answer("📷 В этом квесте фото-трофеев нет.")
+        return
+
+    await callback.message.answer(
+        f"📷 <b>Фото-трофеи · {esc(record.get('city') or 'Китай')}</b>\n"
+        f"Сохранено: <b>{len(photos)}</b>"
+    )
+
+    def photo_sort_key(item):
+        key, _ = item
+        try:
+            return int(key)
+        except Exception:
+            return 999
+
+    for key, file_id in sorted(photos.items(), key=photo_sort_key):
+        try:
+            idx = int(key)
+        except Exception:
+            idx = -1
+
+        stop_name = ""
+        mission_title = ""
+        if 0 <= idx < len(quest.get("stops") or []):
+            stop = quest["stops"][idx]
+            stop_name = str(stop.get("name_ru") or "")
+            mission_title = str((stop.get("mission") or {}).get("title") or "")
+
+        caption_parts = []
+        if stop_name:
+            caption_parts.append(f"📍 <b>{esc(stop_name)}</b>")
+        if mission_title:
+            caption_parts.append(f"🎯 {esc(mission_title)}")
+
+        try:
+            await callback.message.answer_photo(
+                file_id,
+                caption="\n".join(caption_parts) if caption_parts else None,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to send saved trophy photo %s / %s",
+                record_id,
+                key,
+            )
+
 
 
 @router.callback_query(F.data == "card_style_menu")
@@ -6454,7 +7542,9 @@ async def about(callback: CallbackQuery):
         "• Активный квест, прогресс, XP и фото сохраняются между перезапусками BotHost.\n"
         "• После завершения квеста бот собирает travel-открытку из фото-трофеев.\n"
         "• Блок «Впечатления» можно заменить своим текстом и вернуть готовый вариант.\n"
-        "• Для travel-открытки можно сравнить три оформления и сохранить понравившееся."
+        "• Для travel-открытки можно сравнить три оформления и сохранить понравившееся.\n"
+        "• «Мои приключения» работают как паспорт городов с красными печатями, статистикой и архивом квестов.\n"
+        "• Неудачную точку активного квеста можно заменить без пересборки всего путешествия."
     )
 
 
@@ -6467,7 +7557,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Starting CityQuest China v9.1 Travel Card Frame Lab")
+    logger.info("Starting CityQuest China v10 Adventure Passport and Replace Point")
     await dp.start_polling(bot)
 
 
