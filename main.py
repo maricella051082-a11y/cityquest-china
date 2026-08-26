@@ -1855,12 +1855,24 @@ async def fetch_place_details(session, place):
 
 
 async def enrich_final_places(places):
-    timeout = aiohttp.ClientTimeout(total=35)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        enriched = await asyncio.gather(
-            *[fetch_place_details(session, place) for place in places]
-        )
-    return list(enriched)
+    timeout = aiohttp.ClientTimeout(
+        total=10, connect=4, sock_connect=4, sock_read=7
+    )
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            enriched = await asyncio.wait_for(
+                asyncio.gather(*[
+                    fetch_place_details(session, place) for place in places
+                ]),
+                timeout=12,
+            )
+        return list(enriched)
+    except asyncio.TimeoutError:
+        logger.warning("Place Details batch timed out; keeping base POIs")
+        return list(places)
+    except Exception:
+        logger.exception("Place Details batch failed; keeping base POIs")
+        return list(places)
 
 
 async def _fetch_city_variant(session, url, query):
@@ -2085,21 +2097,27 @@ async def geocode_start_candidates(query, city):
             dedup_queries.append(value)
 
     timeout = aiohttp.ClientTimeout(
-        total=15,
-        connect=6,
-        sock_connect=6,
-        sock_read=10,
+        total=10,
+        connect=4,
+        sock_connect=4,
+        sock_read=7,
     )
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            result_sets = await asyncio.gather(
-                *[
-                    _fetch_start_query(session, value, city)
-                    for value in dedup_queries
-                ],
-                return_exceptions=False,
+            result_sets = await asyncio.wait_for(
+                asyncio.gather(
+                    *[
+                        _fetch_start_query(session, value, city)
+                        for value in dedup_queries
+                    ],
+                    return_exceptions=False,
+                ),
+                timeout=11,
             )
+    except asyncio.TimeoutError:
+        logger.warning("Manual start-point lookup timed out: %s", raw)
+        return []
     except Exception:
         logger.exception("Manual start-point lookup session failed")
         return []
@@ -2228,10 +2246,18 @@ async def fetch_places_source(session, city, source_key, categories, limit=20, b
         "apiKey": GEOAPIFY_API_KEY,
     }
 
-    async with session.get(url, params=params) as response:
-        if response.status != 200:
-            return []
-        data = await response.json()
+    try:
+        async with session.get(url, params=params) as response:
+            if response.status != 200:
+                logger.warning("Places %s HTTP %s", source_key, response.status)
+                return []
+            data = await response.json()
+    except asyncio.TimeoutError:
+        logger.warning("Places timed out: %s", source_key)
+        return []
+    except Exception:
+        logger.exception("Places request failed: %s", source_key)
+        return []
 
     output = []
     for feature in data.get("features", []):
@@ -2308,38 +2334,76 @@ def pool_needs_broadening(places):
 
 
 async def search_places(city, interests, duration, start_point=None):
-    """
-    First search exactly what the user asked for.
-    If the map is sparse, broaden discovery with neutral city categories.
-    This never means "the city has nothing"; it only compensates for map coverage.
-    """
+    """Fast, bounded POI discovery with hard network deadlines."""
     primary_sources = [(key, INTERESTS[key]["categories"]) for key in interests]
 
     if duration != "2 часа" and "tea" not in interests and "food" not in interests:
         primary_sources.append(("rest", REST_CATEGORIES))
 
-    timeout = aiohttp.ClientTimeout(total=40)
+    timeout = aiohttp.ClientTimeout(
+        total=12, connect=4, sock_connect=4, sock_read=8
+    )
+    primary_results = []
+    fallback_results = []
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        primary_results = await asyncio.gather(*[
-            fetch_places_source(session, city, key, cats, bias_point=start_point)
-            for key, cats in primary_sources
-        ])
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            try:
+                primary_results = await asyncio.wait_for(
+                    asyncio.gather(*[
+                        fetch_places_source(
+                            session, city, key, cats, bias_point=start_point
+                        )
+                        for key, cats in primary_sources
+                    ]),
+                    timeout=13,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Primary Places search timed out for %s", city_display_ru(city))
+                primary_results = []
 
-        primary_places = merge_place_results(primary_results, primary_sources, max_items=28)
+            primary_places = (
+                merge_place_results(primary_results, primary_sources, max_items=28)
+                if primary_results else []
+            )
+            if primary_places and not pool_needs_broadening(primary_places):
+                return prefer_local_places(primary_places)
 
-        if not pool_needs_broadening(primary_places):
-            return prefer_local_places(primary_places)
+            try:
+                fallback_results = await asyncio.wait_for(
+                    asyncio.gather(*[
+                        fetch_places_source(
+                            session, city, key, cats, limit=16, bias_point=start_point
+                        )
+                        for key, cats in FALLBACK_DISCOVERY_SOURCES
+                    ]),
+                    timeout=13,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Fallback Places search timed out for %s", city_display_ru(city))
+                fallback_results = []
+    except Exception:
+        logger.exception("Places search session failed for %s", city_display_ru(city))
 
-        # Sparse map: search broad, safe categories in the same city.
-        fallback_results = await asyncio.gather(*[
-            fetch_places_source(session, city, key, cats, limit=16, bias_point=start_point)
-            for key, cats in FALLBACK_DISCOVERY_SOURCES
-        ])
+    if not primary_results and not fallback_results:
+        return []
 
     all_sources = primary_sources + FALLBACK_DISCOVERY_SOURCES
-    all_results = primary_results + list(fallback_results)
-    return prefer_local_places(merge_place_results(all_results, all_sources, max_items=32))
+    primary_aligned = (
+        list(primary_results)
+        if primary_results
+        else [[] for _ in primary_sources]
+    )
+    fallback_aligned = (
+        list(fallback_results)
+        if fallback_results
+        else [[] for _ in FALLBACK_DISCOVERY_SOURCES]
+    )
+    all_results = primary_aligned + fallback_aligned
+
+    return prefer_local_places(
+        merge_place_results(all_results, all_sources, max_items=32)
+    )
 
 
 def suggested_mode_from_pool(places):
@@ -2483,7 +2547,7 @@ async def walking_route(stops, start_point=None):
         "apiKey": GEOAPIFY_API_KEY,
     }
 
-    timeout = aiohttp.ClientTimeout(total=40)
+    timeout = aiohttp.ClientTimeout(total=11, connect=4, sock_connect=4, sock_read=8)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(url, params=params) as response:
             body = await response.text()
@@ -2606,6 +2670,10 @@ async def try_route_combinations(
     relaxed,
     start_point=None,
 ):
+    """Check a small set of best routes concurrently, never sequentially for minutes."""
+    route_candidates = []
+    total_limit = 6
+
     for wanted in wanted_counts:
         if len(pool) < wanted:
             continue
@@ -2613,7 +2681,6 @@ async def try_route_combinations(
         scored = []
         for idxs in itertools.combinations(range(len(pool)), wanted):
             combo = [pool[i] for i in idxs]
-
             if not combo_validator(combo):
                 continue
 
@@ -2622,42 +2689,47 @@ async def try_route_combinations(
                 continue
 
             diversity = len(set(place_group(p) for p in combo))
-            repeat_penalty = sum(
-                float(p.get("_repeat_penalty") or 0)
-                for p in combo
-            )
-            # Fresh POIs are strongly preferred. Repeats remain possible only
-            # when they are needed for interests, diversity or route viability.
-            scored.append(
-                (
-                    approx
-                    + repeat_penalty
-                    - diversity * 260,
-                    ordered,
-                )
-            )
+            repeat_penalty = sum(float(p.get("_repeat_penalty") or 0) for p in combo)
+            scored.append((approx + repeat_penalty - diversity * 260, ordered))
 
-        scored.sort(key=lambda x: x[0])
+        scored.sort(key=lambda item: item[0])
+        for score, ordered in scored[:3]:
+            route_candidates.append((wanted, score, ordered))
+            if len(route_candidates) >= total_limit:
+                break
+        if len(route_candidates) >= total_limit:
+            break
 
-        # Keep the number of real Routing API checks bounded.
-        for _, ordered in scored[:10]:
-            try:
-                route = await walking_route(
-                    ordered,
-                    start_point=start_point,
-                )
-            except Exception:
-                continue
+    if not route_candidates:
+        return None
 
-            if route_fits(
-                route,
-                duration,
-                len(ordered),
-                relaxed=relaxed,
-            ):
-                return ordered, route
+    async def check_one(item):
+        wanted, score, ordered = item
+        try:
+            route = await walking_route(ordered, start_point=start_point)
+            if route_fits(route, duration, len(ordered), relaxed=relaxed):
+                return wanted, score, ordered, route
+        except Exception:
+            return None
+        return None
 
-    return None
+    try:
+        checked = await asyncio.wait_for(
+            asyncio.gather(*[check_one(item) for item in route_candidates]),
+            timeout=13,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Route candidate batch timed out")
+        return None
+
+    valid = [item for item in checked if item]
+    if not valid:
+        return None
+
+    priority = {count: i for i, count in enumerate(wanted_counts)}
+    valid.sort(key=lambda item: (priority.get(item[0], 999), item[1]))
+    _, _, ordered, route = valid[0]
+    return ordered, route
 
 
 def location_aware_pool(places, start_point, max_items=20):
@@ -3076,7 +3148,7 @@ async def groq_meta(city, duration, interests, style, places, avoid_missions=Non
         },
     }
 
-    timeout = aiohttp.ClientTimeout(total=75)
+    timeout = aiohttp.ClientTimeout(total=28, connect=5, sock_connect=5, sock_read=24)
     for attempt in range(2):
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -4201,14 +4273,12 @@ async def find_replacement_candidate(data, index):
     old_route = data.get("route") or {}
     old_distance = float(old_route.get("distance_m") or 0)
 
-    # Six real routing checks are enough for a useful replacement and keep
-    # Geoapify consumption bounded.
-    for candidate in pool[:6]:
+    async def check_replacement(candidate):
         new_places = list(current_places)
         new_places[index] = candidate
 
         if not route_order_ok(new_places):
-            continue
+            return None
 
         try:
             new_route = await walking_route(
@@ -4216,7 +4286,7 @@ async def find_replacement_candidate(data, index):
                 start_point=start_point,
             )
         except Exception:
-            continue
+            return None
 
         if not route_fits(
             new_route,
@@ -4224,7 +4294,7 @@ async def find_replacement_candidate(data, index):
             len(new_places),
             relaxed=True,
         ):
-            continue
+            return None
 
         if old_distance:
             max_reasonable = max(
@@ -4232,9 +4302,27 @@ async def find_replacement_candidate(data, index):
                 old_distance + 2000,
             )
             if float(new_route.get("distance_m") or 0) > max_reasonable:
-                continue
+                return None
 
         return candidate, new_route
+
+    # Check the five best alternatives concurrently instead of waiting for
+    # six route calls one by one.
+    try:
+        checked = await asyncio.wait_for(
+            asyncio.gather(*[
+                check_replacement(candidate)
+                for candidate in pool[:5]
+            ]),
+            timeout=13,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Replacement route batch timed out")
+        return None, None
+
+    for result in checked:
+        if result:
+            return result
 
     return None, None
 
@@ -4270,14 +4358,20 @@ async def build_replacement_stop(data, index, candidate):
     avoid_missions.extend(sorted(used_titles))
 
     try:
-        ai_meta = await groq_meta(
-            city,
-            duration,
-            interests,
-            style,
-            [place],
-            avoid_missions=avoid_missions,
+        ai_meta = await asyncio.wait_for(
+            groq_meta(
+                city,
+                duration,
+                interests,
+                style,
+                [place],
+                avoid_missions=avoid_missions,
+            ),
+            timeout=25,
         )
+    except asyncio.TimeoutError:
+        logger.warning("Replacement AI timed out; using safe mission")
+        ai_meta = {}
     except Exception:
         logger.exception("Replacement AI mission failed")
         ai_meta = {}
@@ -6302,14 +6396,23 @@ async def generate_quest_for_start(
         )
 
     try:
-        selected, route, adaptive_mode = await select_route(
-            candidates,
-            interests,
-            duration,
-            start_point=start_point,
+        selected, route, adaptive_mode = await asyncio.wait_for(
+            select_route(
+                candidates,
+                interests,
+                duration,
+                start_point=start_point,
+            ),
+            timeout=30,
         )
+    except asyncio.TimeoutError:
+        logger.warning("Route generation hard timeout for %s", city_display_ru(city))
+        selected = route = adaptive_mode = None
     except Exception:
         logger.exception("Route from selected start")
+        selected = route = adaptive_mode = None
+
+    if not selected or not route:
         await state.set_state(QuestForm.choosing_start)
 
         if start_point:
@@ -6405,14 +6508,24 @@ async def generate_quest_for_start(
         city_display_ru(city),
     )
 
-    ai_meta = await groq_meta(
-        city,
-        duration,
-        interests,
-        style,
-        selected,
-        avoid_missions=avoid_missions,
-    )
+    try:
+        ai_meta = await asyncio.wait_for(
+            groq_meta(
+                city,
+                duration,
+                interests,
+                style,
+                selected,
+                avoid_missions=avoid_missions,
+            ),
+            timeout=35,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Quest AI hard timeout; using safe templates")
+        ai_meta = {}
+    except Exception:
+        logger.exception("Quest AI failed; using safe templates")
+        ai_meta = {}
 
     quest = build_quest(
         city,
@@ -6488,15 +6601,21 @@ async def handle_manual_start_query(message: Message, state: FSMContext, query: 
     )
 
     try:
-        candidates = await geocode_start_candidates(raw, city)
+        candidates = await asyncio.wait_for(
+            geocode_start_candidates(raw, city),
+            timeout=12,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Manual start lookup hard timeout: %s", raw)
+        candidates = []
     except Exception:
         logger.exception("Manual start lookup")
         candidates = []
 
     if not candidates:
         await status.edit_text(
-            f"🤔 <b>Не удалось уверенно найти эту точку в {esc(city_display_ru(city))}.</b>\n\n"
-            "Попробуй:\n"
+            f"🤔 <b>Не удалось получить подтверждённую точку в {esc(city_display_ru(city))}.</b>\n\n"
+            "Geoapify мог не найти место или не ответить вовремя. Попробуй:\n"
             "• полное название отеля/места;\n"
             "• название на английском или китайском;\n"
             "• полный адрес с районом;\n"
@@ -8467,7 +8586,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Starting CityQuest China v10.2 Manual Start Point")
+    logger.info("Starting CityQuest China v10.2.1 Fast Fail-Safe Routing")
     await dp.start_polling(bot)
 
 
