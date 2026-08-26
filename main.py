@@ -938,9 +938,9 @@ FALLBACK_DISCOVERY_SOURCES = [
 ]
 
 ADAPTIVE_MODE_LABELS = {
-    "rich": "🟢 Полный городской квест",
-    "compact": "🟡 Компактный квест",
-    "explorer": "🟠 Исследовательский квест",
+    "rich": "🌆 Городской маршрут",
+    "compact": "🚶 Компактная прогулка",
+    "explorer": "🧭 Прогулка-исследование",
 }
 
 STYLE_LABELS = {
@@ -2493,22 +2493,19 @@ def suggested_mode_from_pool(places):
 def pool_mode_message(mode):
     if mode == "rich":
         return (
-            "На карте достаточно разных точек — попробую собрать полноценный маршрут."
+            "Нашлось достаточно разных мест — соберу насыщенный маршрут без лишних переездов."
         )
     if mode == "compact":
         return (
-            "На карте меньше подробно размеченных мест, чем в крупных туристических центрах. "
-            "Это нормально: если строгий маршрут не соберётся, бот автоматически сделает компактный квест "
-            "из лучших подтверждённых точек."
+            "В этом районе подходящих мест меньше, поэтому прогулка получится компактнее. "
+            "Я выберу самые интересные остановки и добавлю задания по пути."
         )
     if mode == "explorer":
         return (
-            "На карте сейчас очень мало подробно размеченных мест. "
-            "Это не значит, что в городе нечего смотреть: бот включит исследовательский режим "
-            "и использует подтверждённые точки как ориентиры, а часть заданий даст по ходу прогулки."
+            "Здесь мало мест с подробными данными на карте, поэтому часть заданий будет не у отдельных остановок, а прямо по пути."
         )
     return (
-        "На карте пока не удалось найти подходящие подробно размеченные точки."
+        "Пока не удалось найти подходящие места для прогулки."
     )
 
 
@@ -3176,6 +3173,85 @@ def ai_rules_for_place(place, style):
     }
 
 
+def russian_editorial_ok(value, kind="general"):
+    text = str(value or "").strip()
+    if not text or not contains_cyrillic(text):
+        return False
+
+    low = text.casefold()
+    bad_patterns = [
+        r"историческ\w*\s+струн",
+        r"\bструн(?:ы|ам|ами|ах|ки|кам|ками)?\b",
+        r"игра(?:я|ть|ем|й)\s+в\s+загадк",
+        r"\bв\s+(?:2|4|6|8|два|четыре|шесть|восемь)\s+час(?:а|ов)?\b",
+        r"\bобязати\w*\b",
+        r"\bвыбери\s+экспоната\b",
+        r"\bнайди\s+экспоната\b",
+        r"\bзапиши\s+фото\b",
+        r"\bсформулируй\s+вопрос\b",
+        r"\bвопрос\s+сотрудник",
+        r"\bспроси\s+сотрудник",
+        r"\bобратись\s+к\s+сотрудник",
+        r"\bпоинтересуйся\s+у\s+сотрудник",
+        r"\bэкспонат\s*,?\s*о\s+котором\s+ты\s+бы\s+хотел\s+узнать\b.*\bсформулируй",
+        r"\bучитывай\b",
+        r"\bвидимая\s+часть\b",
+        r"\bингредиентн\w*\s+сочетан",
+        r"\bразлож\w*\s+.*\bкадр",
+        r"\bчтобы\s+(?:ai|ии)\s+распозна",
+    ]
+    if any(re.search(p, low) for p in bad_patterns):
+        return False
+
+    if kind in {"title", "intro", "caption"}:
+        # Reject English-style poetic calques that read like machine translation.
+        calques = [
+            r"\bпо\s+струнам\b",
+            r"\bприкоснись\s+к\s+сердцу\s+города\b",
+            r"\bраскрой\s+секреты\s+каждого\s+места\b",
+            r"\bокун(?:ись|уться)\s+в\s+историю\b.*\bвкус",
+        ]
+        if any(re.search(p, low) for p in calques):
+            return False
+
+    return True
+
+
+def natural_quest_title(city, interests=None):
+    interests = set(interests or [])
+    city_name = city_display_ru(city)
+
+    if "food" in interests or "tea" in interests:
+        if "history" in interests or "tradition" in interests:
+            return f"{city_name}: история, вкусы и детали"
+        return f"{city_name}: вкусы и городские находки"
+    if "history" in interests or "tradition" in interests:
+        return f"{city_name}: следы прошлого и городские детали"
+    if "nature" in interests and "photo" in interests:
+        return f"{city_name}: зелёные маршруты и удачные кадры"
+    if "art" in interests or "photo" in interests:
+        return f"{city_name}: город с другого ракурса"
+    if "unusual" in interests:
+        return f"{city_name}: маршрут неожиданных находок"
+    return f"{city_name}: маршрут открытий"
+
+
+def natural_quest_intro(city, stop_count, interests=None):
+    city_name = city_display_ru(city)
+    return (
+        f"В этой прогулке по {city_name} будет {stop_count} "
+        f"{ru_count_word(stop_count, 'остановка', 'остановки', 'остановок')}. "
+        "На каждой — своё небольшое задание, а по дороге можно просто смотреть вокруг и замечать город."
+    )
+
+
+def natural_travel_caption(city):
+    city_name = city_display_ru(city)
+    return (
+        f"{city_name} запомнился деталями, которые легко пропустить на обычной прогулке."
+    )
+
+
 async def groq_meta(city, duration, interests, style, places, avoid_missions=None):
     fallback_missions = safe_fallback_missions(places, interests)
     interest_text = ", ".join(INTERESTS[k]["label"] for k in interests)
@@ -3225,10 +3301,14 @@ async def groq_meta(city, duration, interests, style, places, avoid_missions=Non
 7. Не требуй покупки, заказа, употребления еды/напитка или платной услуги.
 8. Не требуй заходить в закрытые зоны, перелезать ограждения, выходить на дорогу, нарушать правила объекта.
 9. Не требуй фотографировать незнакомых людей. Если взаимодействие разрешено стилем и категорией — оно должно быть коротким, вежливым и необязательным.
-10. Турист не обязан знать китайский. Не вставляй китайские фразы: приложение добавляет проверенные фразы само.
-11. Пиши только по-русски, естественно, конкретно, без Markdown и без рекламных формулировок.
-12. Пиши как хороший русскоязычный travel-гид: живо, понятно и с ощущением маленькой игры. Не превращай миссии в сухие инструкции.
-13. Всегда обращайся к пользователю на «ты»: «найди», «выбери», «сфотографируй». Никогда не пиши «вам», «ваш», «выберите», «снимайте».
+10. Турист не обязан знать китайский. Не вставляй китайские фразы: приложение добавляет проверенные фразы само — с китайским, pinyin, русской транскрипцией и переводом.
+11. Пиши ТОЛЬКО естественным современным русским языком, как носитель языка и редактор, а не как переводчик с английского. Перед ответом мысленно перечитай каждую фразу на грамотность и естественность.
+12. Избегай искусственных метафор и кальки: нельзя «исторические струны», «играть в загадки», «раскрыть секреты каждого места», «прикоснуться к сердцу города». Если упоминаешь длительность, пиши «за 6 часов», а не «в 6 часов».
+13. Пиши как хороший русскоязычный travel-гид: живо, понятно и с ощущением маленькой игры. Не превращай миссии в сухие инструкции.
+14. Всегда обращайся к пользователю на «ты»: «найди», «выбери», «сфотографируй». Никогда не пиши «вам», «ваш», «выберите», «снимайте».
+15. Не предлагай пользователю самому придумывать или формулировать вопрос сотруднику. Не пиши «спроси сотрудника» и не сочиняй китайские фразы: если общение действительно нужно, приложение само добавит проверенную фразу с китайским, pinyin, русской транскрипцией и переводом.
+16. Task — это маленькая игра или наблюдение с понятным результатом. Hint — конкретная помощь. Photo — ясный фото-трофей. Никаких абстрактных «проанализируй», «учитывай», «сформулируй».
+17. В одном квесте чередуй механики: поиск детали, сравнение, догадка, цвет, ракурс, символ, текст, необычная находка. Не делай шесть заданий по схеме «найди объект и сфотографируй».
 14. В task должна быть САМА МИССИЯ — интересное действие или наблюдение. В hint — помощь, как её выполнить. В photo — фото-трофей.
 15. AI не должен быть смыслом миссии. Фраза «сфотографируй и AI поможет...» допустима только как дополнительная помощь в hint, особенно для еды, меню и музея.
 16. Отбрасывай только действительно плохой русский: канцелярит, бессмысленные указания и фотографический жаргон.
@@ -3263,7 +3343,8 @@ async def groq_meta(city, duration, interests, style, places, avoid_missions=Non
             {
                 "role": "system",
                 "content": (
-                    "Только русский JSON по схеме. Реальные POI неизменяемы. "
+                    "Только грамотный естественный русский JSON по схеме. Реальные POI неизменяемы. "
+                    "Пиши как носитель русского языка и редактор, а не как машинный переводчик. "
                     "Персонализируй миссии, но не придумывай факты."
                 ),
             },
@@ -3290,6 +3371,12 @@ async def groq_meta(city, duration, interests, style, places, avoid_missions=Non
                         data = json.loads(body)
                         result = json.loads(data["choices"][0]["message"]["content"])
                         if isinstance(result, dict):
+                            if not russian_editorial_ok(result.get("title"), "title"):
+                                result["title"] = ""
+                            if not russian_editorial_ok(result.get("intro"), "intro"):
+                                result["intro"] = ""
+                            if not russian_editorial_ok(result.get("final_challenge"), "general"):
+                                result["final_challenge"] = ""
                             return result
                     logger.error("Groq quest HTTP %s: %s", response.status, body[:700])
         except Exception:
@@ -3334,51 +3421,28 @@ def phrase_text(phrase):
 
 
 def reason_for_place(place, interests):
-    """Reason is derived from verified place group; AI cannot contradict it."""
+    """Short user-facing reason, derived only from the verified place type."""
     group = place_group(place)
-    matches = set(place.get("interest_matches") or [])
-    chosen = set(interests)
 
     if is_global_chain(place):
-        primary = (
-            "Знакомая сетевая точка как запасная гастрономическая пауза; "
-            "можно сравнить меню с тем, что знакомо дома"
+        return (
+            "Знакомая сетевая точка может пригодиться как короткая пауза, "
+            "если по пути не найдётся более интересного местного варианта."
         )
-    else:
-        primary = {
-        "restaurant": "Познакомиться с кухней города через меню и незнакомые блюда",
-        "cafe": "Сделать гастрономическую паузу и исследовать меню",
-        "tea": "Познакомиться с китайской чайной культурой",
-        "market": "Увидеть город через еду, вывески и повседневную жизнь",
-        "museum": "Добавить в маршрут историю, культуру и реальные экспонаты",
-        "temple": "Увидеть традиционную религиозную архитектуру и символы",
-        "heritage": "Рассмотреть историческую архитектуру и китайские декоративные детали",
-        "park": "Сменить ритм прогулки и увидеть город через природу",
-        "art": "Добавить современное или традиционное искусство",
-        "viewpoint": "Посмотреть на город с выразительного ракурса",
-        "other": "Добавить в маршрут необычную городскую точку",
-        }.get(group, "Добавить в маршрут новый тип впечатления")
 
-    # Add only compatible selected interests.
-    compatible = []
-    if "photo" in chosen and group in {"heritage", "temple", "museum", "park", "art", "viewpoint", "market"}:
-        compatible.append("фото")
-    if "tradition" in chosen and group in {"heritage", "temple", "museum", "park"}:
-        compatible.append("традиции")
-    if "history" in chosen and group in {"heritage", "temple", "museum"}:
-        compatible.append("история")
-    if "food" in chosen and group in {"restaurant", "cafe", "market"}:
-        compatible.append("еда")
-    if "tea" in chosen and group == "tea":
-        compatible.append("чай")
-    if "nature" in chosen and group == "park":
-        compatible.append("природа")
-    if "art" in chosen and group in {"art", "museum"}:
-        compatible.append("искусство")
-
-    if compatible:
-        return f"{primary} · {' + '.join(compatible)}"
-    return primary
+    return {
+        "restaurant": "Здесь можно познакомиться с кухней города через меню и незнакомые блюда.",
+        "cafe": "Хорошее место для короткой гастрономической паузы и изучения меню.",
+        "tea": "Здесь можно присмотреться к китайской чайной культуре.",
+        "market": "Здесь особенно интересно наблюдать за повседневной жизнью, едой и вывесками.",
+        "museum": "Здесь можно узнать больше об истории и культуре через музейную коллекцию.",
+        "temple": "Здесь интересно рассматривать традиционную архитектуру и символы.",
+        "heritage": "Здесь особенно хорошо искать детали старой архитектуры и декора.",
+        "park": "Здесь можно сменить ритм прогулки и посмотреть, как природа вписана в город.",
+        "art": "Здесь стоит искать необычные визуальные детали и искусство.",
+        "viewpoint": "Здесь удобно посмотреть на город с другого ракурса.",
+        "other": "Эта остановка добавляет прогулке новый тип впечатления.",
+    }.get(group, "Здесь можно заметить что-то новое и необычное для этой части города.")
 
 
 def heritage_mission_variants(place):
@@ -3597,6 +3661,18 @@ def ai_mission_is_safe(place, candidate, style):
     if any(re.search(pattern, combined) for pattern in awkward_patterns):
         return False, "awkward_russian"
 
+    if not all(
+        russian_editorial_ok(values[key], "general")
+        for key in ("title", "task", "hint", "photo")
+    ):
+        return False, "russian_editorial_reject"
+
+    if re.search(
+        r"\b(?:спроси|спросить|обратись|обратиться|уточни|уточнить|поинтересуйся)\b.{0,35}\b(?:сотрудник|официант|продавец|кассир|гид)\w*\b",
+        combined,
+    ):
+        return False, "unprepared_staff_question"
+
     formal_plural_patterns = [
         r"\bвам\b",
         r"\bваш(?:а|е|и|его|ему|им)?\b",
@@ -3661,12 +3737,12 @@ def apply_human_mission_copy(place, mission):
         if mechanic == "spicy":
             helper = (
                 "Если хочешь проверить догадку, сфотографируй блюдо или его название. "
-                "AI попробует понять, острое оно или нет. Если по фото неясно, используй готовую китайскую фразу ниже."
+                "AI попробует понять, острое оно или нет. Если этого недостаточно, ниже будет готовая фраза: китайский текст, pinyin, русская транскрипция и перевод."
             )
         elif mechanic == "ingredients":
             helper = (
                 "Если хочешь уточнить состав, сфотографируй блюдо или его название. "
-                "AI попробует определить основные ингредиенты. Если этого недостаточно, используй готовую фразу ниже."
+                "AI попробует определить основные ингредиенты. Если этого недостаточно, ниже будет готовая фраза: китайский текст, pinyin, русская транскрипция и перевод."
             )
         else:
             helper = (
@@ -3681,7 +3757,7 @@ def apply_human_mission_copy(place, mission):
     elif group == "tea":
         helper = (
             "Если название чая непонятно, сфотографируй меню, упаковку или табличку — "
-            "AI поможет перевести. Готовую китайскую фразу можно показать сотруднику на экране."
+            "AI поможет перевести. Если понадобится уточнение, ниже будет готовая фраза с китайским, pinyin, русской транскрипцией и переводом."
         )
         current_tip = str(result.get("tip") or "").strip()
         if helper.casefold() not in current_tip.casefold():
@@ -3747,19 +3823,63 @@ def mission_for_place(place, interests, index, used_titles):
         )
 
     elif group == "tea":
-        mission = {
-            "type": "tea",
-            "title": "Два аромата",
-            "text": (
-                "Если можно, сравни два чая по аромату. Какой кажется более травянистым, цветочным, "
-                "ореховым или просто приятнее? Если понюхать нельзя — сравни два напитка по меню."
-            ),
-            "tip": "Покупать напиток не обязательно. Если нужно — покажи сотруднику готовую китайскую фразу.",
-            "photo": "Сфотографируй меню, название чая, упаковку или чашку.",
-            "xp": 30,
-            "minutes": 15,
-            "phrase": PHRASES["smell"],
-        }
+        variants = [
+            {
+                "type": "compare",
+                "title": "Два аромата",
+                "text": (
+                    "Найди два разных чая и попробуй сравнить их по аромату. Какой кажется более цветочным, "
+                    "травянистым, ореховым или просто приятнее? Если понюхать нельзя — сравни их по названию и описанию в меню."
+                ),
+                "tip": "Покупать напиток не обязательно. Если название непонятно, сфотографируй меню или упаковку — AI поможет перевести.",
+                "photo": "Сфотографируй два названия чая, упаковки или чашки, которые ты сравнивал.",
+                "xp": 30,
+                "minutes": 15,
+                "phrase": PHRASES["smell"],
+            },
+            {
+                "type": "color",
+                "title": "Чай по цвету",
+                "text": (
+                    "Найди два чая или чайных напитка, которые заметно отличаются по цвету или оформлению. "
+                    "Попробуй угадать, какой из них кажется тебе более лёгким, а какой — более насыщенным."
+                ),
+                "tip": "Не нужно ничего заказывать: подойдут меню, витрина, упаковки или уже готовые напитки.",
+                "photo": "Сфотографируй два варианта, которые ты сравнивал.",
+                "xp": 20,
+                "minutes": 10,
+            },
+            {
+                "type": "detail",
+                "title": "Чайная деталь",
+                "text": (
+                    "Найди одну деталь, которая делает это место именно чайным: чашку, чайник, банку с чаем, "
+                    "упаковку, меню или способ подачи. Выбери ту, которую хочется запомнить."
+                ),
+                "tip": "Если не уверен, что написано на упаковке или в меню, сфотографируй текст — AI поможет перевести.",
+                "photo": "Сфотографируй выбранную чайную деталь.",
+                "xp": 20,
+                "minutes": 10,
+            },
+            {
+                "type": "menu",
+                "title": "Незнакомый чай",
+                "text": (
+                    "Найди в меню или на упаковке название чая, которого ты раньше не встречал. "
+                    "Сначала попробуй догадаться по названию или оформлению, чем он может отличаться от знакомых тебе чаёв."
+                ),
+                "tip": "Сфотографируй название — AI поможет перевести и объяснить его. Если понадобится уточнение, ниже появится готовая фраза.",
+                "photo": "Сфотографируй название выбранного чая или его упаковку.",
+                "xp": 25,
+                "minutes": 12,
+                "phrase": PHRASES["recommend"],
+            },
+        ]
+        mission = choose_unused_variant(
+            variants,
+            used_titles,
+            stable_variant_index(place, len(variants), index),
+        )
 
     elif group in {"restaurant", "cafe"}:
         variants = [
@@ -3836,35 +3956,58 @@ def mission_for_place(place, interests, index, used_titles):
         variants = [
             {
                 "type": "market",
-                "title": "Выбери свой трофей рынка",
+                "title": "Трофей рынка",
                 "text": (
-                    "Выбери ОДИН из двух путей:\n"
-                    "🍜 ЕДА — найди незнакомое блюдо, напиток или строку меню;\n"
-                    "🧧 ПРЕДМЕТ — найди необычный товар, декор, барабан, фонарь, вывеску, упаковку или другой интересный объект.\n"
-                    "Тебе не нужно искать еду, если интереснее что-то другое."
+                    "Найди одну вещь, которую ты не ожидал здесь увидеть: блюдо, упаковку, предмет, вывеску, "
+                    "необычный товар или декоративную деталь. Сначала попробуй сам догадаться, что это."
                 ),
-                "tip": (
-                    "После загрузки фото бот сначала даст подходящие варианты анализа: "
-                    "для еды — состав и острота, для предмета — что это, символика и надписи."
+                "tip": "Если после догадки всё ещё непонятно, загрузи фото — бот предложит подходящий разбор для еды, текста, предмета или символа.",
+                "photo": "Сфотографируй свою необычную находку.",
+                "xp": 20,
+                "minutes": 10,
+            },
+            {
+                "type": "compare",
+                "title": "Два похожих — один выбор",
+                "text": (
+                    "Найди два похожих товара, блюда или упаковки и выбери тот вариант, который кажется тебе интереснее. "
+                    "Реши, какая одна деталь повлияла на выбор: цвет, форма, название, рисунок или подача."
                 ),
-                "photo": "Сфотографируй выбранный трофей: еду/меню ИЛИ интересный предмет/декор/вывеску.",
+                "tip": "Покупать ничего не нужно — это только наблюдение и маленький выбор.",
+                "photo": "Сфотографируй два варианта рядом или тот, который выбрал.",
                 "xp": 20,
                 "minutes": 12,
             },
             {
-                "type": "market",
-                "title": "Одна непонятная находка",
+                "type": "text",
+                "title": "Вывеска-загадка",
                 "text": (
-                    "Найди то, что хочется расшифровать: блюдо, предмет, вывеску, символ или необычный декор. "
-                    "Сфотографируй находку и попроси AI помочь разобраться."
+                    "Найди короткую вывеску, ценник или упаковку с китайским текстом. До перевода попробуй угадать по месту и оформлению, "
+                    "о чём там может быть написано."
                 ),
-                "tip": "Не фотографируй людей крупным планом без разрешения.",
-                "photo": "Сними объект или надпись достаточно близко, чтобы детали были видны.",
+                "tip": "После своей версии сфотографируй надпись и нажми «Прочитать / перевести», чтобы проверить догадку.",
+                "photo": "Сфотографируй надпись достаточно близко, чтобы иероглифы были читаемы.",
+                "xp": 25,
+                "minutes": 10,
+            },
+            {
+                "type": "color",
+                "title": "Цвет рынка",
+                "text": (
+                    "Оглянись и выбери цвет, который здесь особенно часто повторяется. Найди его ещё в двух разных деталях — "
+                    "например, в упаковке, вывеске, посуде или декоре."
+                ),
+                "tip": "Не ищи идеальный ответ: важен твой собственный взгляд на место.",
+                "photo": "Сделай кадр, где выбранный цвет встречается хотя бы в двух деталях.",
                 "xp": 20,
                 "minutes": 10,
             },
         ]
-        mission = choose_unused_variant(variants, used_titles, stable_variant_index(place, len(variants), index))
+        mission = choose_unused_variant(
+            variants,
+            used_titles,
+            stable_variant_index(place, len(variants), index),
+        )
 
     elif group == "museum":
         variants = [
@@ -3878,7 +4021,7 @@ def mission_for_place(place, interests, index, used_titles):
                 "tip": (
                     "Если фотографировать можно — сфотографируй экспонат или табличку рядом с ним и спроси AI. "
                     "Если фото запрещены — найди название экспоната или текст на табличке и введи его в бот вручную. "
-                    "AI попробует объяснить, что это. Если названия нет, можно спросить сотрудника готовой фразой."
+                    "AI попробует объяснить, что это. Если названия нет, нажми «🏛 Узнать об экспонате без фото» — там есть готовые вопросы на китайском с pinyin, русской транскрипцией и переводом."
                 ),
                 "photo": "Если съёмка разрешена, сфотографируй экспонат или табличку рядом с ним.",
                 "xp": 30,
@@ -3893,7 +4036,7 @@ def mission_for_place(place, interests, index, used_titles):
                 ),
                 "tip": (
                     "Если хочешь узнать о детали больше, сфотографируй её или табличку, если съёмка разрешена. "
-                    "Если фотографировать нельзя — введи название экспоната или текст с таблички вручную."
+                    "Если фотографировать нельзя — нажми «🏛 Узнать об экспонате без фото» и введи название или текст с таблички."
                 ),
                 "photo": "Если можно фотографировать, сфотографируй выбранную деталь или табличку.",
                 "xp": 20,
@@ -3908,7 +4051,7 @@ def mission_for_place(place, interests, index, used_titles):
                 ),
                 "tip": (
                     "Сравни, для чего использовали старый предмет и чем сегодня пользуются вместо него. "
-                    "Если название непонятно, сфотографируй табличку или введи её текст в бот."
+                    "Если название непонятно, сфотографируй табличку; при запрете съёмки используй кнопку «🏛 Узнать об экспонате без фото»."
                 ),
                 "photo": "Если съёмка разрешена, сфотографируй выбранный предмет или его табличку.",
                 "xp": 20,
@@ -3923,7 +4066,7 @@ def mission_for_place(place, interests, index, used_titles):
                 ),
                 "tip": (
                     "Если хочется узнать, что это за предмет, используй фото или название на табличке. "
-                    "Если фото запрещены, название или текст можно ввести в бот вручную."
+                    "Если фото запрещены, нажми «🏛 Узнать об экспонате без фото» и введи название или текст с таблички."
                 ),
                 "photo": "Если можно, сфотографируй предмет или его название на табличке.",
                 "xp": 20,
@@ -3958,6 +4101,30 @@ def mission_for_place(place, interests, index, used_titles):
                 "photo": "Сфотографируй место так, чтобы дорожка, лестница или другая линия уводила взгляд в глубину кадра.",
                 "xp": 20,
                 "minutes": 12,
+            },
+            {
+                "type": "contrast",
+                "title": "Что здесь выбивается?",
+                "text": (
+                    "Найди одну деталь, которая заметно отличается от всего вокруг: по цвету, форме, материалу или стилю. "
+                    "Реши, почему именно она первой цепляет взгляд."
+                ),
+                "tip": "Это может быть совсем маленькая деталь — главное, чтобы она действительно выделялась для тебя.",
+                "photo": "Сфотографируй деталь так, чтобы было видно её окружение.",
+                "xp": 20,
+                "minutes": 10,
+            },
+            {
+                "type": "photo",
+                "title": "Один шаг меняет всё",
+                "text": (
+                    "Сделай два пробных взгляда на место: с текущей точки и после нескольких шагов в сторону. "
+                    "Выбери, откуда оно выглядит интереснее, и объясни себе одним словом почему."
+                ),
+                "tip": "Не нужно искать идеальную композицию — сравни только два простых варианта.",
+                "photo": "Сфотографируй место с выбранной точки.",
+                "xp": 25,
+                "minutes": 10,
             },
         ]
         mission = choose_unused_variant(variants, used_titles, stable_variant_index(place, len(variants), index))
@@ -4080,26 +4247,24 @@ def adaptive_mode_note(mode, places, interests):
 
     missing = missing_interest_labels(places, interests)
     missing_text = ""
-
     if missing:
         missing_text = (
-            "\n\nНекоторые выбранные темы не получили отдельной точки на карте: "
+            "\n\nНе для каждой выбранной темы нашлась отдельная остановка: "
             + ", ".join(missing)
-            + ". Я не буду отправлять тебя далеко ради формального совпадения — эти темы лучше встроить в задания по пути."
+            + ". Я добавлю эти темы в задания по пути, чтобы не растягивать прогулку."
         )
 
     if mode == "compact":
         return (
-            "🟡 <b>Компактный режим</b>\n"
-            "На карте здесь меньше подробно размеченных POI, поэтому маршрут короче, "
-            "но все точки реальные и проверенные. Между ними будут дополнительные задания наблюдения."
+            "🚶 <b>Компактная прогулка</b>\n"
+            "Подходящих остановок здесь меньше, поэтому маршрут короче. "
+            "Между основными местами будут небольшие задания по дороге."
             + missing_text
         )
 
     return (
-        "🟠 <b>Исследовательский режим</b>\n"
-        "На карте сейчас мало подробно размеченных мест. Это не означает, что в городе нечего смотреть: "
-        "подтверждённые точки станут ориентирами, а часть квеста будет происходить по пути."
+        "🧭 <b>Прогулка-исследование</b>\n"
+        "В этой части города мало мест с подробным описанием на карте, поэтому часть заданий будет происходить прямо по пути."
         + missing_text
     )
 
@@ -4117,7 +4282,7 @@ def repeat_alternate_mission(place, fallback):
             ),
             "tip": (
                 "Покупать ничего не нужно: подойдут меню, упаковки, банки с чаем или уже готовые напитки. "
-                "Если название непонятно, можно показать фото или текст AI."
+                "Если название непонятно, сфотографируй его или введи текст в бот — AI поможет перевести."
             ),
             "photo": "Сфотографируй два варианта чая, меню или упаковки, которые ты сравнивал.",
             "xp": 25,
@@ -4240,17 +4405,19 @@ def build_quest(city, interests, style, places, ai_meta, adaptive_mode="rich"):
         city_display_ru(city),
     )
 
+    ai_title = str(ai_meta.get("title") or "").strip()
+    ai_intro = str(ai_meta.get("intro") or "").strip()
+    ai_final = str(ai_meta.get("final_challenge") or "").strip()
+
     return {
-        "title": str(ai_meta.get("title") or "").strip() or f"CityQuest · {city_display_ru(city)}",
-        "intro": str(ai_meta.get("intro") or "").strip() or (
-            "Реальный городской квест: разные типы мест, фото-трофеи и небольшие задания вместо обычного списка достопримечательностей."
-        ),
+        "title": natural_quest_title(city, interests),
+        "intro": natural_quest_intro(city, len(places), interests),
         "stops": stops,
         "adaptive_mode": adaptive_mode,
         "adaptive_note": adaptive_mode_note(adaptive_mode, places, interests),
         "field_missions": build_field_missions(adaptive_mode, interests, len(places)),
-        "final_challenge": str(ai_meta.get("final_challenge") or "").strip() or (
-            "Выбери лучший кадр прогулки и придумай ему короткое название."
+        "final_challenge": ai_final if russian_editorial_ok(ai_final, "general") else (
+            "Выбери один кадр, который лучше всего напоминает тебе об этой прогулке, и придумай ему короткое название."
         ),
         "ai_missions_accepted": accepted_ai,
     }
@@ -5058,8 +5225,10 @@ async def generate_travel_caption(data):
 Только по-русски. Без Markdown, без кавычек, без хэштегов.
 Не перечисляй статистику: она будет отдельно.
 Тон: тёплый, живой, как личная заметка из путешествия.
+Пиши естественным современным русским языком, без переводных оборотов и искусственных метафор.
+Нельзя: «город разыграл свои стены», «вкусные лапши», «в каждом шаге», «исторические струны», «прикоснуться к сердцу города».
 Не придумывай факты о городе и местах.
-Длина: максимум 110 символов.
+Длина: максимум 150 символов. Лучше одно нормальное законченное предложение, чем красивость ради красивости.
 
 Город: {city_display_ru(city)}
 Название квеста: {quest.get('title') or 'CityQuest'}
@@ -5109,12 +5278,12 @@ async def generate_travel_caption(data):
                 )
                 caption = str(result.get("caption") or "").strip()
                 caption = re.sub(r"[#*_`<>]", "", caption)
-                if caption:
-                    return caption[:140]
+                if caption and russian_editorial_ok(caption, "caption"):
+                    return caption[:180]
     except Exception:
         logger.exception("Travel caption generation failed")
 
-    return "Маленькое путешествие, которое получилось увидеть своими глазами."
+    return natural_travel_caption(city)
 
 
 def load_card_font(size, bold=False):
@@ -5372,6 +5541,28 @@ def draw_travel_card_frame(draw, style, width=1080, height=1350):
         )
 
 
+def fit_card_lines(draw, text, max_width, max_lines, start_size, min_size, bold=False):
+    """Shrink text until it fits; if still too long, end cleanly with an ellipsis."""
+    clean = clean_card_text(text)
+    for size in range(start_size, min_size - 1, -1):
+        font = load_card_font(size, bold=bold)
+        lines = wrap_by_pixels(draw, clean, font, max_width)
+        if len(lines) <= max_lines:
+            return font, lines
+
+    font = load_card_font(min_size, bold=bold)
+    lines = wrap_by_pixels(draw, clean, font, max_width)
+    if len(lines) <= max_lines:
+        return font, lines
+
+    lines = lines[:max_lines]
+    last = lines[-1].rstrip(" .,…")
+    while last and draw.textbbox((0, 0), last + "…", font=font)[2] > max_width:
+        last = last[:-1].rstrip()
+    lines[-1] = (last + "…") if last else "…"
+    return font, lines
+
+
 def render_travel_card(data, photo_images, caption, frame_style="none"):
     width, height = 1080, 1350
 
@@ -5444,11 +5635,14 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
     draw.text((78, 132), city_name, font=city_font, fill=deep_red)
 
     # Quest title.
-    title_lines = wrap_by_pixels(draw, title, title_font, 790)[:2]
+    title_font, title_lines = fit_card_lines(
+        draw, title, 790, max_lines=2, start_size=38, min_size=28, bold=True
+    )
     ty = 230
+    title_step = max(36, int(getattr(title_font, "size", 34) * 1.22))
     for line_text in title_lines:
         draw.text((80, ty), line_text, font=title_font, fill=ink)
-        ty += 47
+        ty += title_step
 
     # Stats as proper cards, no emoji/symbol glyph dependency.
     stats = [
@@ -5546,17 +5740,21 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
         fill=gold,
     )
 
-    cap_lines = wrap_by_pixels(
+    body_font, cap_lines = fit_card_lines(
         draw,
         caption or "Моя прогулка по Китаю.",
-        body_font,
         900,
-    )[:3]
+        max_lines=5,
+        start_size=25,
+        min_size=18,
+        bold=False,
+    )
 
     cy = bottom_top + 60
+    body_step = max(24, int(getattr(body_font, "size", 22) * 1.30))
     for line_text in cap_lines:
         draw.text((78, cy), line_text, font=body_font, fill=ink)
-        cy += 34
+        cy += body_step
 
     # Compact route line(s): user sees actual places included.
     stops = [
@@ -5566,7 +5764,7 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
     ][:4]
 
     if stops:
-        route_y = 1162
+        route_y = max(1162, min(1202, cy + 16))
         draw.text(
             (78, route_y),
             "МАРШРУТ",
@@ -5575,17 +5773,15 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
         )
 
         route_text = "  •  ".join(stops)
-        route_lines = wrap_by_pixels(
-            draw,
-            route_text,
-            route_font,
-            900,
-        )[:2]
+        route_bold_font, route_lines = fit_card_lines(
+            draw, route_text, 900, max_lines=2, start_size=18, min_size=14, bold=True
+        )
 
-        ry = route_y + 34
+        ry = route_y + 32
+        route_step = max(20, int(getattr(route_bold_font, "size", 16) * 1.35))
         for line_text in route_lines:
             draw.text((78, ry), line_text, font=route_bold_font, fill=muted)
-            ry += 27
+            ry += route_step
 
     draw.line((78, 1280, 1000, 1280), fill=line, width=2)
     draw.text(
@@ -5748,7 +5944,7 @@ def passport_main_keyboard(city_groups, has_active=False):
         city = short_text(group["city"], 30)
         missions = f"{group['completed']}/{group['total']}"
         kb.button(
-            text=f"🟥 {city} · {missions} · {group['xp']} XP",
+            text=f"🧧 {city} · {missions} · {group['xp']} XP",
             callback_data=f"passport_city:{group['latest_id']}",
         )
 
@@ -5797,6 +5993,40 @@ def passport_quest_keyboard(record_id, city_anchor_id, has_card=False, has_photo
     kb.button(text="🎒 Все города", callback_data="my_quests")
     kb.adjust(1)
     return kb.as_markup()
+
+
+def draw_city_seal(draw, x, y, size, red, paper):
+    """Small vector Chinese-style stamp: irregular square, gate and route dot."""
+    # Slightly uneven nested outlines imitate a stamped edge without extra assets.
+    offsets = [(0, 2), (2, 0), (1, 1)]
+    for ox, oy in offsets:
+        draw.rounded_rectangle(
+            (x + ox, y + oy, x + size - ox, y + size - oy),
+            radius=7,
+            outline=red,
+            width=3,
+        )
+    # Stylised gate in the negative-space colour.
+    left = x + int(size * 0.25)
+    right = x + int(size * 0.75)
+    top = y + int(size * 0.30)
+    base = y + int(size * 0.72)
+    draw.line((left, base, left, top + 9), fill=red, width=4)
+    draw.line((right, base, right, top + 9), fill=red, width=4)
+    draw.line((left - 6, top + 10, right + 6, top + 10), fill=red, width=4)
+    draw.line((left + 4, top, right - 4, top), fill=red, width=3)
+    # Route curve + destination dot.
+    draw.arc(
+        (x + int(size*0.28), y + int(size*0.48), x + int(size*0.73), y + int(size*0.84)),
+        start=195,
+        end=345,
+        fill=red,
+        width=3,
+    )
+    r = max(3, size // 16)
+    cx = x + int(size * 0.72)
+    cy = y + int(size * 0.68)
+    draw.ellipse((cx-r, cy-r, cx+r, cy+r), fill=red)
 
 
 def render_passport_card(city_groups, total_missions, total_xp):
@@ -5893,12 +6123,14 @@ def render_passport_card(city_groups, total_missions, total_xp):
             width=2,
         )
 
+        draw_city_seal(draw, x + 16, y + 20, 62, red, paper)
+
         city = clean_card_text(group["city"]).upper()
-        city_lines = wrap_by_pixels(draw, city, city_font, seal_w - 34)[:2]
-        cy = y + 24
+        city_lines = wrap_by_pixels(draw, city, city_font, seal_w - 112)[:2]
+        cy = y + 26
         for line_text in city_lines:
             draw.text(
-                (x + 18, cy),
+                (x + 92, cy),
                 line_text,
                 font=city_font,
                 fill=deep_red,
@@ -5906,16 +6138,10 @@ def render_passport_card(city_groups, total_missions, total_xp):
             cy += 30
 
         draw.text(
-            (x + 18, y + 100),
+            (x + 18, y + 104),
             f"{group['completed']}/{group['total']}  ·  {group['xp']} XP",
             font=small_font,
             fill=muted,
-        )
-        draw.text(
-            (x + seal_w - 48, y + 18),
-            "CQ",
-            font=small_font,
-            fill=red,
         )
 
     if len(city_groups) > 6:
@@ -5978,7 +6204,7 @@ async def send_passport_quest_detail(message, user_id, record_id):
     )
 
     await message.answer(
-        f"🟥 <b>ГОРОДСКАЯ ПЕЧАТЬ · {esc(city)}</b>\n\n"
+        f"🧧 <b>ГОРОДСКАЯ ПЕЧАТЬ · {esc(city)}</b>\n\n"
         f"🏮 <b>{esc(record.get('title') or 'CityQuest')}</b>\n"
         f"📅 {esc(date or 'Дата не сохранена')}\n"
         f"✅ Миссии: <b>{len(completed)}/{total}</b>\n"
@@ -6001,11 +6227,7 @@ async def send_passport_quest_detail(message, user_id, record_id):
 
 def route_summary(route, quest, duration):
     walk = route["time_s"] / 60
-    route_heading = (
-        "🗺 <b>Маршрут проверен</b>"
-        if route.get("verified")
-        else "🗺 <b>Маршрут собран · расстояние приблизительное</b>"
-    )
+    route_heading = "🗺 <b>План прогулки</b>"
     missions = sum(int(s["mission"].get("minutes", 12)) for s in quest["stops"])
     total = DURATION_MINUTES[duration]
     pause = max(15, int(total * 0.12))
@@ -6037,10 +6259,10 @@ def route_summary(route, quest, duration):
             )
 
         return (
-            "🗺 <b>Основа квеста проверена</b>\n"
+            "🗺 <b>План прогулки</b>\n"
             f"{start_line}"
             f"{walk_line}"
-            "📍 Подтверждённая точка: 1\n"
+            "📍 Остановок: 1\n"
             f"🎯 Основная миссия: ~{fmt_minutes(missions)}\n"
             "🧭 Остальное время — исследовательские задания вокруг этой точки и по ближайшим улицам."
         )
@@ -6103,7 +6325,7 @@ async def send_quest(message, state):
             await message.answer(
                 f"🧭 <b>По пути · {esc(field['title'])}</b>\n\n"
                 f"{esc(field['text'])}\n\n"
-                "Это дополнительная исследовательская миссия — она не требует отдельной точки на карте."
+                "Это небольшое задание по пути — отдельная остановка для него не нужна."
             )
 
     await state.update_data(completed=[], bonuses=[], photos={}, photo_versions={})
@@ -6428,7 +6650,7 @@ async def interests_continue(callback: CallbackQuery, state: FSMContext):
     await state.set_state(QuestForm.choosing_style)
 
     await safe_status_edit(status, 
-        f"📍 <b>Нашёл {len(places)} кандидата</b>\n\n"
+        f"📍 <b>Нашёл {len(places)} подходящих мест</b>\n\n"
         f"{candidate_summary(places)}\n\n"
         f"{pool_mode_message(pool_mode)}\n\n"
         "Сейчас ничего выбирать не нужно. После выбора стиля бот сам попробует самый качественный режим: "
@@ -6497,7 +6719,7 @@ async def generate_quest_for_start(
             return
 
         await safe_status_edit(status, 
-            f"🔎 <b>Рядом найдено {len(candidates)} подходящих кандидатов.</b>\n\n"
+            f"🔎 <b>Рядом найдено {len(candidates)} интересных мест.</b>\n\n"
             "Теперь проверяю, можно ли соединить лучшие из них удобным пешим маршрутом "
             "прямо от твоей точки старта."
         )
@@ -6527,8 +6749,8 @@ async def generate_quest_for_start(
     if visited_pois and repeat_count:
         await safe_status_edit(status, 
             f"🧭 <b>Учитываю прошлые прогулки по {esc(city_display_ru(city))}.</b>\n\n"
-            f"Новых кандидатов: <b>{fresh_count}</b>.\n"
-            f"Уже встречались в прошлых квестах: <b>{repeat_count}</b>.\n\n"
+            f"Новых мест: <b>{fresh_count}</b>.\n"
+            f"Уже были в твоих прошлых прогулках: <b>{repeat_count}</b>.\n\n"
             "Новые места получают максимальный приоритет. "
             "Старые точки остаются резервом на случай, если без них маршрут или выбранные интересы не складываются."
         )
@@ -6608,43 +6830,31 @@ async def generate_quest_for_start(
     else:
         repeat_note = ""
 
-    route_quality_note = (
-        "\n✅ Пеший маршрут подтверждён Geoapify."
-        if route.get("verified")
-        else "\n⚠️ Geoapify Routing не ответил вовремя: расстояние и время пока приблизительные, по координатам точек."
-    )
-
     access_text = ""
     if route.get("access_leg"):
         access = route["access_leg"]
         access_text = (
-            f"\nДо первой точки: ~{fmt_distance(access['distance_m'])} · "
+            f"\nДо первой остановки: ~{fmt_distance(access['distance_m'])} · "
             f"~{fmt_minutes(access['time_s']/60)}."
         )
 
-    await safe_status_edit(status, 
-        f"🔎 <b>{esc(ADAPTIVE_MODE_LABELS.get(adaptive_mode, 'Квест'))}</b>\n\n"
+    distance_note = (
+        ""
+        if route.get("verified")
+        else "\nРасстояние пока приблизительное — перед выходом лучше открыть первую точку на карте."
+    )
+
+    await safe_status_edit(
+        status,
+        f"🗺 <b>Маршрут собран</b>\n\n"
         f"Старт: <b>{start_description}</b>.\n"
-        f"Подтверждённых точек: <b>{len(selected)}</b>.\n"
-        f"Пешком всего: ~{fmt_distance(route['distance_m'])} · "
-        f"~{fmt_minutes(route['time_s']/60)}."
-        f"{access_text}"
-        f"{route_quality_note}"
-        f"{repeat_note}\n\n"
-        "Уточняю финальные точки и их типы через Place Details…"
+        f"Остановок: <b>{len(selected)}</b>.\n"
+        f"Пешком: ~{fmt_distance(route['distance_m'])} · ~{fmt_minutes(route['time_s']/60)}."
+        f"{access_text}{repeat_note}{distance_note}\n\n"
+        "Готовлю задания для каждой остановки…"
     )
 
     selected = await enrich_final_places(selected)
-
-    await safe_status_edit(status, 
-        f"🤖 <b>Точки проверены.</b>\n\n"
-        f"Старт: <b>{start_description}</b>.\n"
-        f"Пешком ~{fmt_distance(route['distance_m'])} · "
-        f"~{fmt_minutes(route['time_s']/60)}.\n\n"
-        "AI создаёт персональные миссии именно для этих реальных точек. "
-        "Названия, категории и координаты он менять не может; "
-        "сомнительная миссия автоматически заменяется безопасной."
-    )
 
     avoid_missions = db_recent_missions_for_city(
         user_id,
@@ -6688,7 +6898,7 @@ async def generate_quest_for_start(
         start_label=str(start_label or "").strip(),
     )
 
-    await safe_status_edit(status, "✅ <b>Квест готов!</b>")
+    await safe_status_edit(status, "✅ <b>Квест готов — можно начинать!</b>")
     await send_quest(message, state)
 
 
@@ -8142,7 +8352,7 @@ async def passport_city(callback: CallbackQuery):
         xp_total += int(record.get("xp") or 0)
 
     await callback.message.answer(
-        f"🟥 <b>ГОРОДСКАЯ ПЕЧАТЬ · {esc(city)}</b>\n\n"
+        f"🧧 <b>ГОРОДСКАЯ ПЕЧАТЬ · {esc(city)}</b>\n\n"
         f"🏮 Завершено квестов: <b>{len(records)}</b>\n"
         f"✅ Миссии: <b>{completed_total}/{missions_total}</b>\n"
         f"⭐ XP: <b>{xp_total}</b>\n\n"
@@ -8203,7 +8413,7 @@ async def passport_card(callback: CallbackQuery):
             ),
             caption=(
                 f"🖼 <b>{esc(record.get('title') or 'CityQuest')}</b>\n"
-                f"🟥 {esc(record.get('city') or 'Китай')}"
+                f"🧧 {esc(record.get('city') or 'Китай')}"
             ),
         )
     except Exception:
@@ -8725,7 +8935,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Starting CityQuest China v10.2.3 Safe Status Messages")
+    logger.info("Starting CityQuest China v10.3 Russian Editorial Polish")
     await dp.start_polling(bot)
 
 
