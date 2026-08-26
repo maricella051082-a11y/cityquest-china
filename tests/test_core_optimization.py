@@ -177,6 +177,20 @@ class NavigationTests(unittest.TestCase):
         self.assertIn("quest_stop:1", callbacks)
         self.assertIn("home", callbacks)
 
+    def test_stop_card_contains_navigation_without_separate_menu(self):
+        place = {"lat": 31.2, "lon": 121.5}
+        markup = main.stop_keyboard(place, 1, False, 6)
+        callbacks = {
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+            if button.callback_data
+        }
+        self.assertIn("quest_stop:0", callbacks)
+        self.assertIn("quest_stop:2", callbacks)
+        self.assertIn("show_checklist", callbacks)
+        self.assertIn("photo_add:1", callbacks)
+
 
 class ProgressUiTests(unittest.TestCase):
     def test_active_summary_and_checklist_do_not_show_xp(self):
@@ -207,6 +221,45 @@ class ProgressUiTests(unittest.TestCase):
         }]
         group = main.passport_city_groups(records)[0]
         self.assertEqual(group["photos"], 3)
+
+
+class PoiTypeTests(unittest.TestCase):
+    def test_statue_is_not_a_generic_sight(self):
+        place = {
+            "name": "孙中山像",
+            "category_label": main.clean_category_label(
+                ["tourism.sights"],
+                "孙中山像",
+            ),
+        }
+        self.assertEqual(place["category_label"], "🗿 статуя")
+        self.assertEqual(main.place_group(place), "monument")
+        self.assertNotIn("Достопримечательность", main.safe_russian_name(place))
+
+    def test_named_types_override_generic_sight(self):
+        cases = {
+            "Shanghai Museum": "🏛 музей",
+            "Summer Palace": "🏯 дворец",
+            "People's Square": "🏙 площадь",
+            "保卫和平坊": "🏮 мемориальный объект",
+        }
+        for name, expected in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    main.clean_category_label(["tourism.sights"], name),
+                    expected,
+                )
+
+    def test_monument_fallback_mission_is_object_specific(self):
+        mission = main.mission_for_place(
+            {"name": "孙中山像", "category_label": "🗿 статуя"},
+            [],
+            0,
+            set(),
+        )
+        combined = f"{mission['title']} {mission['text']}".lower()
+        self.assertNotIn("крыши", combined)
+        self.assertNotIn("архитектур", combined)
 
 
 class TravelCardFrameTests(unittest.TestCase):

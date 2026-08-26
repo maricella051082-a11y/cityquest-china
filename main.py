@@ -1679,7 +1679,40 @@ def manual_start_candidate_text(candidate, city):
     return "\n".join(lines)
 
 
-def clean_category_label(categories):
+def poi_type_from_name(name):
+    """Infer only an explicit POI type present in its verified map name."""
+    text = str(name or "").strip()
+    low = text.casefold()
+    rules = [
+        (("博物馆", "美术馆", "纪念馆", "museum"), "🏛 музей"),
+        (("宫殿", "故宫", "palace"), "🏯 дворец"),
+        (("雕像", "塑像", "铜像", "statue"), "🗿 статуя"),
+        (("纪念碑", "纪念塔", "monument", "memorial"), "🗿 памятник / мемориал"),
+        (("广场", "square", "plaza"), "🏙 площадь"),
+        (("城门", "大门", "gate"), "🏮 исторические ворота"),
+        (("鼓楼", "钟楼", "tower"), "🏯 башня"),
+        (("宝塔", "佛塔", "pagoda"), "🏯 пагода"),
+        (("寺", "庙", "清真寺", "temple", "mosque"), "🛕 храм / религиозное место"),
+        (("陵", "墓", "mausoleum", "tomb"), "🪦 мавзолей / историческое захоронение"),
+        (("喷泉", "fountain"), "⛲ фонтан"),
+        (("剧院", "theatre", "theater"), "🎭 театр"),
+        (("公园", "park"), "🌿 парк"),
+        (("花园", "garden"), "🌺 сад"),
+    ]
+    for needles, label in rules:
+        if any(needle in text or needle in low for needle in needles):
+            return label
+
+    # A final 像 in a Chinese attraction name normally denotes a statue, while
+    # avoiding false positives from the English word "image".
+    if contains_han(text) and text.endswith("像"):
+        return "🗿 статуя"
+    if contains_han(text) and text.endswith("坊"):
+        return "🏮 мемориальный объект"
+    return ""
+
+
+def clean_category_label(categories, name=None):
     cats = categories or []
 
     def has(prefix):
@@ -1694,12 +1727,21 @@ def clean_category_label(categories):
     if has("entertainment.museum"): return "🏛 музей"
     if has("tourism.sights.place_of_worship"): return "🛕 храм / религиозное место"
     if has("tourism.sights.city_gate"): return "🏮 исторические ворота"
+    if has("tourism.sights.memorial"): return "🗿 памятник / мемориал"
+    if has("tourism.sights.monument"): return "🗿 памятник"
+    if has("tourism.sights.castle"): return "🏯 дворец / крепость"
+    if has("tourism.sights.fort"): return "🏯 крепость"
     if has("tourism.attraction.viewpoint"): return "📸 смотровая точка"
-    if has("tourism.attraction.artwork"): return "🎨 арт-объект"
     if has("leisure.park.garden"): return "🌺 сад"
     if has("leisure.park"): return "🌿 парк"
     if has("natural"): return "🌿 природное место"
     if has("entertainment.culture"): return "🎭 культурное место"
+
+    named_type = poi_type_from_name(name)
+    if named_type:
+        return named_type
+
+    if has("tourism.attraction.artwork"): return "🎨 арт-объект"
     if has("heritage"): return "🏯 историческое место"
     if has("tourism.sights"): return "🏯 достопримечательность"
     if has("tourism.attraction"): return "📍 достопримечательность"
@@ -1715,7 +1757,10 @@ def place_group(place):
     if "парк" in label or "сад" in label or "природ" in label: return "park"
     if "музей" in label: return "museum"
     if "храм" in label or "религиоз" in label: return "temple"
-    if "истор" in label or "ворота" in label or "достопримеч" in label: return "heritage"
+    if any(word in label for word in ("памятник", "мемориал", "статуя")): return "monument"
+    if any(word in label for word in (
+        "истор", "ворота", "достопримеч", "дворец", "башня", "пагода", "мавзолей", "захоронение",
+    )): return "heritage"
     if "арт" in label or "культур" in label: return "art"
     if "смотров" in label: return "viewpoint"
     return "other"
@@ -1762,7 +1807,7 @@ def prefer_local_places(places):
 
 
 def is_outdoor_social_place(place):
-    return place_group(place) in {"park", "market", "heritage", "temple", "viewpoint", "art", "other"}
+    return place_group(place) in {"park", "market", "heritage", "monument", "temple", "viewpoint", "art", "other"}
 
 
 def pinyin_without_tones(text: str) -> str:
@@ -1777,6 +1822,9 @@ def translated_suffix_name(original: str) -> str:
     pinyin = pinyin_without_tones(original)
 
     suffixes = [
+        ("纪念碑", "памятник / мемориал"),
+        ("雕像", "статуя"),
+        ("塑像", "статуя"),
         ("牌楼", "мемориальная арка"),
         ("牌坊", "мемориальная арка"),
         ("鼓楼", "Барабанная башня"),
@@ -1784,6 +1832,7 @@ def translated_suffix_name(original: str) -> str:
         ("博物馆", "музей"),
         ("美术馆", "художественный музей"),
         ("纪念馆", "мемориальный музей"),
+        ("宫殿", "дворец"),
         ("城墙", "городская стена"),
         ("广场", "площадь"),
         ("公园", "парк"),
@@ -1791,6 +1840,9 @@ def translated_suffix_name(original: str) -> str:
         ("寺", "храм"),
         ("庙", "храм"),
         ("塔", "пагода / башня"),
+        ("像", "статуя"),
+        ("宫", "дворец"),
+        ("坊", "мемориальный объект"),
         ("市场", "рынок"),
         ("茶馆", "чайная"),
         ("茶楼", "чайная"),
@@ -1908,13 +1960,13 @@ async def fetch_place_details(session, place):
     props = details_features[0].get("properties") or {}
     enriched = dict(place)
 
+    original_name = str(props.get("name") or place.get("name") or "").strip()
     categories = props.get("categories") or place.get("categories") or []
     if categories:
         enriched["categories"] = categories
-        enriched["category_label"] = clean_category_label(categories)
+        enriched["category_label"] = clean_category_label(categories, original_name)
 
-    original_name = str(props.get("name") or "").strip()
-    if original_name:
+    if props.get("name") and original_name:
         enriched["name"] = original_name
         enriched["pinyin"] = place_pinyin(original_name)
 
@@ -2373,7 +2425,7 @@ async def fetch_places_source(
             "place_id": props.get("place_id") or "",
             "name": name,
             "pinyin": place_pinyin(name),
-            "category_label": clean_category_label(raw_categories),
+            "category_label": clean_category_label(raw_categories, name),
             "categories": raw_categories,
             "lat": float(props["lat"]),
             "lon": float(props["lon"]),
@@ -3237,6 +3289,7 @@ def allowed_mechanics_for_place(place, style):
 
     allowed = {
         "heritage": {"detail", "symbol", "text", "photo", "contrast"},
+        "monument": {"detail", "symbol", "text", "photo", "contrast", "color", "object"},
         "temple": {"detail", "symbol", "text", "photo", "contrast"},
         "park": {"nature", "color", "photo", "contrast", "detail"},
         "tea": {"compare", "menu", "text", "photo", "color", "detail"},
@@ -3265,6 +3318,11 @@ def ai_rules_for_place(place, style):
             "наблюдение за реально видимой деталью, формой, надписью, контрастом или фотокомпозицией. "
             "Не придумывай, где именно находится деталь: никаких «на задней стенке», «слева от входа», "
             "«на крыше» и т.п., если этого нет в verified_description"
+        ),
+        "monument": (
+            "наблюдение за реально видимыми деталями памятника или скульптуры: позой, силуэтом, материалом, "
+            "фактурой, постаментом, символом или надписью. Не придумывай личность, событие, значение символа "
+            "или историю объекта, если этого нет в verified_description; не предлагай искать крышу и архитектурный декор"
         ),
         "temple": (
             "наблюдение за реально видимой деталью, символом, формой, надписью или фотокомпозицией; "
@@ -3669,6 +3727,7 @@ def reason_for_place(place, interests):
         "market": "Здесь особенно интересно наблюдать за повседневной жизнью, едой и вывесками.",
         "museum": "Здесь можно узнать больше об истории и культуре через музейную коллекцию.",
         "temple": "Здесь интересно рассматривать традиционную архитектуру и символы.",
+        "monument": "Здесь можно рассмотреть памятник или скульптуру и заметить, какие детали делают образ выразительным.",
         "heritage": "Здесь особенно хорошо искать детали старой архитектуры и декора.",
         "park": "Здесь можно сменить ритм прогулки и посмотреть, как природа вписана в город.",
         "art": "Здесь стоит искать необычные визуальные детали и искусство.",
@@ -4037,6 +4096,51 @@ def mission_for_place(place, interests, index, used_titles):
 
     if group in {"heritage", "temple"}:
         variants = heritage_mission_variants(place)
+        mission = choose_unused_variant(
+            variants,
+            used_titles,
+            stable_variant_index(place, len(variants), index),
+        )
+
+    elif group == "monument":
+        variants = [
+            {
+                "type": "detail",
+                "title": "Поза и силуэт",
+                "text": (
+                    "Рассмотри памятник с двух разных сторон и найди одну деталь позы или силуэта, "
+                    "которая сильнее всего меняет впечатление от фигуры. Выбери более выразительный ракурс."
+                ),
+                "tip": "Обрати внимание на положение рук, поворот головы, одежду и общую линию фигуры.",
+                "photo": "Сфотографируй памятник с выбранного ракурса.",
+                "xp": 20,
+                "minutes": 10,
+            },
+            {
+                "type": "detail",
+                "title": "Материал и время",
+                "text": (
+                    "Найди на памятнике одну хорошо видимую деталь, по которой можно предположить материал: "
+                    "блеск, шероховатость, шов, изменение цвета или следы времени."
+                ),
+                "tip": "Не нужно угадывать точно — выбери признак, который действительно виден.",
+                "photo": "Сфотографируй выбранную деталь достаточно близко.",
+                "xp": 20,
+                "minutes": 10,
+            },
+            {
+                "type": "text",
+                "title": "Надпись у памятника",
+                "text": (
+                    "Если рядом есть табличка или надпись, найди в ней один повторяющийся или особенно заметный знак. "
+                    "Если надписи нет, выбери самый заметный символ или предмет в композиции."
+                ),
+                "tip": "После своей догадки можно загрузить фото текста и нажать «Что написано?».",
+                "photo": "Сфотографируй надпись, символ или выбранный предмет крупным планом.",
+                "xp": 25,
+                "minutes": 10,
+            },
+        ]
         mission = choose_unused_variant(
             variants,
             used_titles,
@@ -4987,7 +5091,7 @@ def quest_launch_keyboard(quest):
     return kb.as_markup()
 
 
-def stop_keyboard(place, index, has_bonus):
+def stop_keyboard(place, index, has_bonus, total_stops):
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(
         text="📍 Открыть точку на карте",
@@ -4997,6 +5101,13 @@ def stop_keyboard(place, index, has_bonus):
         InlineKeyboardButton(text="📷 Добавить фото", callback_data=f"photo_add:{index}"),
         InlineKeyboardButton(text="✅ Выполнено", callback_data=f"mission_toggle:{index}"),
     )
+    navigation = []
+    if index > 0:
+        navigation.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"quest_stop:{index-1}"))
+    navigation.append(InlineKeyboardButton(text="☑️ Чек-лист", callback_data="show_checklist"))
+    if index + 1 < total_stops:
+        navigation.append(InlineKeyboardButton(text="Далее ➡️", callback_data=f"quest_stop:{index+1}"))
+    kb.row(*navigation)
     kb.row(
         InlineKeyboardButton(
             text="🔄 Заменить эту точку",
@@ -5105,7 +5216,7 @@ async def send_stop_card(message, quest, route, index):
         f"{phrase_text(mission.get('phrase'))}"
         f"{bonus_text}"
         f"{field_text}",
-        reply_markup=stop_keyboard(place, index, bool(stop.get("bonus"))),
+        reply_markup=stop_keyboard(place, index, bool(stop.get("bonus")), len(quest["stops"])),
     )
 
 
@@ -7551,10 +7662,6 @@ async def photo_continue(callback: CallbackQuery, state: FSMContext):
             route,
             next_idx,
         )
-        await callback.message.answer(
-            "🧭 <b>Навигация:</b>",
-            reply_markup=mission_nav_keyboard(quest, next_idx),
-        )
     else:
         await callback.message.answer(
             "🏁 Это последняя точка маршрута.\n"
@@ -8010,12 +8117,9 @@ async def photo_add(callback: CallbackQuery, state: FSMContext):
 
     await state.update_data(photo_target=idx)
     await state.set_state(QuestForm.waiting_photo)
-    await callback.answer()
-
-    await callback.message.answer(
-        f"📷 <b>Фото для {idx+1}. {esc(quest['stops'][idx]['name_ru'])}</b>\n\n"
-        "Отправь фотографию следующим сообщением. После загрузки появятся AI-кнопки для этой точки.\n\n"
-        "Для отмены: /cancelphoto"
+    await callback.answer(
+        "📷 Теперь отправь фотографию в чат. После загрузки появятся кнопки AI-разбора.",
+        show_alert=True,
     )
 
 
@@ -8030,14 +8134,11 @@ async def photo_replace(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Миссия не найдена.", show_alert=True)
         return
 
-    await callback.answer()
     await state.update_data(photo_target=idx)
     await state.set_state(QuestForm.waiting_photo)
-
-    await callback.message.answer(
-        f"🔄 <b>Другое фото для {idx+1}. {esc(quest['stops'][idx]['name_ru'])}</b>\n\n"
-        "Пришли новый снимок. Он заменит предыдущее фото этой миссии, "
-        "и следующие AI-вопросы будут относиться уже к новому снимку."
+    await callback.answer(
+        "🔄 Теперь отправь новый снимок в чат. Он заменит прежний фото-трофей.",
+        show_alert=True,
     )
 
 
@@ -8267,10 +8368,6 @@ async def quest_stop_callback(callback: CallbackQuery, state: FSMContext):
 
     await callback.answer()
     await send_stop_card(callback.message, quest, route, idx)
-    await callback.message.answer(
-        "🧭 <b>Навигация:</b>",
-        reply_markup=mission_nav_keyboard(quest, idx),
-    )
 
 
 @router.callback_query(F.data == "show_checklist")
@@ -8515,10 +8612,6 @@ async def resume_quest(callback: CallbackQuery, state: FSMContext):
             quest,
             route,
             next_index,
-        )
-        await callback.message.answer(
-            "🧭 <b>Навигация:</b>",
-            reply_markup=mission_nav_keyboard(quest, next_index),
         )
 
     await callback.message.answer(
