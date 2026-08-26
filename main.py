@@ -8627,8 +8627,7 @@ async def quest_finish(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         "🏆 <b>CityQuest завершён!</b>\n\n"
         f"✅ Миссии: <b>{len(completed)}/{len(quest['stops'])}</b>\n"
-        f"📷 Фото-трофеи: <b>{len(photos)}</b>\n\n"
-        f"🎁 <b>Финальный штрих:</b> {esc(quest['final_challenge'])}"
+        f"📷 Фото-трофеи: <b>{len(photos)}</b>"
     )
 
     if card_path and os.path.exists(card_path):
