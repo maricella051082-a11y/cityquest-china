@@ -1658,14 +1658,13 @@ def manual_start_choices_keyboard(candidates):
 
 def manual_start_candidate_text(candidate, city):
     name = start_candidate_name(candidate)
-    formatted = str(candidate.get("formatted") or "").strip()
     distance = float(candidate.get("distance_from_city_m") or 0)
-    street_address, area = start_candidate_address(candidate)
+    street_address, _area = start_candidate_address(candidate)
     category = str(candidate.get("category") or "").casefold()
     place_label = "Отель" if "accommodation.hotel" in category or "hotel" in category else "Место"
 
     lines = [
-        "📍 <b>Нашла точку старта</b>",
+        "📍 <b>Точка старта найдена</b>",
         "",
         f"🏨 <b>{place_label}:</b> {esc(name)}" if place_label == "Отель" else f"📌 <b>Место:</b> {esc(name)}",
     ]
@@ -1673,10 +1672,13 @@ def manual_start_candidate_text(candidate, city):
     if street_address and street_address.casefold() != name.casefold():
         lines.append(f"🏠 <b>Адрес:</b> {esc(street_address)}")
 
-    if area:
-        lines.append(f"🏙 <b>Район и город:</b> {esc(area)}")
-    elif formatted and formatted.casefold() != name.casefold():
-        lines.append(f"🏠 <b>Адрес:</b> {esc(formatted)}")
+    locality = city_display_ru(city)
+    state_raw = candidate.get("state") or city.get("state")
+    province = region_ru(state_raw) if state_raw else ""
+    place_parts = [locality]
+    if province and normalize_city_text(province) != normalize_city_text(locality):
+        place_parts.append(province)
+    lines.append(f"📍 <b>Город:</b> {esc(', '.join(place_parts))}")
 
     lines += [
         f"🚶 <b>От центра {esc(city_display_ru(city))}:</b> ~{esc(fmt_distance(distance))}",
@@ -2194,6 +2196,18 @@ def start_candidate_address(candidate):
     if not street_address:
         street_address = address_line1
 
+    # Geoapify sometimes returns the name of an inner corridor/path inside a
+    # large attraction as address_line1. It is not useful as a postal address.
+    if (
+        not house
+        and re.search(
+            r"\b(?:corridor|walkway|footway|passage|path|trail|entrance)\b",
+            street_address,
+            re.IGNORECASE,
+        )
+    ):
+        street_address = ""
+
     area_parts = []
     for key in ("suburb", "district", "city", "state"):
         value = str(candidate.get(key) or "").strip()
@@ -2695,6 +2709,7 @@ def candidate_summary(places):
 
     order = [
         ("heritage", "🏯 история и достопримечательности"),
+        ("monument", "🗿 памятники и мемориалы"),
         ("temple", "🛕 храмы"),
         ("museum", "🏛 музеи"),
         ("park", "🌿 парки и сады"),
@@ -2767,6 +2782,11 @@ def combo_ok(combo, interests):
     if groups.count("park") > 2:
         return False
     if groups.count("heritage") > 2:
+        return False
+    if groups.count("monument") > 2:
+        return False
+    history_cap = 4 if "history" in interests else 3
+    if sum(g in {"heritage", "monument", "temple"} for g in groups) > history_cap:
         return False
     if len(combo) >= 4 and len(set(groups)) < 3:
         return False
@@ -2931,7 +2951,7 @@ def route_fits(route, duration, count, relaxed=False):
     return True
 
 
-def relaxed_combo_ok(combo):
+def relaxed_combo_ok(combo, interests=None):
     """
     Keep hard UX rules (no food crawl), but stop requiring every selected interest
     to have its own POI in a sparse city.
@@ -2944,6 +2964,11 @@ def relaxed_combo_ok(combo):
     if groups.count("restaurant") > 1:
         return False
     if "restaurant" in groups and sum(g in {"tea", "cafe"} for g in groups) > 1:
+        return False
+    if groups.count("monument") > 2:
+        return False
+    history_cap = 4 if "history" in set(interests or []) else 3
+    if sum(g in {"heritage", "monument", "temple"} for g in groups) > history_cap:
         return False
 
     if len(combo) >= 3 and len(set(groups)) < 2:
@@ -3183,7 +3208,7 @@ async def select_route(places, interests, duration, start_point=None):
         pool,
         compact_stop_counts(duration),
         duration,
-        relaxed_combo_ok,
+        lambda combo: relaxed_combo_ok(combo, interests),
         relaxed=True,
         start_point=start_point,
     )
@@ -3280,7 +3305,6 @@ AI_META_SCHEMA = {
     "properties": {
         "title": {"type": "string"},
         "intro": {"type": "string"},
-        "final_challenge": {"type": "string"},
         "missions": {
             "type": "array",
             "items": {
@@ -3298,7 +3322,7 @@ AI_META_SCHEMA = {
             },
         },
     },
-    "required": ["title", "intro", "final_challenge", "missions"],
+    "required": ["title", "intro", "missions"],
     "additionalProperties": False,
 }
 
@@ -3433,6 +3457,13 @@ def russian_editorial_ok(value, kind="general"):
         r"\bразлож\w*\s+.*\bкадр",
         r"\bчтобы\s+(?:ai|ии)\s+распозна",
         r"\bформа\s+в\s+тени\b",
+        r"\bвизуальн\w*\s+напряж",
+        r"\bвизуальн\w*\s+единств",
+        r"\bвизуальн\w*\s+представлен",
+        r"\bгармоничн\w*\s+композиц",
+        r"\bподчеркн\w*\s+(?:динамик|выразительност)",
+        r"\bсфокусируй\s+внимание\b",
+        r"\bзапиши\b",
         r"\bзагадк\w*\s+в\s+меню\b",
         r"\bвыбери\s+угол\s*,?\s*где\b",
         r"\bо\s+котор\w*\s+ничего\s+не\s+знаешь\b",
@@ -3560,6 +3591,10 @@ async def groq_meta(city, duration, interests, style, places, avoid_missions=Non
 23. task: 180–280 символов, одно основное действие, которое можно пересказать одним предложением.
 24. hint: 100–170 символов. Начинай task с конкретного действия: найди, сравни, заметь, выбери, попробуй определить или сфотографируй.
 25. Не используй кальки «форма в тени», «две загадки в меню», «вкусы могут носить», «выбери угол, где разница ощущается». Пиши проще: «силуэт крыши», «два незнакомых блюда», «каким может быть вкус», «найди ракурс».
+26. Не пиши «визуальная напряжённость», «визуальное единство», «гармоничная композиция», «подчеркнуть динамику», «визуальное представление» и «сфокусируй внимание». Используй обычные слова туриста.
+27. Не проси «запиши ответ/догадку»: в миссии нет текстового поля. Можно предложить выбрать свою версию или проверить догадку по меню.
+28. Не предполагай пруд, фонтан, водопад, колонну или конкретный объект без verified_description. Если идея необязательна, пиши условно: «если увидишь воду…».
+29. Десертные задания допустимы в кафе, ресторанах, чайных и точках стритфуда; делай их живыми и конкретными.
 
 МИССИИ ИЗ ПРЕДЫДУЩИХ КВЕСТОВ ЭТОГО ПОЛЬЗОВАТЕЛЯ В ЭТОМ ГОРОДЕ — НЕ ПОВТОРЯЙ ИХ, ЕСЛИ МОЖНО:
 {old_text}
@@ -3570,7 +3605,6 @@ async def groq_meta(city, duration, interests, style, places, avoid_missions=Non
 Верни JSON по схеме:
 - title: атмосферное название всего квеста на русском;
 - intro: 1–2 коротких предложения;
-- final_challenge: короткий финальный фото/рефлексивный челлендж;
 - missions: для каждого poi_index ровно одна миссия: mechanic, title, task, hint, photo.
 """.strip()
 
@@ -3617,8 +3651,6 @@ async def groq_meta(city, duration, interests, style, places, avoid_missions=Non
                                 result["title"] = ""
                             if not russian_editorial_ok(result.get("intro"), "intro"):
                                 result["intro"] = ""
-                            if not russian_editorial_ok(result.get("final_challenge"), "general"):
-                                result["final_challenge"] = ""
                             result["missions"] = await edit_rejected_ai_missions(
                                 result.get("missions"),
                                 places,
@@ -3900,6 +3932,36 @@ def choose_unused_variant(variants, used_titles, preferred_index=0):
     return fallback
 
 
+def mission_copy_similarity(first, second):
+    """Token overlap for preventing near-verbatim missions in one quest."""
+    stop_words = {
+        "и", "в", "на", "с", "по", "или", "для", "что", "это", "тот", "так",
+        "один", "одну", "два", "две", "его", "её", "как", "если", "который",
+        "найди", "выбери", "заметь", "сравни", "сфотографируй",
+    }
+
+    def tokens(value):
+        words = re.findall(r"[а-яёa-z]{3,}", str(value or "").casefold())
+        return {word for word in words if word not in stop_words}
+
+    left = tokens(first)
+    right = tokens(second)
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def mission_repeats_existing(mission, existing_stops, threshold=0.58):
+    candidate = f"{mission.get('title') or ''} {mission.get('text') or ''}"
+    return any(
+        mission_copy_similarity(
+            candidate,
+            f"{stop['mission'].get('title') or ''} {stop['mission'].get('text') or ''}",
+        ) >= threshold
+        for stop in existing_stops
+    )
+
+
 def clean_ai_mission_value(value, max_len):
     value = str(value or "").strip()
     value = re.sub(r"<[^>]+>", "", value)
@@ -4002,6 +4064,15 @@ def ai_mission_is_safe(place, candidate, style):
         r"\bпроанализируй\s+композиц",
         r"\bсравни\s+линии\s*,?\s*масштаб",
         r"\bвизуальн\w*\s+ритм",
+        r"\bвизуальн\w*\s+напряж",
+        r"\bвизуальн\w*\s+единств",
+        r"\bвизуальн\w*\s+представлен",
+        r"\bгармоничн\w*\s+композиц",
+        r"\bподчеркн\w*\s+(?:динамик|выразительност|контраст)",
+        r"\bсфокусируй\s+внимание\b",
+        r"\bоформи\s+(?:снимок|кадр)\b",
+        r"\bзапиши\b",
+        r"\bувидь\b",
         r"\bдоминирующ\w*\s+вкус",
         r"\bвидим\w*\s+част",
         r"чтобы\s+(?:ai|ии)\s+распозна",
@@ -4058,6 +4129,34 @@ def ai_mission_is_safe(place, candidate, style):
         return False, "unclear_photo_instruction"
 
     group = place_group(place)
+
+    verified_context = " ".join([
+        str(place.get("name") or ""),
+        str(place.get("category_label") or ""),
+        str(place.get("description") or place.get("verified_description") or ""),
+        " ".join(str(value) for value in (place.get("categories") or [])),
+    ]).casefold()
+
+    # Keep lively food missions, including desserts, at every food/tea stop.
+    # Reject them only when the POI is not a food venue at all.
+    if re.search(r"\bдесерт\w*\b", combined):
+        dessert_verified = bool(re.search(
+            r"десерт|кондитер|bakery|pastry|dessert|ice_cream|кафе|cafe|coffee",
+            verified_context,
+        ))
+        if not is_food_group(group) and not dessert_verified:
+            return False, "unverified_dessert"
+
+    # A garden does not automatically contain a pond, waterfall or fountain.
+    # Conditional wording remains valid and keeps the mission usable.
+    if re.search(r"\b(?:пруд\w*|водопад\w*|фонтан\w*|водо[её]м\w*|отражени\w*)\b", combined):
+        water_verified = bool(re.search(
+            r"пруд|водопад|фонтан|водо[её]м|озер|река|pond|waterfall|fountain|lake|river",
+            verified_context,
+        ))
+        conditional = bool(re.search(r"\bесли\s+(?:увидишь|есть|рядом|найд[её]шь)", combined))
+        if not water_verified and not conditional:
+            return False, "unverified_water_feature"
 
     if group in {"heritage", "temple", "park", "art", "viewpoint", "other"}:
         if re.search(r"\b(?:ai|ии)\b", values["hint"].casefold()):
@@ -4736,6 +4835,28 @@ def build_quest(city, interests, style, places, ai_meta, adaptive_mode="rich"):
             style,
         )
 
+        if mission_repeats_existing(mission, stops):
+            mission = dict(fallback)
+            mission["source"] = "duplicate_safe_fallback"
+
+        recent_mechanics = [
+            str(stop["mission"].get("mechanic") or stop["mission"].get("type") or "")
+            for stop in stops[-2:]
+        ]
+        current_mechanic = str(mission.get("mechanic") or mission.get("type") or "")
+        if (
+            current_mechanic
+            and len(recent_mechanics) == 2
+            and all(value == current_mechanic for value in recent_mechanics)
+        ):
+            mission = mission_for_place(
+                place,
+                interests,
+                i + 37,
+                local_used_titles,
+            )
+            mission["source"] = "mechanic_variety_fallback"
+
         if (
             previous_titles
             and str(mission.get("title") or "").strip()
@@ -4781,8 +4902,6 @@ def build_quest(city, interests, style, places, ai_meta, adaptive_mode="rich"):
 
     ai_title = str(ai_meta.get("title") or "").strip()
     ai_intro = str(ai_meta.get("intro") or "").strip()
-    ai_final = str(ai_meta.get("final_challenge") or "").strip()
-
     return {
         "title": natural_quest_title(city, interests),
         "intro": natural_quest_intro(city, len(places), interests),
@@ -4790,9 +4909,6 @@ def build_quest(city, interests, style, places, ai_meta, adaptive_mode="rich"):
         "adaptive_mode": adaptive_mode,
         "adaptive_note": adaptive_mode_note(adaptive_mode, places, interests),
         "field_missions": build_field_missions(adaptive_mode, interests, len(places)),
-        "final_challenge": ai_final if russian_editorial_ok(ai_final, "general") else (
-            "Выбери один кадр, который лучше всего напоминает тебе об этой прогулке, и придумай ему короткое название."
-        ),
         "ai_missions_accepted": accepted_ai,
     }
 
@@ -5146,9 +5262,14 @@ def full_quest_text(quest, route, duration):
     sections = [route_summary(route, quest, duration), "", "📋 <b>Все миссии</b>"]
     for index, stop in enumerate(quest.get("stops", []), start=1):
         mission = stop.get("mission") or {}
+        raw_name = str((stop.get("place") or {}).get("name") or "").strip()
         sections.extend([
             "",
             f"📍 <b>{index}. {esc(stop.get('name_ru') or 'Остановка')}</b>",
+        ])
+        if raw_name and contains_han(raw_name):
+            sections.append(f"🏮 {esc(raw_name)}")
+        sections.extend([
             f"🎯 <b>{esc(mission.get('title') or 'Миссия')}</b>",
             esc(mission.get("text") or ""),
         ])
@@ -5912,6 +6033,35 @@ FRAME_ASSETS_DIR = os.path.join(
     "frames",
 )
 
+TRAVEL_CARD_TEXT_LAYOUTS = {
+    "none": {
+        "header_left": 78, "header_right": 1000,
+        "content_left": 78, "content_right": 1000,
+        "bottom_left": 78, "bottom_right": 1000,
+        "kicker_y": 68, "line_y": 102, "city_y": 132,
+    },
+    "chinese_seal": {
+        "header_left": 145, "header_right": 910,
+        "content_left": 120, "content_right": 940,
+        "bottom_left": 125, "bottom_right": 900,
+        "kicker_y": 105, "line_y": 137, "city_y": 158,
+    },
+    "ink_travel": {
+        # The ink mountains occupy most of the upper-left and lower-right
+        # corners. Text uses the genuinely transparent part of this overlay.
+        "header_left": 355, "header_right": 920,
+        "content_left": 185, "content_right": 920,
+        "bottom_left": 130, "bottom_right": 680,
+        "kicker_y": 78, "line_y": 110, "city_y": 132,
+    },
+    "china_journal": {
+        "header_left": 165, "header_right": 910,
+        "content_left": 125, "content_right": 930,
+        "bottom_left": 145, "bottom_right": 875,
+        "kicker_y": 105, "line_y": 137, "city_y": 158,
+    },
+}
+
 
 def normalize_travel_card_style(style):
     value = str(style or "none").strip()
@@ -5982,10 +6132,17 @@ def fit_card_lines(draw, text, max_width, max_lines, start_size, min_size, bold=
 
 def render_travel_card(data, photo_images, caption, frame_style="none"):
     width, height = 1080, 1350
-    framed = normalize_travel_card_style(frame_style) != "none"
-    content_left = 112 if framed else 78
-    content_right = 930 if framed else 1000
+    normalized_style = normalize_travel_card_style(frame_style)
+    framed = normalized_style != "none"
+    layout = TRAVEL_CARD_TEXT_LAYOUTS[normalized_style]
+    header_left = layout["header_left"]
+    header_right = layout["header_right"]
+    content_left = layout["content_left"]
+    content_right = layout["content_right"]
+    bottom_left = layout["bottom_left"]
+    bottom_right = layout["bottom_right"]
     content_width = content_right - content_left
+    bottom_width = bottom_right - bottom_left
 
     bg = (246, 241, 230)
     paper = (255, 252, 245)
@@ -6035,8 +6192,8 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
     draw.rectangle((40, 35, 55, 1315), fill=red)
 
     # Top identity.
-    draw.text((content_left, 68), "CITYQUEST CHINA", font=kicker_font, fill=gold)
-    draw.line((content_left, 102, content_right, 102), fill=line, width=2)
+    draw.text((header_left, layout["kicker_y"]), "CITYQUEST CHINA", font=kicker_font, fill=gold)
+    draw.line((header_left, layout["line_y"], header_right, layout["line_y"]), fill=line, width=2)
 
     # Decorative seal, drawn without unsupported glyphs.
     if not framed:
@@ -6045,16 +6202,25 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
         draw.text((934, 84), "CQ", font=seal_font, fill=(255, 247, 235))
 
     # Large Russian city.
-    draw.text((content_left, 132), city_name, font=city_font, fill=deep_red)
+    city_font, city_lines = fit_card_lines(
+        draw,
+        city_name,
+        header_right - header_left,
+        max_lines=1,
+        start_size=76,
+        min_size=42,
+        bold=True,
+    )
+    draw.text((header_left, layout["city_y"]), city_lines[0], font=city_font, fill=deep_red)
 
     # Quest title.
     title_font, title_lines = fit_card_lines(
-        draw, title, content_width, max_lines=2, start_size=38, min_size=28, bold=True
+        draw, title, header_right - header_left, max_lines=2, start_size=38, min_size=25, bold=True
     )
-    ty = 230
+    ty = max(230, int(layout["city_y"]) + 88)
     title_step = max(36, int(getattr(title_font, "size", 34) * 1.22))
     for line_text in title_lines:
-        draw.text((content_left, ty), line_text, font=title_font, fill=ink)
+        draw.text((header_left, ty), line_text, font=title_font, fill=ink)
         ty += title_step
 
     # Stats as proper cards, no emoji/symbol glyph dependency.
@@ -6116,12 +6282,12 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
             else f"ФОТО-ТРОФЕИ · {photo_count}"
         )
         draw.rounded_rectangle(
-            (78, 424, 78 + 225, 458),
+            (content_left, 424, content_left + 225, 458),
             radius=16,
             fill=red,
         )
         draw.text(
-            (93, 432),
+            (content_left + 15, 432),
             label,
             font=stat_label_font,
             fill=(255, 247, 236),
@@ -6144,10 +6310,10 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
 
     # Bottom: personal caption + route stops.
     bottom_top = 1002
-    draw.line((content_left, bottom_top, content_right, bottom_top), fill=line, width=2)
+    draw.line((bottom_left, bottom_top, bottom_right, bottom_top), fill=line, width=2)
 
     draw.text(
-        (content_left, bottom_top + 25),
+        (bottom_left, bottom_top + 25),
         "ВПЕЧАТЛЕНИЯ",
         font=kicker_font,
         fill=gold,
@@ -6156,7 +6322,7 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
     body_font, cap_lines = fit_card_lines(
         draw,
         caption or "Моя прогулка по Китаю.",
-        content_width,
+        bottom_width,
         max_lines=5,
         start_size=25,
         min_size=18,
@@ -6166,7 +6332,7 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
     cy = bottom_top + 60
     body_step = max(24, int(getattr(body_font, "size", 22) * 1.30))
     for line_text in cap_lines:
-        draw.text((content_left, cy), line_text, font=body_font, fill=ink)
+        draw.text((bottom_left, cy), line_text, font=body_font, fill=ink)
         cy += body_step
 
     # Compact route line(s): user sees actual places included.
@@ -6179,7 +6345,7 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
     if stops:
         route_y = max(1162, min(1202, cy + 16))
         draw.text(
-            (content_left, route_y),
+            (bottom_left, route_y),
             "МАРШРУТ",
             font=kicker_font,
             fill=gold,
@@ -6187,22 +6353,23 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
 
         route_text = "  •  ".join(stops)
         route_bold_font, route_lines = fit_card_lines(
-            draw, route_text, content_width, max_lines=2, start_size=18, min_size=14, bold=True
+            draw, route_text, bottom_width, max_lines=2, start_size=18, min_size=13, bold=True
         )
 
         ry = route_y + 32
         route_step = max(20, int(getattr(route_bold_font, "size", 16) * 1.35))
         for line_text in route_lines:
-            draw.text((content_left, ry), line_text, font=route_bold_font, fill=muted)
+            draw.text((bottom_left, ry), line_text, font=route_bold_font, fill=muted)
             ry += route_step
 
-    draw.line((content_left, 1280, content_right, 1280), fill=line, width=2)
-    draw.text(
-        (content_left, 1292),
-        "CITYQUEST CHINA  ·  PERSONAL TRAVEL CARD",
-        font=footer_font,
-        fill=muted,
-    )
+    if not framed:
+        draw.line((content_left, 1280, content_right, 1280), fill=line, width=2)
+        draw.text(
+            (content_left, 1292),
+            "CITYQUEST CHINA  ·  PERSONAL TRAVEL CARD",
+            font=footer_font,
+            fill=muted,
+        )
 
     result = apply_travel_card_frame(image, frame_style)
     buffer = io.BytesIO()
@@ -6664,8 +6831,7 @@ def route_summary(route, quest, duration):
     route_heading = "🗺 <b>План прогулки</b>"
     missions = sum(int(s["mission"].get("minutes", 12)) for s in quest["stops"])
     total = DURATION_MINUTES[duration]
-    pause = max(15, int(total * 0.12))
-    reserve = max(0, total - walk - missions - pause)
+    free_time = max(0, total - walk - missions)
 
     start_line = ""
     access_leg = route.get("access_leg")
@@ -6706,8 +6872,7 @@ def route_summary(route, quest, duration):
         f"{start_line}"
         f"🚶 Пешком всего: ~{fmt_distance(route['distance_m'])} · ~{fmt_minutes(walk)}\n"
         f"🎯 Миссии: ~{fmt_minutes(missions)}\n"
-        f"☕ Паузы: ~{fmt_minutes(pause)}\n"
-        f"🕒 Запас: ~{fmt_minutes(reserve)}"
+        f"🧭 На осмотр мест, еду и отдых: до ~{fmt_minutes(free_time)}"
     )
 
 

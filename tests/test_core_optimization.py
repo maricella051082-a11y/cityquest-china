@@ -93,12 +93,46 @@ class GeoTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("Отель:</b> The Temple House", text)
         self.assertIn("Адрес:</b> Bitieshi Street 81", text)
-        self.assertIn("Jinjiang District, Chengdu, Sichuan", text)
+        self.assertIn("Город:</b> Chengdu, Сычуань", text)
+        self.assertNotIn("Jinjiang District", text)
         self.assertNotIn("30.65987", text)
         self.assertNotIn("Координаты", text)
 
+    def test_internal_corridor_is_not_shown_as_postal_address(self):
+        candidate = {
+            "name": "Zhu's Family Garden",
+            "address_line1": "Corridor of Little Rainbow",
+            "state": "Yunnan",
+            "distance_from_city_m": 2_000,
+        }
+        text = main.manual_start_candidate_text(
+            candidate,
+            {"city": "Jianshui", "verified_name_ru": "Цзяньшуй", "state": "Yunnan"},
+        )
+        self.assertIn("Точка старта найдена", text)
+        self.assertIn("Цзяньшуй, Юньнань", text)
+        self.assertNotIn("Corridor of Little Rainbow", text)
+
 
 class RouteTests(unittest.IsolatedAsyncioTestCase):
+    def test_route_rejects_four_monuments_even_in_compact_mode(self):
+        monuments = [
+            {"category_label": "🗿 памятник", "interest_matches": []}
+            for _ in range(4)
+        ]
+        self.assertFalse(main.combo_ok(monuments, []))
+        self.assertFalse(main.relaxed_combo_ok(monuments, []))
+
+    def test_route_summary_treats_remaining_time_as_exploration(self):
+        quest = {"stops": [
+            {"mission": {"minutes": 12}},
+            {"mission": {"minutes": 12}},
+        ]}
+        route = {"time_s": 600, "distance_m": 700, "legs": []}
+        text = main.route_summary(route, quest, "6 часов")
+        self.assertIn("На осмотр мест, еду и отдых", text)
+        self.assertNotIn("Запас", text)
+
     async def test_second_ranked_route_can_win(self):
         pool = [
             {"name": "A", "lat": 30.000, "lon": 120.000},
@@ -157,6 +191,19 @@ class CopyTests(unittest.TestCase):
                 "general",
             )
         )
+        self.assertFalse(main.russian_editorial_ok("Подчеркни визуальную напряжённость.", "general"))
+        self.assertFalse(main.russian_editorial_ok("Запиши свою догадку.", "general"))
+
+    def test_near_duplicate_missions_are_detected(self):
+        first = {
+            "title": "Цвет памятника",
+            "text": "Выбери заметный цвет памятника и найди его в разных частях композиции.",
+        }
+        stop = {"mission": {
+            "title": "Цвета памятника",
+            "text": "Найди заметный цвет памятника в разных частях композиции и выбери главный.",
+        }}
+        self.assertTrue(main.mission_repeats_existing(first, [stop]))
 
     def test_descriptive_english_poi_gets_russian_display_name(self):
         place = {"name": "Light show (Dancing fountains)"}
@@ -337,6 +384,12 @@ class TravelCardFrameTests(unittest.TestCase):
                 filename,
             )
             self.assertFalse(filename.endswith(".png.png"))
+
+    def test_each_frame_has_its_own_safe_text_layout(self):
+        layouts = main.TRAVEL_CARD_TEXT_LAYOUTS
+        self.assertLess(layouts["ink_travel"]["bottom_right"], layouts["none"]["bottom_right"])
+        self.assertGreater(layouts["ink_travel"]["header_left"], layouts["none"]["header_left"])
+        self.assertNotEqual(layouts["chinese_seal"], layouts["china_journal"])
 
     def test_none_keeps_pixels_and_png_overlay_keeps_canvas_size(self):
         base = Image.new("RGB", (1080, 1350), (12, 34, 56))
