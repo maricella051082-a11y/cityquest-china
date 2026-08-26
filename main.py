@@ -5126,10 +5126,33 @@ def quest_launch_keyboard(quest):
     kb = InlineKeyboardBuilder()
     if quest.get("stops"):
         kb.button(text="▶️ Начать с первой миссии", callback_data="quest_stop:0")
-    kb.button(text="📋 Посмотреть все миссии", callback_data="show_checklist")
+    kb.button(text="📋 Посмотреть весь квест", callback_data="show_full_quest")
     kb.button(text="🏠 Главное меню", callback_data="home")
     kb.adjust(1)
     return kb.as_markup()
+
+
+def full_quest_keyboard(quest):
+    kb = InlineKeyboardBuilder()
+    if quest.get("stops"):
+        kb.button(text="▶️ Начать с первой миссии", callback_data="quest_stop:0")
+    kb.button(text="☑️ Чек-лист", callback_data="show_checklist")
+    kb.button(text="🏠 Главное меню", callback_data="home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def full_quest_text(quest, route, duration):
+    sections = [route_summary(route, quest, duration), "", "📋 <b>Все миссии</b>"]
+    for index, stop in enumerate(quest.get("stops", []), start=1):
+        mission = stop.get("mission") or {}
+        sections.extend([
+            "",
+            f"📍 <b>{index}. {esc(stop.get('name_ru') or 'Остановка')}</b>",
+            f"🎯 <b>{esc(mission.get('title') or 'Миссия')}</b>",
+            esc(mission.get("text") or ""),
+        ])
+    return "\n".join(sections)
 
 
 def stop_keyboard(place, index, has_bonus, total_stops):
@@ -8438,6 +8461,24 @@ async def show_checklist_callback(callback: CallbackQuery, state: FSMContext):
             data.get("photos", {}),
         ),
         reply_markup=checklist_keyboard(quest, data.get("completed", [])),
+    )
+
+
+@router.callback_query(F.data == "show_full_quest")
+async def show_full_quest_callback(callback: CallbackQuery, state: FSMContext):
+    data = await restore_active_state(callback.from_user.id, state)
+    quest = data.get("quest")
+    route = data.get("route")
+    duration = data.get("duration")
+
+    if not quest or not route or duration not in DURATION_MINUTES:
+        await callback.answer("Активный квест не найден.", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.answer(
+        full_quest_text(quest, route, duration),
+        reply_markup=full_quest_keyboard(quest),
     )
 
 

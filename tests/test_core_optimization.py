@@ -187,7 +187,22 @@ class NavigationTests(unittest.TestCase):
             for row in markup.inline_keyboard
             for button in row
         }
-        self.assertEqual(callbacks, {"quest_stop:0", "show_checklist", "home"})
+        self.assertEqual(callbacks, {"quest_stop:0", "show_full_quest", "home"})
+
+    def test_full_quest_view_contains_route_and_every_mission(self):
+        quest = {
+            "stops": [
+                {"name_ru": "Музей", "mission": {"title": "Экспонат", "text": "Найди интересный предмет."}},
+                {"name_ru": "Парк", "mission": {"title": "Цвет", "text": "Заметь необычный цвет."}},
+            ],
+        }
+        route = {"time_s": 1200, "distance_m": 1500, "legs": []}
+        text = main.full_quest_text(quest, route, "2 часа")
+        self.assertIn("План прогулки", text)
+        self.assertIn("1. Музей", text)
+        self.assertIn("Найди интересный предмет", text)
+        self.assertIn("2. Парк", text)
+        self.assertIn("Заметь необычный цвет", text)
 
     def test_checklist_has_route_back_to_mission_and_home(self):
         quest = {"stops": [{"name_ru": "Первая"}, {"name_ru": "Вторая"}]}
