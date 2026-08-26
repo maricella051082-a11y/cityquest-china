@@ -80,6 +80,37 @@ ACTIVE_DATA_KEYS = (
 )
 
 
+async def soft_deadline(coro, timeout, label="operation"):
+    """
+    Return (ok, result) without waiting for a stuck coroutine to finish
+    cancellation cleanup. This is intentionally different from wait_for().
+    """
+    task = asyncio.create_task(coro)
+    done, pending = await asyncio.wait({task}, timeout=float(timeout))
+
+    if task in done:
+        try:
+            return True, task.result()
+        except asyncio.CancelledError:
+            return False, None
+        except Exception:
+            logger.exception("%s failed", label)
+            return False, None
+
+    logger.warning("%s soft deadline reached after %ss", label, timeout)
+    task.cancel()
+
+    # Do not await cancellation: some network/DNS stacks can stall cleanup.
+    def consume_result(future):
+        try:
+            future.result()
+        except BaseException:
+            pass
+
+    task.add_done_callback(consume_result)
+    return False, None
+
+
 def utc_now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -2103,23 +2134,33 @@ async def geocode_start_candidates(query, city):
         sock_read=7,
     )
 
+    result_sets = []
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            result_sets = await asyncio.wait_for(
-                asyncio.gather(
-                    *[
-                        _fetch_start_query(session, value, city)
-                        for value in dedup_queries
-                    ],
-                    return_exceptions=False,
-                ),
-                timeout=11,
-            )
-    except asyncio.TimeoutError:
-        logger.warning("Manual start-point lookup timed out: %s", raw)
-        return []
+            tasks = [
+                asyncio.create_task(
+                    _fetch_start_query(session, value, city)
+                )
+                for value in dedup_queries
+            ]
+            done, pending = await asyncio.wait(tasks, timeout=7.5)
+
+            for task in done:
+                try:
+                    result_sets.append(task.result())
+                except Exception:
+                    logger.exception("Manual start geocode task failed")
+
+            for task in pending:
+                task.cancel()
+                task.add_done_callback(
+                    lambda future: future.exception()
+                    if not future.cancelled() else None
+                )
     except Exception:
         logger.exception("Manual start-point lookup session failed")
+
+    if not result_sets:
         return []
 
     current_names = {
@@ -2530,6 +2571,68 @@ def combo_ok(combo, interests):
     return set(interests).issubset(covered)
 
 
+def approximate_walking_route(stops, start_point=None):
+    """Fast fallback using straight-line distance + a conservative walk factor."""
+    if not stops:
+        return {
+            "distance_m": 0.0,
+            "time_s": 0.0,
+            "legs": [],
+            "access_leg": None,
+            "verified": False,
+            "route_source": "estimate",
+        }
+
+    points = []
+    if start_point:
+        points.append(start_point)
+    points.extend(stops)
+
+    raw_legs = []
+    total_distance = 0.0
+    # Walking streets are normally longer than straight-line distance.
+    street_factor = 1.22
+    walking_speed_m_s = 1.20
+
+    for a, b in zip(points, points[1:]):
+        distance = haversine(a, b) * street_factor
+        total_distance += distance
+        raw_legs.append({
+            "distance_m": float(distance),
+            "time_s": float(distance / walking_speed_m_s),
+        })
+
+    access_leg = None
+    mission_legs = raw_legs
+    if start_point and raw_legs:
+        access_leg = raw_legs[0]
+        mission_legs = raw_legs[1:]
+
+    return {
+        "distance_m": float(total_distance),
+        "time_s": float(total_distance / walking_speed_m_s),
+        "legs": mission_legs,
+        "access_leg": access_leg,
+        "verified": False,
+        "route_source": "estimate",
+        "start_mode": "location" if start_point else "center",
+    }
+
+
+async def best_effort_walking_route(stops, start_point=None, timeout=7):
+    """Try Geoapify once; fall back immediately to a local estimate."""
+    ok, route = await soft_deadline(
+        walking_route(stops, start_point=start_point),
+        timeout=timeout,
+        label="Geoapify routing",
+    )
+    if ok and route:
+        route["verified"] = True
+        route["route_source"] = "geoapify"
+        return route
+    return approximate_walking_route(stops, start_point=start_point)
+
+
 async def walking_route(stops, start_point=None):
     url = "https://api.geoapify.com/v1/routing"
 
@@ -2580,6 +2683,8 @@ async def walking_route(stops, start_point=None):
         "legs": mission_legs,
         "access_leg": access_leg,
         "start_mode": "location" if start_point else "center",
+        "verified": True,
+        "route_source": "geoapify",
     }
 
 
@@ -2670,15 +2775,20 @@ async def try_route_combinations(
     relaxed,
     start_point=None,
 ):
-    """Check a small set of best routes concurrently, never sequentially for minutes."""
-    route_candidates = []
-    total_limit = 6
+    """
+    Choose the best route locally first. Only one Routing API request is made
+    for the chosen candidate; if it times out, the local estimate is used.
+    """
+    # A smaller pool makes combinatorial scoring deterministic and instant.
+    pool = list(pool)[:14]
 
     for wanted in wanted_counts:
         if len(pool) < wanted:
             continue
 
-        scored = []
+        best = None
+        best_score = float("inf")
+
         for idxs in itertools.combinations(range(len(pool)), wanted):
             combo = [pool[i] for i in idxs]
             if not combo_validator(combo):
@@ -2689,47 +2799,36 @@ async def try_route_combinations(
                 continue
 
             diversity = len(set(place_group(p) for p in combo))
-            repeat_penalty = sum(float(p.get("_repeat_penalty") or 0) for p in combo)
-            scored.append((approx + repeat_penalty - diversity * 260, ordered))
+            repeat_penalty = sum(
+                float(p.get("_repeat_penalty") or 0)
+                for p in combo
+            )
+            score = approx + repeat_penalty - diversity * 260
+            if score < best_score:
+                best_score = score
+                best = ordered
 
-        scored.sort(key=lambda item: item[0])
-        for score, ordered in scored[:3]:
-            route_candidates.append((wanted, score, ordered))
-            if len(route_candidates) >= total_limit:
-                break
-        if len(route_candidates) >= total_limit:
-            break
+        if not best:
+            continue
 
-    if not route_candidates:
-        return None
-
-    async def check_one(item):
-        wanted, score, ordered = item
-        try:
-            route = await walking_route(ordered, start_point=start_point)
-            if route_fits(route, duration, len(ordered), relaxed=relaxed):
-                return wanted, score, ordered, route
-        except Exception:
-            return None
-        return None
-
-    try:
-        checked = await asyncio.wait_for(
-            asyncio.gather(*[check_one(item) for item in route_candidates]),
-            timeout=13,
+        route = await best_effort_walking_route(
+            best,
+            start_point=start_point,
+            timeout=7,
         )
-    except asyncio.TimeoutError:
-        logger.warning("Route candidate batch timed out")
-        return None
 
-    valid = [item for item in checked if item]
-    if not valid:
-        return None
+        # If verified routing says the route is poor, try the next stop count.
+        # For an estimate, use relaxed fit so a network outage does not kill the quest.
+        fit_relaxed = relaxed or not route.get("verified", False)
+        if route_fits(
+            route,
+            duration,
+            len(best),
+            relaxed=fit_relaxed,
+        ):
+            return best, route
 
-    priority = {count: i for i, count in enumerate(wanted_counts)}
-    valid.sort(key=lambda item: (priority.get(item[0], 999), item[1]))
-    _, _, ordered, route = valid[0]
-    return ordered, route
+    return None
 
 
 def location_aware_pool(places, start_point, max_items=20):
@@ -2856,9 +2955,10 @@ async def select_route(places, interests, duration, start_point=None):
 
         if best_pair:
             try:
-                route = await walking_route(
+                route = await best_effort_walking_route(
                     best_pair,
                     start_point=start_point,
+                    timeout=6,
                 )
                 if route_fits(
                     route,
@@ -2879,9 +2979,10 @@ async def select_route(places, interests, duration, start_point=None):
 
         if start_point:
             try:
-                route = await walking_route(
+                route = await best_effort_walking_route(
                     [single],
                     start_point=start_point,
+                    timeout=6,
                 )
                 if route_fits(
                     route,
@@ -4281,9 +4382,10 @@ async def find_replacement_candidate(data, index):
             return None
 
         try:
-            new_route = await walking_route(
+            new_route = await best_effort_walking_route(
                 new_places,
                 start_point=start_point,
+                timeout=6,
             )
         except Exception:
             return None
@@ -5868,6 +5970,11 @@ async def send_passport_quest_detail(message, user_id, record_id):
 
 def route_summary(route, quest, duration):
     walk = route["time_s"] / 60
+    route_heading = (
+        "🗺 <b>Маршрут проверен</b>"
+        if route.get("verified")
+        else "🗺 <b>Маршрут собран · расстояние приблизительное</b>"
+    )
     missions = sum(int(s["mission"].get("minutes", 12)) for s in quest["stops"])
     total = DURATION_MINUTES[duration]
     pause = max(15, int(total * 0.12))
@@ -5908,7 +6015,7 @@ def route_summary(route, quest, duration):
         )
 
     return (
-        "🗺 <b>Маршрут проверен</b>\n"
+        f"{route_heading}\n"
         f"{start_line}"
         f"🚶 Пешком всего: ~{fmt_distance(route['distance_m'])} · ~{fmt_minutes(walk)}\n"
         f"🎯 Миссии: ~{fmt_minutes(missions)}\n"
@@ -6395,21 +6502,19 @@ async def generate_quest_for_start(
             "Старые точки остаются резервом на случай, если без них маршрут или выбранные интересы не складываются."
         )
 
-    try:
-        selected, route, adaptive_mode = await asyncio.wait_for(
-            select_route(
-                candidates,
-                interests,
-                duration,
-                start_point=start_point,
-            ),
-            timeout=30,
-        )
-    except asyncio.TimeoutError:
-        logger.warning("Route generation hard timeout for %s", city_display_ru(city))
-        selected = route = adaptive_mode = None
-    except Exception:
-        logger.exception("Route from selected start")
+    ok, route_result = await soft_deadline(
+        select_route(
+            candidates,
+            interests,
+            duration,
+            start_point=start_point,
+        ),
+        timeout=18,
+        label=f"route generation: {city_display_ru(city)}",
+    )
+    if ok and route_result:
+        selected, route, adaptive_mode = route_result
+    else:
         selected = route = adaptive_mode = None
 
     if not selected or not route:
@@ -6472,6 +6577,12 @@ async def generate_quest_for_start(
     else:
         repeat_note = ""
 
+    route_quality_note = (
+        "\n✅ Пеший маршрут подтверждён Geoapify."
+        if route.get("verified")
+        else "\n⚠️ Geoapify Routing не ответил вовремя: расстояние и время пока приблизительные, по координатам точек."
+    )
+
     access_text = ""
     if route.get("access_leg"):
         access = route["access_leg"]
@@ -6487,6 +6598,7 @@ async def generate_quest_for_start(
         f"Пешком всего: ~{fmt_distance(route['distance_m'])} · "
         f"~{fmt_minutes(route['time_s']/60)}."
         f"{access_text}"
+        f"{route_quality_note}"
         f"{repeat_note}\n\n"
         "Уточняю финальные точки и их типы через Place Details…"
     )
@@ -6600,16 +6712,12 @@ async def handle_manual_start_query(message: Message, state: FSMContext, query: 
         reply_markup=ReplyKeyboardRemove(),
     )
 
-    try:
-        candidates = await asyncio.wait_for(
-            geocode_start_candidates(raw, city),
-            timeout=12,
-        )
-    except asyncio.TimeoutError:
-        logger.warning("Manual start lookup hard timeout: %s", raw)
-        candidates = []
-    except Exception:
-        logger.exception("Manual start lookup")
+    ok, candidates = await soft_deadline(
+        geocode_start_candidates(raw, city),
+        timeout=9,
+        label=f"manual start lookup: {raw}",
+    )
+    if not ok or not candidates:
         candidates = []
 
     if not candidates:
@@ -8586,7 +8694,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Starting CityQuest China v10.2.1 Fast Fail-Safe Routing")
+    logger.info("Starting CityQuest China v10.2.2 No-Hang Route Fallback")
     await dp.start_polling(bot)
 
 
