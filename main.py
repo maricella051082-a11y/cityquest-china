@@ -407,6 +407,241 @@ def format_passport_date(value):
         return raw[:10]
 
 
+def poi_history_name(value):
+    value = str(value or "").casefold().strip()
+    value = value.replace("’", "'").replace("`", "'")
+    return re.sub(r"[\s'’`\-_,.·•()（）]+", "", value)
+
+
+def city_history_names(city):
+    values = [
+        city_display_ru(city),
+        city.get("city"),
+        city.get("name"),
+        city.get("input_name"),
+    ]
+    return {
+        normalize_city_text(value)
+        for value in values
+        if str(value or "").strip()
+    }
+
+
+def same_city_for_history(saved_city, current_city, saved_label=""):
+    saved_city = saved_city or {}
+    current_city = current_city or {}
+
+    saved_place_id = str(saved_city.get("place_id") or "").strip()
+    current_place_id = str(current_city.get("place_id") or "").strip()
+    if saved_place_id and current_place_id and saved_place_id == current_place_id:
+        return True
+
+    current_names = city_history_names(current_city)
+    saved_names = city_history_names(saved_city)
+
+    if saved_label:
+        saved_names.add(normalize_city_text(saved_label))
+
+    return bool(current_names.intersection(saved_names))
+
+
+def db_visited_pois_for_city(user_id: int, city: dict, limit_quests: int = 40):
+    """
+    Return real POIs used in earlier completed quests in the same city.
+    Newest visits come first. Mission titles are kept too, so an unavoidable
+    repeated POI can receive a genuinely different task.
+    """
+    if not PERSISTENCE_OK:
+        return []
+
+    try:
+        with db_connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, city, data_json
+                FROM completed_quests
+                WHERE user_id=?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (int(user_id), int(limit_quests)),
+            ).fetchall()
+
+        by_key = {}
+        order = []
+        visit_rank = 0
+
+        for row in rows:
+            try:
+                payload = json.loads(row["data_json"])
+            except Exception:
+                continue
+
+            if not same_city_for_history(
+                payload.get("city") or {},
+                city,
+                saved_label=row["city"],
+            ):
+                continue
+
+            visit_rank += 1
+            quest = payload.get("quest") or {}
+
+            for stop in quest.get("stops") or []:
+                place = stop.get("place") or {}
+                lat = place.get("lat")
+                lon = place.get("lon")
+                if lat is None or lon is None:
+                    continue
+
+                place_id = str(place.get("place_id") or "").strip()
+                name = str(
+                    place.get("name")
+                    or stop.get("name_ru")
+                    or ""
+                ).strip()
+                name_norm = poi_history_name(name)
+
+                dedupe = (
+                    f"id:{place_id}"
+                    if place_id
+                    else f"geo:{float(lat):.5f}:{float(lon):.5f}:{name_norm}"
+                )
+
+                mission = stop.get("mission") or {}
+                mission_title = str(
+                    mission.get("title") or ""
+                ).strip()
+
+                if dedupe not in by_key:
+                    by_key[dedupe] = {
+                        "place_id": place_id,
+                        "name": name,
+                        "name_norm": name_norm,
+                        "lat": float(lat),
+                        "lon": float(lon),
+                        "visit_rank": visit_rank,
+                        "mission_titles": [],
+                    }
+                    order.append(dedupe)
+
+                item = by_key[dedupe]
+                item["visit_rank"] = min(
+                    int(item.get("visit_rank") or visit_rank),
+                    visit_rank,
+                )
+
+                if (
+                    mission_title
+                    and mission_title not in item["mission_titles"]
+                ):
+                    item["mission_titles"].append(mission_title)
+
+        return [by_key[key] for key in order]
+
+    except Exception:
+        logger.exception(
+            "Failed to load visited POIs for user %s / %s",
+            user_id,
+            city_display_ru(city),
+        )
+        return []
+
+
+def candidate_history_match(candidate, visited_pois):
+    candidate_id = str(candidate.get("place_id") or "").strip()
+    candidate_name = poi_history_name(candidate.get("name"))
+    candidate_lat = candidate.get("lat")
+    candidate_lon = candidate.get("lon")
+
+    if candidate_lat is None or candidate_lon is None:
+        return None
+
+    matches = []
+
+    for visited in visited_pois or []:
+        visited_id = str(visited.get("place_id") or "").strip()
+        matched = False
+
+        if candidate_id and visited_id and candidate_id == visited_id:
+            matched = True
+        else:
+            try:
+                distance = haversine(candidate, visited)
+            except Exception:
+                distance = 999999.0
+
+            if (
+                candidate_name
+                and candidate_name == visited.get("name_norm")
+                and distance < 250
+            ):
+                matched = True
+            elif distance < 55:
+                matched = True
+
+        if matched:
+            matches.append(visited)
+
+    if not matches:
+        return None
+
+    combined_titles = []
+    for item in matches:
+        for title in item.get("mission_titles") or []:
+            if title and title not in combined_titles:
+                combined_titles.append(title)
+
+    return {
+        "visit_rank": min(
+            int(item.get("visit_rank") or 999)
+            for item in matches
+        ),
+        "mission_titles": combined_titles,
+    }
+
+
+def anti_repeat_candidates(candidates, visited_pois):
+    """
+    Fresh places stay first. Previous POIs remain as a reserve for sparse
+    cities, with a stronger penalty for the most recently visited ones.
+    """
+    fresh = []
+    repeated = []
+
+    for place in candidates or []:
+        item = dict(place)
+        match = candidate_history_match(item, visited_pois)
+
+        if not match:
+            item["_repeat_penalty"] = 0.0
+            item["_repeat_visit_rank"] = None
+            fresh.append(item)
+            continue
+
+        rank = int(match.get("visit_rank") or 1)
+        # Recent visits are most expensive. Older repeats remain possible
+        # when a small city has too few alternatives.
+        item["_repeat_penalty"] = max(
+            12000.0,
+            36000.0 - min(rank - 1, 8) * 3000.0,
+        )
+        item["_repeat_visit_rank"] = rank
+        item["_previous_mission_titles"] = list(
+            match.get("mission_titles") or []
+        )
+        repeated.append(item)
+
+    repeated.sort(
+        key=lambda p: (
+            float(p.get("_repeat_penalty") or 0),
+            int(p.get("_repeat_visit_rank") or 999),
+        )
+    )
+
+    return fresh + repeated, len(fresh), len(repeated)
+
+
 def db_recent_missions_for_city(user_id: int, city_name: str, limit: int = 12):
     """Small memory used only to tell AI what not to repeat in the same city."""
     if not PERSISTENCE_OK:
@@ -2126,9 +2361,20 @@ async def try_route_combinations(
                 continue
 
             diversity = len(set(place_group(p) for p in combo))
-            # Diversity remains valuable, but compactness — including the
-            # walk from the user's start point — matters too.
-            scored.append((approx - diversity * 260, ordered))
+            repeat_penalty = sum(
+                float(p.get("_repeat_penalty") or 0)
+                for p in combo
+            )
+            # Fresh POIs are strongly preferred. Repeats remain possible only
+            # when they are needed for interests, diversity or route viability.
+            scored.append(
+                (
+                    approx
+                    + repeat_penalty
+                    - diversity * 260,
+                    ordered,
+                )
+            )
 
         scored.sort(key=lambda x: x[0])
 
@@ -2154,33 +2400,67 @@ async def try_route_combinations(
 
 
 def location_aware_pool(places, start_point, max_items=20):
-    if not start_point:
-        return places[:max_items]
+    """
+    Keep mostly fresh POIs, but reserve a few slots for old places.
+    Those reserve points carry a large repeat penalty and are selected only
+    when fresh places cannot satisfy the route/interests.
+    """
+    fresh = [
+        place
+        for place in places
+        if float(place.get("_repeat_penalty") or 0) <= 0
+    ]
+    repeated = [
+        place
+        for place in places
+        if float(place.get("_repeat_penalty") or 0) > 0
+    ]
 
-    # Most candidates should be close to the tourist, but keep several of the
-    # original high-quality/category-diverse candidates so "nearby" does not
-    # turn the route into a boring list of whatever happens to be closest.
-    nearest = sorted(
-        places,
-        key=lambda p: haversine(start_point, p),
-    )[:14]
+    reserve_old = min(4, len(repeated))
+    fresh_limit = max_items - reserve_old
 
-    pool = []
-    seen = set()
-
-    for place in nearest + list(places):
-        key = (
-            place.get("place_id")
-            or f"{place.get('name')}:{place['lat']:.5f}:{place['lon']:.5f}"
+    if start_point:
+        fresh = sorted(
+            fresh,
+            key=lambda p: haversine(start_point, p),
         )
-        if key in seen:
-            continue
-        seen.add(key)
-        pool.append(place)
-        if len(pool) >= max_items:
-            break
+        repeated = sorted(
+            repeated,
+            key=lambda p: (
+                float(p.get("_repeat_penalty") or 0),
+                haversine(start_point, p),
+            ),
+        )
 
-    return pool
+    chosen = fresh[:fresh_limit]
+
+    # If there are fewer fresh places than the reserved fresh capacity,
+    # use additional old places rather than leave the pool unnecessarily small.
+    old_limit = max_items - len(chosen)
+    chosen.extend(repeated[:old_limit])
+
+    # If there were no repeats, fill the whole pool with fresh places.
+    if len(chosen) < max_items and len(fresh) > len(chosen):
+        seen_keys = {
+            (
+                p.get("place_id")
+                or f"{p.get('name')}:{p['lat']:.5f}:{p['lon']:.5f}"
+            )
+            for p in chosen
+        }
+        for place in fresh:
+            key = (
+                place.get("place_id")
+                or f"{place.get('name')}:{place['lat']:.5f}:{place['lon']:.5f}"
+            )
+            if key in seen_keys:
+                continue
+            chosen.append(place)
+            seen_keys.add(key)
+            if len(chosen) >= max_items:
+                break
+
+    return chosen[:max_items]
 
 
 async def select_route(places, interests, duration, start_point=None):
@@ -3359,6 +3639,41 @@ def adaptive_mode_note(mode, places, interests):
     )
 
 
+def repeat_alternate_mission(place, fallback):
+    group = place_group(place)
+
+    if group == "tea":
+        return {
+            "type": "tea",
+            "title": "Чай по цвету",
+            "text": (
+                "Найди два разных чая или чайных напитка и сравни их по цвету, названию или оформлению. "
+                "Какой кажется тебе более лёгким, насыщенным или необычным — ещё до дегустации?"
+            ),
+            "tip": (
+                "Покупать ничего не нужно: подойдут меню, упаковки, банки с чаем или уже готовые напитки. "
+                "Если название непонятно, можно показать фото или текст AI."
+            ),
+            "photo": "Сфотографируй два варианта чая, меню или упаковки, которые ты сравнивал.",
+            "xp": 25,
+            "minutes": 12,
+        }
+
+    result = dict(fallback)
+    result["title"] = f"{fallback.get('title') or 'Новая миссия'} · новый вариант"
+    result["text"] = (
+        "Посмотри на это место иначе, чем в прошлый раз: найди новую деталь, объект, надпись, "
+        "цвет или сочетание, которого ты тогда не замечал. Выбери одну находку, которую хочется запомнить."
+    )
+    result["tip"] = (
+        "Смысл повтора — увидеть другое, а не повторить старое задание. "
+        "Если прошлую миссию помнишь, специально выбери другой объект или ракурс."
+    )
+    result["photo"] = "Сфотографируй новую находку, которой не было в прошлой миссии."
+    result["minutes"] = 10
+    return result
+
+
 def build_quest(city, interests, style, places, ai_meta, adaptive_mode="rich"):
     stops = []
     social_used = False
@@ -3382,7 +3697,33 @@ def build_quest(city, interests, style, places, ai_meta, adaptive_mode="rich"):
     for i, place in enumerate(places):
         name_ru = safe_russian_name(place)
         reason = reason_for_place(place, interests)
-        fallback = mission_for_place(place, interests, i, used_titles)
+        local_used_titles = set(used_titles)
+        previous_titles = {
+            str(title).strip()
+            for title in (
+                place.get("_previous_mission_titles") or []
+            )
+            if str(title).strip()
+        }
+        local_used_titles.update(previous_titles)
+
+        fallback = mission_for_place(
+            place,
+            interests,
+            i,
+            local_used_titles,
+        )
+
+        if (
+            previous_titles
+            and str(fallback.get("title") or "").strip()
+            in previous_titles
+        ):
+            fallback = repeat_alternate_mission(
+                place,
+                fallback,
+            )
+
         mission = merge_ai_mission(
             place,
             fallback,
@@ -3391,8 +3732,18 @@ def build_quest(city, interests, style, places, ai_meta, adaptive_mode="rich"):
             style,
         )
 
+        if (
+            previous_titles
+            and str(mission.get("title") or "").strip()
+            in previous_titles
+        ):
+            mission = dict(fallback)
+            mission["source"] = "repeat_safe_fallback"
+
         if mission.get("source") == "ai_v2":
             accepted_ai += 1
+
+        used_titles.add(str(mission.get("title") or "").strip())
 
         # The displayed titles must remain unique even after AI personalization.
         base_title = mission["title"]
@@ -5652,6 +6003,30 @@ async def generate_quest_for_start(
             reply_markup=ReplyKeyboardRemove(),
         )
 
+    visited_pois = db_visited_pois_for_city(
+        user_id,
+        city,
+    )
+    candidates, fresh_count, repeat_count = anti_repeat_candidates(
+        candidates,
+        visited_pois,
+    )
+
+    await state.update_data(
+        candidates=candidates,
+        anti_repeat_fresh=fresh_count,
+        anti_repeat_old=repeat_count,
+    )
+
+    if visited_pois and repeat_count:
+        await status.edit_text(
+            f"🧭 <b>Учитываю прошлые прогулки по {esc(city_display_ru(city))}.</b>\n\n"
+            f"Новых кандидатов: <b>{fresh_count}</b>.\n"
+            f"Уже встречались в прошлых квестах: <b>{repeat_count}</b>.\n\n"
+            "Новые места получают максимальный приоритет. "
+            "Старые точки остаются резервом на случай, если без них маршрут или выбранные интересы не складываются."
+        )
+
     try:
         selected, route, adaptive_mode = await select_route(
             candidates,
@@ -5693,6 +6068,24 @@ async def generate_quest_for_start(
         else "из центральной части города"
     )
 
+    selected_repeats = sum(
+        1
+        for place in selected
+        if float(place.get("_repeat_penalty") or 0) > 0
+    )
+    if visited_pois:
+        if selected_repeats:
+            repeat_note = (
+                f"\n🔁 Повторных точек: <b>{selected_repeats}</b>. "
+                "Они понадобились, чтобы сохранить нормальный маршрут; миссии для них будут другими."
+            )
+        else:
+            repeat_note = (
+                "\n✨ Все точки этого квеста новые относительно твоих завершённых прогулок по этому городу."
+            )
+    else:
+        repeat_note = ""
+
     access_text = ""
     if route.get("access_leg"):
         access = route["access_leg"]
@@ -5707,7 +6100,8 @@ async def generate_quest_for_start(
         f"Подтверждённых точек: <b>{len(selected)}</b>.\n"
         f"Пешком всего: ~{fmt_distance(route['distance_m'])} · "
         f"~{fmt_minutes(route['time_s']/60)}."
-        f"{access_text}\n\n"
+        f"{access_text}"
+        f"{repeat_note}\n\n"
         "Уточняю финальные точки и их типы через Place Details…"
     )
 
@@ -7544,7 +7938,8 @@ async def about(callback: CallbackQuery):
         "• Блок «Впечатления» можно заменить своим текстом и вернуть готовый вариант.\n"
         "• Для travel-открытки можно сравнить три оформления и сохранить понравившееся.\n"
         "• «Мои приключения» работают как паспорт городов с красными печатями, статистикой и архивом квестов.\n"
-        "• Неудачную точку активного квеста можно заменить без пересборки всего путешествия."
+        "• Неудачную точку активного квеста можно заменить без пересборки всего путешествия.\n"
+        "• При новом квесте в уже исследованном городе новые места получают приоритет; старые POI используются только как резерв и получают новую миссию."
     )
 
 
@@ -7557,7 +7952,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Starting CityQuest China v10 Adventure Passport and Replace Point")
+    logger.info("Starting CityQuest China v10.1 Anti Repeat POIs")
     await dp.start_polling(bot)
 
 
