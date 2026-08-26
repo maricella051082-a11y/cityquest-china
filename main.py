@@ -1660,19 +1660,26 @@ def manual_start_candidate_text(candidate, city):
     name = start_candidate_name(candidate)
     formatted = str(candidate.get("formatted") or "").strip()
     distance = float(candidate.get("distance_from_city_m") or 0)
+    street_address, area = start_candidate_address(candidate)
+    category = str(candidate.get("category") or "").casefold()
+    place_label = "Отель" if "accommodation.hotel" in category or "hotel" in category else "Место"
 
     lines = [
         "📍 <b>Нашла точку старта</b>",
         "",
-        f"<b>{esc(name)}</b>",
+        f"🏨 <b>{place_label}:</b> {esc(name)}" if place_label == "Отель" else f"📌 <b>Место:</b> {esc(name)}",
     ]
 
-    if formatted and formatted.casefold() != name.casefold():
-        lines.append(esc(formatted))
+    if street_address and street_address.casefold() != name.casefold():
+        lines.append(f"🏠 <b>Адрес:</b> {esc(street_address)}")
+
+    if area:
+        lines.append(f"🏙 <b>Район и город:</b> {esc(area)}")
+    elif formatted and formatted.casefold() != name.casefold():
+        lines.append(f"🏠 <b>Адрес:</b> {esc(formatted)}")
 
     lines += [
-        f"📌 Координаты: {candidate['lat']:.5f}, {candidate['lon']:.5f}",
-        f"🏙 От центральной точки {esc(city_display_ru(city))}: ~{esc(fmt_distance(distance))}",
+        f"🚶 <b>От центра {esc(city_display_ru(city))}:</b> ~{esc(fmt_distance(distance))}",
         "",
         "Начать квест отсюда?",
     ]
@@ -2176,6 +2183,27 @@ def start_candidate_name(candidate):
     return "Точка старта"
 
 
+def start_candidate_address(candidate):
+    """Build a human-readable address without exposing route coordinates."""
+    street = str(candidate.get("street") or "").strip()
+    house = str(candidate.get("housenumber") or "").strip()
+    address_line1 = str(candidate.get("address_line1") or "").strip()
+    address_line2 = str(candidate.get("address_line2") or "").strip()
+
+    street_address = " ".join(part for part in (street, house) if part)
+    if not street_address:
+        street_address = address_line1
+
+    area_parts = []
+    for key in ("suburb", "district", "city", "state"):
+        value = str(candidate.get(key) or "").strip()
+        if value and value.casefold() not in {part.casefold() for part in area_parts}:
+            area_parts.append(value)
+    area = ", ".join(area_parts) or address_line2
+
+    return street_address, area
+
+
 async def _fetch_start_query(session, query, city):
     url = "https://api.geoapify.com/v1/geocode/search"
     params = {
@@ -2282,6 +2310,13 @@ async def geocode_start_candidates(query, city):
             if lat is None or lon is None:
                 continue
 
+            # A city-centre result is not a meaningful confirmation for a
+            # hotel/place/address query. The user already has a separate
+            # "central part of the city" option.
+            result_type = str(item.get("result_type") or "").casefold()
+            if result_type in {"city", "county", "district", "state", "country"}:
+                continue
+
             candidate_point = {
                 "lat": float(lat),
                 "lon": float(lon),
@@ -2327,7 +2362,13 @@ async def geocode_start_candidates(query, city):
                 "city": item.get("city"),
                 "county": item.get("county"),
                 "district": item.get("district"),
+                "suburb": item.get("suburb"),
                 "state": item.get("state"),
+                "street": item.get("street"),
+                "housenumber": item.get("housenumber"),
+                "address_line1": item.get("address_line1"),
+                "address_line2": item.get("address_line2"),
+                "category": item.get("category"),
                 "result_type": item.get("result_type"),
                 "lat": float(lat),
                 "lon": float(lon),

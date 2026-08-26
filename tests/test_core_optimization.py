@@ -74,6 +74,29 @@ class GeoTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(main.POI_SEARCH_RADII_M, (2_000, 5_000, 10_000, 15_000))
         self.assertLess(main.LOCATION_ACCEPT_DISTANCE_M, main.LOCATION_WARN_DISTANCE_M)
 
+    def test_manual_start_confirmation_shows_address_not_coordinates(self):
+        candidate = {
+            "name": "The Temple House",
+            "category": "accommodation.hotel",
+            "street": "Bitieshi Street",
+            "housenumber": "81",
+            "district": "Jinjiang District",
+            "city": "Chengdu",
+            "state": "Sichuan",
+            "lat": 30.65987,
+            "lon": 104.06332,
+            "distance_from_city_m": 10_000,
+        }
+        text = main.manual_start_candidate_text(
+            candidate,
+            {"city": "Chengdu", "lat": 30.57, "lon": 104.06},
+        )
+        self.assertIn("Отель:</b> The Temple House", text)
+        self.assertIn("Адрес:</b> Bitieshi Street 81", text)
+        self.assertIn("Jinjiang District, Chengdu, Sichuan", text)
+        self.assertNotIn("30.65987", text)
+        self.assertNotIn("Координаты", text)
+
 
 class RouteTests(unittest.IsolatedAsyncioTestCase):
     async def test_second_ranked_route_can_win(self):
