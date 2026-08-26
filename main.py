@@ -5085,7 +5085,7 @@ def quest_launch_keyboard(quest):
     kb = InlineKeyboardBuilder()
     if quest.get("stops"):
         kb.button(text="▶️ Начать с первой миссии", callback_data="quest_stop:0")
-    kb.button(text="✅ Открыть чек-лист", callback_data="show_checklist")
+    kb.button(text="📋 Посмотреть все миссии", callback_data="show_checklist")
     kb.button(text="🏠 Главное меню", callback_data="home")
     kb.adjust(1)
     return kb.as_markup()
@@ -5108,6 +5108,11 @@ def stop_keyboard(place, index, has_bonus, total_stops):
     if index + 1 < total_stops:
         navigation.append(InlineKeyboardButton(text="Далее ➡️", callback_data=f"quest_stop:{index+1}"))
     kb.row(*navigation)
+    if place_group(place) == "museum":
+        kb.row(InlineKeyboardButton(
+            text="🏛 Узнать об экспонате без фото",
+            callback_data=f"museum_text_menu:{index}",
+        ))
     kb.row(
         InlineKeyboardButton(
             text="🔄 Заменить эту точку",
@@ -5913,6 +5918,10 @@ def fit_card_lines(draw, text, max_width, max_lines, start_size, min_size, bold=
 
 def render_travel_card(data, photo_images, caption, frame_style="none"):
     width, height = 1080, 1350
+    framed = normalize_travel_card_style(frame_style) != "none"
+    content_left = 112 if framed else 78
+    content_right = 930 if framed else 1000
+    content_width = content_right - content_left
 
     bg = (246, 241, 230)
     paper = (255, 252, 245)
@@ -5962,25 +5971,26 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
     draw.rectangle((40, 35, 55, 1315), fill=red)
 
     # Top identity.
-    draw.text((78, 68), "CITYQUEST CHINA", font=kicker_font, fill=gold)
-    draw.line((78, 102, 1000, 102), fill=line, width=2)
+    draw.text((content_left, 68), "CITYQUEST CHINA", font=kicker_font, fill=gold)
+    draw.line((content_left, 102, content_right, 102), fill=line, width=2)
 
     # Decorative seal, drawn without unsupported glyphs.
-    draw.ellipse((915, 58, 1000, 143), fill=red)
-    seal_font = load_card_font(24, bold=True)
-    draw.text((934, 84), "CQ", font=seal_font, fill=(255, 247, 235))
+    if not framed:
+        draw.ellipse((915, 58, 1000, 143), fill=red)
+        seal_font = load_card_font(24, bold=True)
+        draw.text((934, 84), "CQ", font=seal_font, fill=(255, 247, 235))
 
     # Large Russian city.
-    draw.text((78, 132), city_name, font=city_font, fill=deep_red)
+    draw.text((content_left, 132), city_name, font=city_font, fill=deep_red)
 
     # Quest title.
     title_font, title_lines = fit_card_lines(
-        draw, title, 790, max_lines=2, start_size=38, min_size=28, bold=True
+        draw, title, content_width, max_lines=2, start_size=38, min_size=28, bold=True
     )
     ty = 230
     title_step = max(36, int(getattr(title_font, "size", 34) * 1.22))
     for line_text in title_lines:
-        draw.text((80, ty), line_text, font=title_font, fill=ink)
+        draw.text((content_left, ty), line_text, font=title_font, fill=ink)
         ty += title_step
 
     # Stats as proper cards, no emoji/symbol glyph dependency.
@@ -5992,12 +6002,12 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
     ]
 
     card_y = 325
-    card_w = 218
+    card_w = (content_width - 3 * (12 if framed else 18)) // 4
     card_h = 72
-    gap = 18
+    gap = 12 if framed else 18
 
     for i, (label, value) in enumerate(stats):
-        x = 78 + i * (card_w + gap)
+        x = content_left + i * (card_w + gap)
         draw.rounded_rectangle(
             (x, card_y, x + card_w, card_y + card_h),
             radius=18,
@@ -6070,10 +6080,10 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
 
     # Bottom: personal caption + route stops.
     bottom_top = 1002
-    draw.line((78, bottom_top, 1000, bottom_top), fill=line, width=2)
+    draw.line((content_left, bottom_top, content_right, bottom_top), fill=line, width=2)
 
     draw.text(
-        (78, bottom_top + 25),
+        (content_left, bottom_top + 25),
         "ВПЕЧАТЛЕНИЯ",
         font=kicker_font,
         fill=gold,
@@ -6082,7 +6092,7 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
     body_font, cap_lines = fit_card_lines(
         draw,
         caption or "Моя прогулка по Китаю.",
-        900,
+        content_width,
         max_lines=5,
         start_size=25,
         min_size=18,
@@ -6092,7 +6102,7 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
     cy = bottom_top + 60
     body_step = max(24, int(getattr(body_font, "size", 22) * 1.30))
     for line_text in cap_lines:
-        draw.text((78, cy), line_text, font=body_font, fill=ink)
+        draw.text((content_left, cy), line_text, font=body_font, fill=ink)
         cy += body_step
 
     # Compact route line(s): user sees actual places included.
@@ -6105,7 +6115,7 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
     if stops:
         route_y = max(1162, min(1202, cy + 16))
         draw.text(
-            (78, route_y),
+            (content_left, route_y),
             "МАРШРУТ",
             font=kicker_font,
             fill=gold,
@@ -6113,18 +6123,18 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
 
         route_text = "  •  ".join(stops)
         route_bold_font, route_lines = fit_card_lines(
-            draw, route_text, 900, max_lines=2, start_size=18, min_size=14, bold=True
+            draw, route_text, content_width, max_lines=2, start_size=18, min_size=14, bold=True
         )
 
         ry = route_y + 32
         route_step = max(20, int(getattr(route_bold_font, "size", 16) * 1.35))
         for line_text in route_lines:
-            draw.text((78, ry), line_text, font=route_bold_font, fill=muted)
+            draw.text((content_left, ry), line_text, font=route_bold_font, fill=muted)
             ry += route_step
 
-    draw.line((78, 1280, 1000, 1280), fill=line, width=2)
+    draw.line((content_left, 1280, content_right, 1280), fill=line, width=2)
     draw.text(
-        (78, 1292),
+        (content_left, 1292),
         "CITYQUEST CHINA  ·  PERSONAL TRAVEL CARD",
         font=footer_font,
         fill=muted,
@@ -6680,8 +6690,7 @@ async def send_quest(message, state):
     await persist_active_state(message.from_user.id, state)
     await message.answer(
         "✅ <b>Квест готов.</b>\n\n"
-        "Маршрут сохранён. Открывай миссии по одной — первая появится "
-        "внизу чата, поэтому ничего прокручивать назад не придётся.",
+        "Маршрут сохранён. Открывай миссии по одной.",
         reply_markup=quest_launch_keyboard(quest),
     )
 

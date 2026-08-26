@@ -191,6 +191,21 @@ class NavigationTests(unittest.TestCase):
         self.assertIn("show_checklist", callbacks)
         self.assertIn("photo_add:1", callbacks)
 
+    def test_museum_stop_restores_no_photo_action(self):
+        place = {
+            "lat": 31.2,
+            "lon": 121.5,
+            "category_label": "🏛 музей",
+        }
+        markup = main.stop_keyboard(place, 1, False, 6)
+        callbacks = {
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+            if button.callback_data
+        }
+        self.assertIn("museum_text_menu:1", callbacks)
+
 
 class ProgressUiTests(unittest.TestCase):
     def test_active_summary_and_checklist_do_not_show_xp(self):
