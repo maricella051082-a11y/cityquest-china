@@ -20,7 +20,15 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 from pypinyin import Style, lazy_pinyin
@@ -57,6 +65,8 @@ ACTIVE_DATA_KEYS = (
     "city",
     "style",
     "interests",
+    "start_mode",
+    "start_point",
     "completed",
     "bonuses",
     "photos",
@@ -64,6 +74,7 @@ ACTIVE_DATA_KEYS = (
     "travel_card_path",
     "travel_caption",
     "travel_ai_caption",
+    "travel_card_style",
 )
 
 
@@ -447,6 +458,7 @@ class QuestForm(StatesGroup):
     waiting_city = State()
     choosing_interests = State()
     choosing_style = State()
+    choosing_start = State()
     generating = State()
     quest_active = State()
     waiting_photo = State()
@@ -1110,6 +1122,36 @@ def style_keyboard():
     return kb.as_markup()
 
 
+def start_point_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(
+                    text="📍 Отправить моё местоположение",
+                    request_location=True,
+                )
+            ],
+            [KeyboardButton(text="🏙 Начать из центра города")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+        input_field_placeholder="Выбери точку старта",
+    )
+
+
+def point_from_location(location):
+    return {
+        "lat": float(location.latitude),
+        "lon": float(location.longitude),
+    }
+
+
+def start_point_label(mode):
+    if mode == "location":
+        return "📍 от твоей геолокации"
+    return "🏙 из центральной части города"
+
+
 def clean_category_label(categories):
     cats = categories or []
 
@@ -1520,18 +1562,23 @@ async def geocode_city_candidates(city_query):
     return final[:5]
 
 
-async def fetch_places_source(session, city, source_key, categories, limit=20):
+async def fetch_places_source(session, city, source_key, categories, limit=20, bias_point=None):
     url = "https://api.geoapify.com/v2/places"
+    bias_ref = bias_point or city
     spatial_filter = (
         f"place:{city['place_id']}"
         if city.get("place_id")
-        else f"circle:{city['lon']},{city['lat']},15000"
+        else (
+            f"circle:{bias_ref['lon']},{bias_ref['lat']},15000"
+            if bias_point
+            else f"circle:{city['lon']},{city['lat']},15000"
+        )
     )
 
     params = {
         "categories": ",".join(categories),
         "filter": spatial_filter,
-        "bias": f"proximity:{city['lon']},{city['lat']}",
+        "bias": f"proximity:{bias_ref['lon']},{bias_ref['lat']}",
         "limit": limit,
         "lang": "zh",
         "apiKey": GEOAPIFY_API_KEY,
@@ -1616,7 +1663,7 @@ def pool_needs_broadening(places):
     return stats["count"] < 10 or stats["groups"] < 4
 
 
-async def search_places(city, interests, duration):
+async def search_places(city, interests, duration, start_point=None):
     """
     First search exactly what the user asked for.
     If the map is sparse, broaden discovery with neutral city categories.
@@ -1631,7 +1678,7 @@ async def search_places(city, interests, duration):
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         primary_results = await asyncio.gather(*[
-            fetch_places_source(session, city, key, cats)
+            fetch_places_source(session, city, key, cats, bias_point=start_point)
             for key, cats in primary_sources
         ])
 
@@ -1642,7 +1689,7 @@ async def search_places(city, interests, duration):
 
         # Sparse map: search broad, safe categories in the same city.
         fallback_results = await asyncio.gather(*[
-            fetch_places_source(session, city, key, cats, limit=16)
+            fetch_places_source(session, city, key, cats, limit=16, bias_point=start_point)
             for key, cats in FALLBACK_DISCOVERY_SOURCES
         ])
 
@@ -1725,23 +1772,30 @@ def route_order_ok(stops):
     return all(not (is_food_group(a) and is_food_group(b)) for a, b in zip(groups, groups[1:]))
 
 
-def best_order(combo):
+def best_order(combo, start_point=None):
     best, best_dist = combo[:], float("inf")
+
     for start in range(len(combo)):
         remaining = set(range(len(combo)))
         remaining.remove(start)
         order = [start]
         cur = start
-        dist = 0.0
+
+        # When a real start point exists, include the approach to the first POI
+        # in the approximate score.
+        dist = haversine(start_point, combo[start]) if start_point else 0.0
+
         while remaining:
             nxt = min(remaining, key=lambda j: haversine(combo[cur], combo[j]))
             dist += haversine(combo[cur], combo[nxt])
             order.append(nxt)
             remaining.remove(nxt)
             cur = nxt
+
         candidate = [combo[i] for i in order]
         if route_order_ok(candidate) and dist < best_dist:
             best, best_dist = candidate, dist
+
     return best, best_dist
 
 
@@ -1768,10 +1822,16 @@ def combo_ok(combo, interests):
     return set(interests).issubset(covered)
 
 
-async def walking_route(stops):
+async def walking_route(stops, start_point=None):
     url = "https://api.geoapify.com/v1/routing"
+
+    waypoints = []
+    if start_point:
+        waypoints.append(start_point)
+    waypoints.extend(stops)
+
     params = {
-        "waypoints": "|".join(f"{p['lat']},{p['lon']}" for p in stops),
+        "waypoints": "|".join(f"{p['lat']},{p['lon']}" for p in waypoints),
         "mode": "walk",
         "format": "json",
         "type": "balanced",
@@ -1792,16 +1852,26 @@ async def walking_route(stops):
         raise RuntimeError("No route")
 
     route = results[0]
+    raw_legs = [
+        {
+            "distance_m": float(leg.get("distance") or 0),
+            "time_s": float(leg.get("time") or 0),
+        }
+        for leg in route.get("legs", [])
+    ]
+
+    access_leg = None
+    mission_legs = raw_legs
+    if start_point and raw_legs:
+        access_leg = raw_legs[0]
+        mission_legs = raw_legs[1:]
+
     return {
         "distance_m": float(route.get("distance") or 0),
         "time_s": float(route.get("time") or 0),
-        "legs": [
-            {
-                "distance_m": float(leg.get("distance") or 0),
-                "time_s": float(leg.get("time") or 0),
-            }
-            for leg in route.get("legs", [])
-        ],
+        "legs": mission_legs,
+        "access_leg": access_leg,
+        "start_mode": "location" if start_point else "center",
     }
 
 
@@ -1884,7 +1954,14 @@ def fake_single_stop_route():
     }
 
 
-async def try_route_combinations(pool, wanted_counts, duration, combo_validator, relaxed):
+async def try_route_combinations(
+    pool,
+    wanted_counts,
+    duration,
+    combo_validator,
+    relaxed,
+    start_point=None,
+):
     for wanted in wanted_counts:
         if len(pool) < wanted:
             continue
@@ -1896,64 +1973,110 @@ async def try_route_combinations(pool, wanted_counts, duration, combo_validator,
             if not combo_validator(combo):
                 continue
 
-            ordered, approx = best_order(combo)
+            ordered, approx = best_order(combo, start_point=start_point)
             if not route_order_ok(ordered):
                 continue
 
             diversity = len(set(place_group(p) for p in combo))
-            # Diversity remains valuable, but compactness still matters.
+            # Diversity remains valuable, but compactness — including the
+            # walk from the user's start point — matters too.
             scored.append((approx - diversity * 260, ordered))
 
         scored.sort(key=lambda x: x[0])
 
-        for _, ordered in scored[:14]:
+        # Keep the number of real Routing API checks bounded.
+        for _, ordered in scored[:10]:
             try:
-                route = await walking_route(ordered)
+                route = await walking_route(
+                    ordered,
+                    start_point=start_point,
+                )
             except Exception:
                 continue
 
-            if route_fits(route, duration, len(ordered), relaxed=relaxed):
+            if route_fits(
+                route,
+                duration,
+                len(ordered),
+                relaxed=relaxed,
+            ):
                 return ordered, route
 
     return None
 
 
-async def select_route(places, interests, duration):
+def location_aware_pool(places, start_point, max_items=20):
+    if not start_point:
+        return places[:max_items]
+
+    # Most candidates should be close to the tourist, but keep several of the
+    # original high-quality/category-diverse candidates so "nearby" does not
+    # turn the route into a boring list of whatever happens to be closest.
+    nearest = sorted(
+        places,
+        key=lambda p: haversine(start_point, p),
+    )[:14]
+
+    pool = []
+    seen = set()
+
+    for place in nearest + list(places):
+        key = (
+            place.get("place_id")
+            or f"{place.get('name')}:{place['lat']:.5f}:{place['lon']:.5f}"
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        pool.append(place)
+        if len(pool) >= max_items:
+            break
+
+    return pool
+
+
+async def select_route(places, interests, duration, start_point=None):
     """
     Adaptive cascade:
-    1) existing strict route;
-    2) compact route with interests treated as preferences;
-    3) explorer route with 2 real anchors;
-    4) one confirmed anchor + field missions.
-    """
-    pool = places[:20]
+    1) strict diverse route;
+    2) compact route;
+    3) two confirmed anchors;
+    4) one confirmed anchor.
 
-    # 1. Preserve the current strict behavior when the data supports it.
+    If start_point is supplied, the approach from the user's location is part
+    of route scoring and the walking-time limits.
+    """
+    pool = location_aware_pool(
+        places,
+        start_point,
+        max_items=20,
+    )
+
     strict = await try_route_combinations(
         pool,
         stop_counts(duration),
         duration,
         lambda combo: combo_ok(combo, interests),
         relaxed=False,
+        start_point=start_point,
     )
     if strict:
         selected, route = strict
         return selected, route, "rich"
 
-    # 2. Compact mode: fewer stops, interests are preferences, hard food rules stay.
     compact = await try_route_combinations(
         pool,
         compact_stop_counts(duration),
         duration,
         relaxed_combo_ok,
         relaxed=True,
+        start_point=start_point,
     )
     if compact:
         selected, route = compact
         mode = "compact" if len(selected) >= 3 else "explorer"
         return selected, route, mode
 
-    # 3. If routing API cannot connect a sparse set, still try the two closest real anchors.
     if len(pool) >= 2:
         best_pair = None
         best_distance = float("inf")
@@ -1961,23 +2084,59 @@ async def select_route(places, interests, duration):
         for a, b in itertools.combinations(pool, 2):
             if is_food_group(place_group(a)) and is_food_group(place_group(b)):
                 continue
-            dist = haversine(a, b)
-            if dist < best_distance:
-                best_pair = [a, b]
-                best_distance = dist
+
+            ordered, approx = best_order(
+                [a, b],
+                start_point=start_point,
+            )
+            if approx < best_distance:
+                best_pair = ordered
+                best_distance = approx
 
         if best_pair:
-            ordered, _ = best_order(best_pair)
             try:
-                route = await walking_route(ordered)
-                if route_fits(route, duration, 2, relaxed=True):
-                    return ordered, route, "explorer"
+                route = await walking_route(
+                    best_pair,
+                    start_point=start_point,
+                )
+                if route_fits(
+                    route,
+                    duration,
+                    2,
+                    relaxed=True,
+                ):
+                    return best_pair, route, "explorer"
             except Exception:
                 pass
 
-    # 4. Last useful fallback: one confirmed real point.
     if pool:
-        return [pool[0]], fake_single_stop_route(), "explorer"
+        single = (
+            min(pool, key=lambda p: haversine(start_point, p))
+            if start_point
+            else pool[0]
+        )
+
+        if start_point:
+            try:
+                route = await walking_route(
+                    [single],
+                    start_point=start_point,
+                )
+                if route_fits(
+                    route,
+                    duration,
+                    1,
+                    relaxed=True,
+                ):
+                    return [single], route, "explorer"
+            except Exception:
+                pass
+
+            # A point that requires an unreasonable approach is not a useful
+            # "near me" quest.
+            raise RuntimeError("No walkable route near selected start")
+
+        return [single], fake_single_stop_route(), "explorer"
 
     raise RuntimeError("No confirmed POI")
 
@@ -3239,7 +3398,14 @@ async def send_stop_card(message, quest, route, index):
     legs = route.get("legs", [])
 
     transition = ""
-    if index > 0 and index - 1 < len(legs):
+    access_leg = route.get("access_leg")
+
+    if index == 0 and access_leg:
+        transition = (
+            f"\n🚶 <b>От точки старта:</b> ~{fmt_distance(access_leg['distance_m'])} · "
+            f"~{fmt_minutes(access_leg['time_s']/60)}\n"
+        )
+    elif index > 0 and index - 1 < len(legs):
         leg = legs[index - 1]
         transition = (
             f"\n🚶 <b>От предыдущей:</b> ~{fmt_distance(leg['distance_m'])} · "
@@ -3866,7 +4032,109 @@ def photo_layout_boxes(count):
     ]
 
 
-def render_travel_card(data, photo_images, caption):
+TRAVEL_CARD_STYLES = {
+    "none": "Без рамки",
+    "chinese": "Тонкая китайская рамка",
+    "journal": "Travel-journal рамка",
+}
+
+
+def travel_card_style_label(style):
+    return TRAVEL_CARD_STYLES.get(style, TRAVEL_CARD_STYLES["none"])
+
+
+def draw_travel_card_frame(draw, style, width=1080, height=1350):
+    red = (165, 61, 49)
+    deep_red = (125, 42, 35)
+    gold = (191, 148, 62)
+    soft_gold = (224, 203, 154)
+    muted = (154, 143, 123)
+
+    if style == "none":
+        return
+
+    if style == "chinese":
+        draw.rounded_rectangle(
+            (57, 51, width - 57, height - 51),
+            radius=27,
+            outline=deep_red,
+            width=3,
+        )
+        draw.rounded_rectangle(
+            (66, 60, width - 66, height - 60),
+            radius=23,
+            outline=soft_gold,
+            width=2,
+        )
+
+        inset = 59
+        corner_len = 25
+        xr = width - inset
+        yb = height - inset
+
+        draw.line((inset, inset, inset + corner_len, inset), fill=gold, width=4)
+        draw.line((inset, inset, inset, inset + corner_len), fill=gold, width=4)
+        draw.line((xr, inset, xr - corner_len, inset), fill=gold, width=4)
+        draw.line((xr, inset, xr, inset + corner_len), fill=gold, width=4)
+
+        draw.line((inset, yb, inset + corner_len, yb), fill=gold, width=4)
+        draw.line((inset, yb, inset, yb - corner_len), fill=gold, width=4)
+        draw.line((xr, yb, xr - corner_len, yb), fill=gold, width=4)
+        draw.line((xr, yb, xr, yb - corner_len), fill=gold, width=4)
+
+        mid_y = height // 2
+        for x in (63, width - 63):
+            draw.polygon(
+                [
+                    (x, mid_y - 9),
+                    (x + 7, mid_y),
+                    (x, mid_y + 9),
+                    (x - 7, mid_y),
+                ],
+                outline=red,
+            )
+        return
+
+    if style == "journal":
+        draw.rounded_rectangle(
+            (52, 47, width - 52, height - 47),
+            radius=30,
+            outline=muted,
+            width=2,
+        )
+
+        x1, y1, x2, y2 = 64, 59, width - 64, height - 59
+        dash, gap = 18, 12
+
+        x = x1
+        while x < x2:
+            draw.line((x, y1, min(x + dash, x2), y1), fill=soft_gold, width=2)
+            draw.line((x, y2, min(x + dash, x2), y2), fill=soft_gold, width=2)
+            x += dash + gap
+
+        y = y1
+        while y < y2:
+            draw.line((x1, y, x1, min(y + dash, y2)), fill=soft_gold, width=2)
+            draw.line((x2, y, x2, min(y + dash, y2)), fill=soft_gold, width=2)
+            y += dash + gap
+
+        # Subtle paper-tape details live on the outer margin only.
+        draw.polygon(
+            [(390, 40), (505, 40), (495, 58), (382, 58)],
+            fill=(238, 224, 190),
+        )
+        draw.polygon(
+            [
+                (575, height - 58),
+                (700, height - 58),
+                (690, height - 40),
+                (565, height - 40),
+            ],
+            fill=(238, 224, 190),
+        )
+
+
+def render_travel_card(data, photo_images, caption, frame_style="none"):
     width, height = 1080, 1350
 
     bg = (246, 241, 230)
@@ -3917,6 +4185,13 @@ def render_travel_card(data, photo_images, caption):
         fill=paper,
     )
     draw.rectangle((40, 35, 55, 1315), fill=red)
+
+    draw_travel_card_frame(
+        draw,
+        frame_style,
+        width=width,
+        height=height,
+    )
 
     # Top identity.
     draw.text((78, 68), "CITYQUEST CHINA", font=kicker_font, fill=gold)
@@ -4116,7 +4391,7 @@ async def collect_card_photos(bot, photos):
     return images
 
 
-async def create_and_save_travel_card(bot, user_id, data, caption_override=None):
+async def create_and_save_travel_card(bot, user_id, data, caption_override=None, style_override=None):
     photos = data.get("photos") or {}
     if not photos:
         return None, None
@@ -4131,7 +4406,20 @@ async def create_and_save_travel_card(bot, user_id, data, caption_override=None)
     if not images:
         return None, None
 
-    card_bytes = render_travel_card(data, images, caption)
+    frame_style = (
+        str(style_override).strip()
+        if style_override is not None
+        else str(data.get("travel_card_style") or "none").strip()
+    )
+    if frame_style not in TRAVEL_CARD_STYLES:
+        frame_style = "none"
+
+    card_bytes = render_travel_card(
+        data,
+        images,
+        caption,
+        frame_style=frame_style,
+    )
 
     cards_dir = os.path.join(DATA_DIR, "travel_cards")
     os.makedirs(cards_dir, exist_ok=True)
@@ -4145,10 +4433,41 @@ async def create_and_save_travel_card(bot, user_id, data, caption_override=None)
     return path, caption
 
 
+def travel_card_style_keyboard(current_style="none"):
+    kb = InlineKeyboardBuilder()
+
+    for key, label in [
+        ("none", "Без рамки"),
+        ("chinese", "Тонкая китайская"),
+        ("journal", "Travel-journal"),
+    ]:
+        prefix = "✅ " if key == current_style else ""
+        kb.button(
+            text=f"{prefix}{label}",
+            callback_data=f"card_style:{key}",
+        )
+
+    kb.button(
+        text="👀 Сравнить все 3",
+        callback_data="card_style_compare",
+    )
+    kb.button(
+        text="↩️ Назад к открытке",
+        callback_data="latest_card",
+    )
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 def travel_card_actions_keyboard(custom=False, initial=False, editable=True):
     kb = InlineKeyboardBuilder()
 
     if editable:
+        kb.button(
+            text="🎨 Оформление открытки",
+            callback_data="card_style_menu",
+        )
+
         if custom:
             kb.button(text="✍️ Изменить впечатления", callback_data="custom_impression")
             kb.button(text="↩️ Вернуть готовый вариант", callback_data="restore_ai_impression")
@@ -4171,9 +4490,28 @@ def route_summary(route, quest, duration):
     pause = max(15, int(total * 0.12))
     reserve = max(0, total - walk - missions - pause)
 
+    start_line = ""
+    access_leg = route.get("access_leg")
+    if route.get("start_mode") == "location":
+        start_line = "📍 Старт: <b>от твоей геолокации</b>\n"
+        if access_leg:
+            start_line += (
+                f"🚶 До первой точки: ~{fmt_distance(access_leg['distance_m'])} · "
+                f"~{fmt_minutes(access_leg['time_s']/60)}\n"
+            )
+
     if len(quest.get("stops", [])) <= 1:
+        walk_line = ""
+        if route.get("start_mode") == "location":
+            walk_line = (
+                f"🚶 Пешком до точки: ~{fmt_distance(route['distance_m'])} · "
+                f"~{fmt_minutes(walk)}\n"
+            )
+
         return (
             "🗺 <b>Основа квеста проверена</b>\n"
+            f"{start_line}"
+            f"{walk_line}"
             "📍 Подтверждённая точка: 1\n"
             f"🎯 Основная миссия: ~{fmt_minutes(missions)}\n"
             "🧭 Остальное время — исследовательские задания вокруг этой точки и по ближайшим улицам."
@@ -4181,7 +4519,8 @@ def route_summary(route, quest, duration):
 
     return (
         "🗺 <b>Маршрут проверен</b>\n"
-        f"🚶 Пешком: ~{fmt_distance(route['distance_m'])} · ~{fmt_minutes(walk)}\n"
+        f"{start_line}"
+        f"🚶 Пешком всего: ~{fmt_distance(route['distance_m'])} · ~{fmt_minutes(walk)}\n"
         f"🎯 Миссии: ~{fmt_minutes(missions)}\n"
         f"☕ Паузы: ~{fmt_minutes(pause)}\n"
         f"🕒 Запас: ~{fmt_minutes(reserve)}"
@@ -4571,37 +4910,127 @@ async def interests_continue(callback: CallbackQuery, state: FSMContext):
     )
 
 
-@router.callback_query(F.data.startswith("style:"))
-async def style_cb(callback: CallbackQuery, state: FSMContext):
-    style = callback.data.split(":", 1)[1]
+async def generate_quest_for_start(
+    message,
+    state,
+    user_id,
+    start_point=None,
+    start_mode="center",
+):
     data = await state.get_data()
-    city, duration = data.get("city"), data.get("duration")
-    interests, candidates = data.get("interests", []), data.get("candidates", [])
+    city = data.get("city")
+    duration = data.get("duration")
+    interests = data.get("interests", [])
+    style = data.get("style")
+    candidates = data.get("candidates", [])
 
-    await callback.answer()
     await state.set_state(QuestForm.generating)
-    status = await callback.message.answer(
-        "🧭 <b>Собираю маршрут…</b>\n\n"
-        "Проверяю разнообразие и реальные пешие переходы."
-    )
+
+    if start_point:
+        status = await message.answer(
+            "📍 <b>Подбираю маршрут рядом с тобой…</b>\n\n"
+            "Сначала ищу подходящие реальные места ближе к твоей геолокации, "
+            "но сохраняю разнообразие и выбранные интересы.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+        try:
+            nearby_candidates = await search_places(
+                city,
+                interests,
+                duration,
+                start_point=start_point,
+            )
+        except Exception:
+            logger.exception("Places near start")
+            nearby_candidates = []
+
+        if nearby_candidates:
+            candidates = nearby_candidates
+            await state.update_data(
+                candidates=candidates,
+                pool_mode=suggested_mode_from_pool(candidates),
+            )
+        else:
+            await state.set_state(QuestForm.choosing_start)
+            await status.edit_text(
+                "🤔 Не получилось найти достаточно размеченных мест рядом с этой точкой."
+            )
+            await message.answer(
+                "Можно отправить геолокацию ещё раз или начать из центральной части города.",
+                reply_markup=start_point_keyboard(),
+            )
+            return
+
+        await status.edit_text(
+            f"🔎 <b>Рядом найдено {len(candidates)} подходящих кандидатов.</b>\n\n"
+            "Теперь проверяю, можно ли соединить лучшие из них удобным пешим маршрутом "
+            "прямо от твоей точки старта."
+        )
+    else:
+        status = await message.answer(
+            "🧭 <b>Собираю маршрут…</b>\n\n"
+            "Начинаю с центральной части города и проверяю разнообразие "
+            "и реальные пешие переходы.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
 
     try:
-        selected, route, adaptive_mode = await select_route(candidates, interests, duration)
-    except Exception:
-        logger.exception("Route")
-        await state.set_state(QuestForm.choosing_style)
-        await status.edit_text(
-            "🗺 На карте не удалось подтвердить даже одну пригодную точку для квеста.\n\n"
-            "Это похоже на нехватку данных карты для этого города, а не на отсутствие интересных мест. "
-            "Можно попробовать другой город или другие интересы.",
-            reply_markup=style_keyboard(),
+        selected, route, adaptive_mode = await select_route(
+            candidates,
+            interests,
+            duration,
+            start_point=start_point,
         )
+    except Exception:
+        logger.exception("Route from selected start")
+        await state.set_state(QuestForm.choosing_start)
+
+        if start_point:
+            await status.edit_text(
+                "🚶 <b>От этой точки не получилось собрать хороший пеший квест.</b>\n\n"
+                "Я не хочу отправлять тебя далеко только ради первой миссии."
+            )
+            await message.answer(
+                "Попробуй отправить геолокацию ещё раз или начни из центральной части города.",
+                reply_markup=start_point_keyboard(),
+            )
+        else:
+            await status.edit_text(
+                "🗺 Не удалось подтвердить удобный маршрут из центральной части города."
+            )
+            await message.answer(
+                "Можно попробовать текущую геолокацию или вернуться и выбрать другие интересы.",
+                reply_markup=start_point_keyboard(),
+            )
         return
+
+    await state.update_data(
+        start_mode=start_mode,
+        start_point=start_point,
+    )
+
+    start_description = (
+        "от твоей геолокации"
+        if start_point
+        else "из центральной части города"
+    )
+
+    access_text = ""
+    if route.get("access_leg"):
+        access = route["access_leg"]
+        access_text = (
+            f"\nДо первой точки: ~{fmt_distance(access['distance_m'])} · "
+            f"~{fmt_minutes(access['time_s']/60)}."
+        )
 
     await status.edit_text(
         f"🔎 <b>{esc(ADAPTIVE_MODE_LABELS.get(adaptive_mode, 'Квест'))}</b>\n\n"
-        f"Подтверждённых точек в маршруте: <b>{len(selected)}</b>.\n"
-        f"Пешком между ними: ~{fmt_distance(route['distance_m'])} · ~{fmt_minutes(route['time_s']/60)}.\n"
+        f"Старт: <b>{start_description}</b>.\n"
+        f"Подтверждённых точек: <b>{len(selected)}</b>.\n"
+        f"Пешком всего: ~{fmt_distance(route['distance_m'])} · "
+        f"~{fmt_minutes(route['time_s']/60)}."
+        f"{access_text}\n\n"
         "Уточняю финальные точки и их типы через Place Details…"
     )
 
@@ -4609,15 +5038,19 @@ async def style_cb(callback: CallbackQuery, state: FSMContext):
 
     await status.edit_text(
         f"🤖 <b>Точки проверены.</b>\n\n"
-        f"Пешком ~{fmt_distance(route['distance_m'])} · ~{fmt_minutes(route['time_s']/60)}.\n"
+        f"Старт: <b>{start_description}</b>.\n"
+        f"Пешком ~{fmt_distance(route['distance_m'])} · "
+        f"~{fmt_minutes(route['time_s']/60)}.\n\n"
         "AI создаёт персональные миссии именно для этих реальных точек. "
-        "Названия, категории и координаты он менять не может; сомнительная миссия автоматически заменяется безопасной."
+        "Названия, категории и координаты он менять не может; "
+        "сомнительная миссия автоматически заменяется безопасной."
     )
 
     avoid_missions = db_recent_missions_for_city(
-        callback.from_user.id,
+        user_id,
         city_display_ru(city),
     )
+
     ai_meta = await groq_meta(
         city,
         duration,
@@ -4626,11 +5059,119 @@ async def style_cb(callback: CallbackQuery, state: FSMContext):
         selected,
         avoid_missions=avoid_missions,
     )
-    quest = build_quest(city, interests, style, selected, ai_meta, adaptive_mode=adaptive_mode)
 
-    await state.update_data(quest=quest, route=route, style=style)
+    quest = build_quest(
+        city,
+        interests,
+        style,
+        selected,
+        ai_meta,
+        adaptive_mode=adaptive_mode,
+    )
+
+    await state.update_data(
+        quest=quest,
+        route=route,
+        style=style,
+        start_mode=start_mode,
+        start_point=start_point,
+    )
+
     await status.edit_text("✅ <b>Квест готов!</b>")
-    await send_quest(callback.message, state)
+    await send_quest(message, state)
+
+
+@router.callback_query(F.data.startswith("style:"))
+async def style_cb(callback: CallbackQuery, state: FSMContext):
+    style = callback.data.split(":", 1)[1]
+    await callback.answer()
+
+    await state.update_data(
+        style=style,
+        start_mode=None,
+        start_point=None,
+    )
+    await state.set_state(QuestForm.choosing_start)
+
+    await callback.message.answer(
+        "📍 <b>Откуда начнём?</b>\n\n"
+        "Если ты уже в городе, отправь своё местоположение — "
+        "я постараюсь собрать интересный пеший квест ближе к тебе.\n\n"
+        "Если не хочешь делиться геолокацией или пока только планируешь поездку, "
+        "выбери «Начать из центра города».",
+        reply_markup=start_point_keyboard(),
+    )
+
+
+@router.message(QuestForm.choosing_start, F.location)
+async def start_location_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    city = data.get("city")
+
+    if not city:
+        await message.answer(
+            "Город потерялся из текущего сценария. Начни новый квест через /start.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    start_point = point_from_location(message.location)
+    distance_from_city = haversine(start_point, city)
+
+    # A wildly remote coordinate is almost certainly the wrong start point.
+    # We do not silently build a route that would require hours just to reach
+    # the selected city.
+    if distance_from_city > 150_000:
+        await message.answer(
+            f"📍 Эта геолокация находится примерно в "
+            f"<b>{fmt_distance(distance_from_city)}</b> от центра "
+            f"<b>{esc(city_display_ru(city))}</b>.\n\n"
+            "Похоже, сейчас ты далеко от выбранного города. "
+            "Для этого квеста отправь другую геолокацию или начни из центра города.",
+            reply_markup=start_point_keyboard(),
+        )
+        return
+
+    await message.answer(
+        "✅ Геолокация принята. Ищу удобный маршрут от твоей точки.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+    await generate_quest_for_start(
+        message,
+        state,
+        message.from_user.id,
+        start_point=start_point,
+        start_mode="location",
+    )
+
+
+@router.message(
+    QuestForm.choosing_start,
+    F.text == "🏙 Начать из центра города",
+)
+async def start_from_center(message: Message, state: FSMContext):
+    await message.answer(
+        "✅ Начинаем из центральной части города.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+    await generate_quest_for_start(
+        message,
+        state,
+        message.from_user.id,
+        start_point=None,
+        start_mode="center",
+    )
+
+
+@router.message(QuestForm.choosing_start)
+async def start_point_unknown(message: Message):
+    await message.answer(
+        "Выбери один из двух вариантов ниже: отправить геолокацию "
+        "или начать из центра города.",
+        reply_markup=start_point_keyboard(),
+    )
 
 
 @router.callback_query(F.data.startswith("photo_continue:"))
@@ -5339,6 +5880,7 @@ async def quest_finish(callback: CallbackQuery, state: FSMContext):
                 travel_card_path=card_path,
                 travel_caption=travel_caption,
                 travel_ai_caption=travel_caption,
+                travel_card_style="none",
             )
             data = await state.get_data()
 
@@ -5482,6 +6024,186 @@ async def my_quests(callback: CallbackQuery, state: FSMContext):
             has_active=bool(active and active.get("quest")),
             has_card=bool(latest_card),
         ),
+    )
+
+
+@router.callback_query(F.data == "card_style_menu")
+async def card_style_menu(callback: CallbackQuery):
+    await callback.answer()
+
+    record_id, payload = db_latest_completed_payload(callback.from_user.id)
+    if not payload or not payload.get("travel_card_path"):
+        await callback.message.answer(
+            "🤔 Сначала нужна готовая travel-открытка."
+        )
+        return
+
+    current_style = str(payload.get("travel_card_style") or "none")
+    if current_style not in TRAVEL_CARD_STYLES:
+        current_style = "none"
+
+    await callback.message.answer(
+        "🎨 <b>Оформление travel-открытки</b>\n\n"
+        f"Сейчас: <b>{esc(travel_card_style_label(current_style))}</b>.\n\n"
+        "Можно выбрать вариант сразу или нажать «Сравнить все 3». "
+        "Фото, текст и статистика останутся одинаковыми.",
+        reply_markup=travel_card_style_keyboard(current_style),
+    )
+
+
+@router.callback_query(F.data == "card_style_compare")
+async def card_style_compare(callback: CallbackQuery):
+    await callback.answer()
+
+    record_id, payload = db_latest_completed_payload(callback.from_user.id)
+    if not payload:
+        await callback.message.answer(
+            "🤔 Готовая travel-открытка не найдена."
+        )
+        return
+
+    photos = payload.get("photos") or {}
+    caption = str(payload.get("travel_caption") or "").strip()
+
+    if not photos:
+        await callback.message.answer(
+            "📷 Для сравнения оформления нужна открытка с фото."
+        )
+        return
+
+    status = await callback.message.answer(
+        "👀 <b>Готовлю три варианта одной открытки…</b>\n"
+        "Меняется только оформление по краям."
+    )
+
+    try:
+        images = await collect_card_photos(callback.bot, photos)
+        if not images:
+            raise RuntimeError("No photos for frame comparison")
+
+        previews = []
+        for style in ("none", "chinese", "journal"):
+            card_bytes = render_travel_card(
+                payload,
+                images,
+                caption,
+                frame_style=style,
+            )
+            previews.append((style, card_bytes))
+
+        await status.edit_text(
+            "✅ <b>Три варианта готовы.</b>\n"
+            "Посмотри их подряд и выбери оформление ниже."
+        )
+
+        for number, (style, card_bytes) in enumerate(previews, 1):
+            await callback.message.answer_photo(
+                BufferedInputFile(
+                    card_bytes,
+                    filename=f"cityquest_{style}.jpg",
+                ),
+                caption=(
+                    f"<b>{number}/3 · "
+                    f"{esc(travel_card_style_label(style))}</b>"
+                ),
+            )
+
+        current_style = str(payload.get("travel_card_style") or "none")
+        if current_style not in TRAVEL_CARD_STYLES:
+            current_style = "none"
+
+        await callback.message.answer(
+            "🎨 <b>Какой вариант оставить?</b>",
+            reply_markup=travel_card_style_keyboard(current_style),
+        )
+
+    except Exception:
+        logger.exception("Travel card comparison failed")
+        await status.edit_text(
+            "🤔 Не получилось собрать три превью. "
+            "Можно попробовать выбрать оформление по одному."
+        )
+
+
+@router.callback_query(F.data.startswith("card_style:"))
+async def card_style_choose(callback: CallbackQuery):
+    style = callback.data.split(":", 1)[1]
+
+    if style not in TRAVEL_CARD_STYLES:
+        await callback.answer(
+            "Неизвестный стиль.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer()
+
+    record_id, payload = db_latest_completed_payload(callback.from_user.id)
+    if not payload:
+        await callback.message.answer(
+            "🤔 Готовая travel-открытка не найдена."
+        )
+        return
+
+    caption = str(payload.get("travel_caption") or "").strip()
+
+    status = await callback.message.answer(
+        f"🎨 <b>Применяю: "
+        f"{esc(travel_card_style_label(style))}…</b>"
+    )
+
+    try:
+        card_path, _ = await create_and_save_travel_card(
+            callback.bot,
+            callback.from_user.id,
+            payload,
+            caption_override=caption,
+            style_override=style,
+        )
+    except Exception:
+        logger.exception("Travel card style regeneration failed")
+        card_path = None
+
+    if not card_path:
+        await status.edit_text(
+            "🤔 Не получилось пересобрать открытку "
+            "с этим оформлением."
+        )
+        return
+
+    payload["travel_card_style"] = style
+    payload["travel_card_path"] = card_path
+    db_update_completed_payload(record_id, payload)
+
+    with open(card_path, "rb") as f:
+        card_bytes = f.read()
+
+    current_caption = str(payload.get("travel_caption") or "").strip()
+    ai_caption = str(
+        payload.get("travel_ai_caption")
+        or current_caption
+    ).strip()
+    is_custom = bool(
+        current_caption
+        and ai_caption
+        and current_caption != ai_caption
+    )
+
+    await status.edit_text(
+        f"✅ <b>Сохранено:</b> "
+        f"{esc(travel_card_style_label(style))}"
+    )
+
+    await callback.message.answer_photo(
+        BufferedInputFile(
+            card_bytes,
+            filename="cityquest_travel_card.jpg",
+        ),
+        caption=(
+            f"🎨 <b>{esc(travel_card_style_label(style))}</b>\n\n"
+            "Этот вариант сейчас сохранён как основной."
+        ),
+        reply_markup=travel_card_actions_keyboard(custom=is_custom),
     )
 
 
@@ -5706,7 +6428,8 @@ async def latest_card(callback: CallbackQuery):
             ),
             caption=(
                 "🖼 <b>Последняя travel-открытка</b>\n\n"
-                "Текст блока «Впечатления» можно изменить."
+                f"Оформление: <b>{esc(travel_card_style_label(str(payload.get('travel_card_style') or 'none')))}</b>.\n"
+                "Текст блока «Впечатления» можно изменить, а оформление — сравнить и поменять."
             ),
             reply_markup=travel_card_actions_keyboard(custom=is_custom),
         )
@@ -5730,7 +6453,8 @@ async def about(callback: CallbackQuery):
         "• Если AI не уверен — бот даёт простую китайскую фразу, которую можно показать человеку.\n"
         "• Активный квест, прогресс, XP и фото сохраняются между перезапусками BotHost.\n"
         "• После завершения квеста бот собирает travel-открытку из фото-трофеев.\n"
-        "• Блок «Впечатления» можно заменить своим текстом и вернуть готовый вариант."
+        "• Блок «Впечатления» можно заменить своим текстом и вернуть готовый вариант.\n"
+        "• Для travel-открытки можно сравнить три оформления и сохранить понравившееся."
     )
 
 
@@ -5743,7 +6467,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Starting CityQuest China v8.4 Balanced Museum Flow")
+    logger.info("Starting CityQuest China v9.1 Travel Card Frame Lab")
     await dp.start_polling(bot)
 
 
