@@ -57,6 +57,12 @@ if not GROQ_API_KEY:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cityquest")
 router = Router()
+GENERATING_USERS = set()
+
+POI_SEARCH_RADII_M = (2_000, 5_000, 10_000, 15_000)
+LOCATION_ACCEPT_DISTANCE_M = 35_000
+LOCATION_WARN_DISTANCE_M = 80_000
+ROUTE_CANDIDATE_LIMIT = 3
 
 async def safe_status_edit(status_message, text, reply_markup=None):
     """
@@ -98,6 +104,10 @@ ACTIVE_DATA_KEYS = (
     "interests",
     "start_mode",
     "start_point",
+    "user_location",
+    "poi_search_center",
+    "route_origin",
+    "city_center",
     "start_label",
     "replacement_history",
     "completed",
@@ -444,6 +454,7 @@ def passport_city_groups(records):
                 "completed": 0,
                 "total": 0,
                 "xp": 0,
+                "photos": 0,
                 "latest_id": int(record.get("id") or 0),
                 "records": [],
             }
@@ -453,6 +464,7 @@ def passport_city_groups(records):
         group["completed"] += int(completed_count)
         group["total"] += int(total_count)
         group["xp"] += int(record.get("xp") or 0)
+        group["photos"] += int(record.get("photos") or 0)
         group["records"].append(record)
 
     return list(groups.values())
@@ -871,19 +883,15 @@ def active_quest_summary(data):
     quest = data.get("quest") or {}
     city = data.get("city") or {}
     completed = data.get("completed", [])
-    bonuses = data.get("bonuses", [])
     photos = data.get("photos", {})
 
     title = str(quest.get("title") or "CityQuest")
     city_name = city_display_ru(city)
     total = len(quest.get("stops", []))
-    xp = earned_xp(quest, completed, bonuses) if quest else 0
-
     return (
         f"🏮 <b>{esc(title)}</b>\n"
         f"📍 {esc(city_name)}\n"
         f"✅ Миссии: <b>{len(completed)}/{total}</b>\n"
-        f"⭐ XP: <b>{xp}</b>\n"
         f"📷 Фото: <b>{len(photos)}</b>"
     )
 
@@ -1828,6 +1836,17 @@ def safe_russian_name(place):
 
     lower = original.casefold()
     if original and not contains_han(original):
+        descriptive_names = {
+            "light show (dancing fountains)": "Световое шоу «Танцующие фонтаны»",
+            "dancing fountains": "Танцующие фонтаны",
+            "musical fountain": "Музыкальный фонтан",
+            "light show": "Световое шоу",
+            "observation deck": "Смотровая площадка",
+            "viewing platform": "Смотровая площадка",
+        }
+        normalized_original = re.sub(r"\s+", " ", lower).strip()
+        if normalized_original in descriptive_names:
+            return descriptive_names[normalized_original]
         if "muslim street" in lower:
             return "Мусульманская улица / рынок"
         if "market" in lower:
@@ -2227,7 +2246,7 @@ async def geocode_start_candidates(query, city):
 
             # Tourist start points should be in or reasonably near the chosen
             # city. A matching administrative label permits a wider radius.
-            max_distance = 150_000 if admin_match else 100_000
+            max_distance = LOCATION_WARN_DISTANCE_M
             if distance_m > max_distance:
                 continue
 
@@ -2296,18 +2315,27 @@ async def geocode_start_candidates(query, city):
     return final
 
 
-async def fetch_places_source(session, city, source_key, categories, limit=20, bias_point=None):
+async def fetch_places_source(
+    session,
+    city,
+    source_key,
+    categories,
+    limit=20,
+    bias_point=None,
+    search_radius_m=15_000,
+):
     url = "https://api.geoapify.com/v2/places"
     bias_ref = bias_point or city
-    spatial_filter = (
-        f"place:{city['place_id']}"
-        if city.get("place_id")
-        else (
-            f"circle:{bias_ref['lon']},{bias_ref['lat']},15000"
-            if bias_point
-            else f"circle:{city['lon']},{city['lat']},15000"
+    if bias_point:
+        # A real/manual start must be the actual POI search centre. Geoapify's
+        # bias only affects ranking and does not constrain results by distance.
+        spatial_filter = (
+            f"circle:{bias_ref['lon']},{bias_ref['lat']},{int(search_radius_m)}"
         )
-    )
+    elif city.get("place_id"):
+        spatial_filter = f"place:{city['place_id']}"
+    else:
+        spatial_filter = f"circle:{city['lon']},{city['lat']},15000"
 
     params = {
         "categories": ",".join(categories),
@@ -2341,7 +2369,7 @@ async def fetch_places_source(session, city, source_key, categories, limit=20, b
             continue
 
         raw_categories = props.get("categories") or []
-        output.append({
+        place = {
             "place_id": props.get("place_id") or "",
             "name": name,
             "pinyin": place_pinyin(name),
@@ -2350,7 +2378,15 @@ async def fetch_places_source(session, city, source_key, categories, limit=20, b
             "lat": float(props["lat"]),
             "lon": float(props["lon"]),
             "interest_matches": [source_key],
-        })
+        }
+        if bias_point:
+            distance_m = haversine(bias_point, place)
+            # Explicit post-filter: do not rely on Geoapify bias/filter alone.
+            if distance_m > float(search_radius_m) * 1.03:
+                continue
+            place["distance_from_search_center_m"] = float(distance_m)
+            place["poi_search_radius_m"] = int(search_radius_m)
+        output.append(place)
     return output
 
 
@@ -2405,7 +2441,13 @@ def pool_needs_broadening(places):
     return stats["count"] < 10 or stats["groups"] < 4
 
 
-async def search_places(city, interests, duration, start_point=None):
+async def _search_places_at_radius(
+    city,
+    interests,
+    duration,
+    start_point=None,
+    search_radius_m=15_000,
+):
     """Fast, bounded POI discovery with hard network deadlines."""
     primary_sources = [(key, INTERESTS[key]["categories"]) for key in interests]
 
@@ -2424,7 +2466,12 @@ async def search_places(city, interests, duration, start_point=None):
                 primary_results = await asyncio.wait_for(
                     asyncio.gather(*[
                         fetch_places_source(
-                            session, city, key, cats, bias_point=start_point
+                            session,
+                            city,
+                            key,
+                            cats,
+                            bias_point=start_point,
+                            search_radius_m=search_radius_m,
                         )
                         for key, cats in primary_sources
                     ]),
@@ -2445,7 +2492,13 @@ async def search_places(city, interests, duration, start_point=None):
                 fallback_results = await asyncio.wait_for(
                     asyncio.gather(*[
                         fetch_places_source(
-                            session, city, key, cats, limit=16, bias_point=start_point
+                            session,
+                            city,
+                            key,
+                            cats,
+                            limit=16,
+                            bias_point=start_point,
+                            search_radius_m=search_radius_m,
                         )
                         for key, cats in FALLBACK_DISCOVERY_SOURCES
                     ]),
@@ -2476,6 +2529,38 @@ async def search_places(city, interests, duration, start_point=None):
     return prefer_local_places(
         merge_place_results(all_results, all_sources, max_items=32)
     )
+
+
+async def search_places(city, interests, duration, start_point=None):
+    """Discover POIs around the actual start, expanding only when necessary."""
+    radii = POI_SEARCH_RADII_M if start_point else (15_000,)
+    last_places = []
+
+    for radius_m in radii:
+        places = await _search_places_at_radius(
+            city,
+            interests,
+            duration,
+            start_point=start_point,
+            search_radius_m=radius_m,
+        )
+        last_places = places
+        distances = [
+            haversine(start_point, place)
+            for place in places
+        ] if start_point and places else []
+        logger.info(
+            "POI search radius=%sm found=%s nearest=%s farthest=%s city=%s",
+            radius_m,
+            len(places),
+            round(min(distances)) if distances else None,
+            round(max(distances)) if distances else None,
+            city_display_ru(city),
+        )
+        if places and not pool_needs_broadening(places):
+            return places
+
+    return last_places
 
 
 def suggested_mode_from_pool(places):
@@ -2804,8 +2889,9 @@ async def try_route_combinations(
     start_point=None,
 ):
     """
-    Choose the best route locally first. Only one Routing API request is made
-    for the chosen candidate; if it times out, the local estimate is used.
+    Rank locally, then verify a small shortlist with the real walking network.
+    This avoids both the old 10+ request explosion and the single-candidate
+    false negative.
     """
     # A smaller pool makes combinatorial scoring deterministic and instant.
     pool = list(pool)[:14]
@@ -2814,8 +2900,7 @@ async def try_route_combinations(
         if len(pool) < wanted:
             continue
 
-        best = None
-        best_score = float("inf")
+        ranked_candidates = []
 
         for idxs in itertools.combinations(range(len(pool)), wanted):
             combo = [pool[i] for i in idxs]
@@ -2832,29 +2917,78 @@ async def try_route_combinations(
                 for p in combo
             )
             score = approx + repeat_penalty - diversity * 260
-            if score < best_score:
-                best_score = score
-                best = ordered
+            ranked_candidates.append((score, ordered))
 
-        if not best:
+        if not ranked_candidates:
             continue
 
-        route = await best_effort_walking_route(
-            best,
-            start_point=start_point,
-            timeout=7,
-        )
+        ranked_candidates.sort(key=lambda item: item[0])
+        shortlist = ranked_candidates[:ROUTE_CANDIDATE_LIMIT]
+        estimate_fallback = None
+        any_verified = False
 
-        # If verified routing says the route is poor, try the next stop count.
-        # For an estimate, use relaxed fit so a network outage does not kill the quest.
-        fit_relaxed = relaxed or not route.get("verified", False)
-        if route_fits(
-            route,
-            duration,
-            len(best),
-            relaxed=fit_relaxed,
+        ok, route_results = await soft_deadline(
+            asyncio.wait_for(
+                asyncio.gather(
+                    *[
+                        walking_route(candidate, start_point=start_point)
+                        for _, candidate in shortlist
+                    ],
+                    return_exceptions=True,
+                ),
+                timeout=7,
+            ),
+            timeout=8,
+            label="Geoapify routing shortlist",
+        )
+        if not ok:
+            route_results = [None] * len(shortlist)
+
+        for rank, ((score, candidate), route) in enumerate(
+            zip(shortlist, route_results),
+            1,
         ):
-            return best, route
+            if route and not isinstance(route, Exception):
+                any_verified = True
+                fits = route_fits(
+                    route,
+                    duration,
+                    len(candidate),
+                    relaxed=relaxed,
+                )
+                logger.info(
+                    "Route candidate rank=%s stops=%s local_score=%.0f "
+                    "verified_distance=%.0f verified_minutes=%.1f accepted=%s",
+                    rank,
+                    len(candidate),
+                    score,
+                    route.get("distance_m", 0),
+                    route.get("time_s", 0) / 60,
+                    fits,
+                )
+                if fits:
+                    return candidate, route
+                continue
+
+            if isinstance(route, Exception):
+                logger.warning("Route candidate rank=%s failed: %s", rank, route)
+
+            estimate = approximate_walking_route(
+                candidate,
+                start_point=start_point,
+            )
+            if estimate_fallback is None and route_fits(
+                estimate,
+                duration,
+                len(candidate),
+                relaxed=True,
+            ):
+                estimate_fallback = (candidate, estimate)
+
+        # Use an estimate only when no shortlisted route could be verified.
+        # A verified-but-poor route must not be disguised as a good fallback.
+        if estimate_fallback and not any_verified:
+            return estimate_fallback
 
     return None
 
@@ -3199,6 +3333,12 @@ def russian_editorial_ok(value, kind="general"):
         r"\bингредиентн\w*\s+сочетан",
         r"\bразлож\w*\s+.*\bкадр",
         r"\bчтобы\s+(?:ai|ии)\s+распозна",
+        r"\bформа\s+в\s+тени\b",
+        r"\bзагадк\w*\s+в\s+меню\b",
+        r"\bвыбери\s+угол\s*,?\s*где\b",
+        r"\bо\s+котор\w*\s+ничего\s+не\s+знаешь\b",
+        r"\bвкус\w*\s+(?:они\s+)?могут\s+носить\b",
+        r"\bразниц\w*\s+ощущается\s+наиболее\s+резко\b",
     ]
     if any(re.search(p, low) for p in bad_patterns):
         return False
@@ -3318,6 +3458,9 @@ async def groq_meta(city, duration, interests, style, places, avoid_missions=Non
 20. Для музея миссия должна работать даже без фотографии. Если фото разрешено — в hint можно предложить AI как дополнительный способ узнать больше.
 21. Поле photo — это фото-трофей, а не обязательное условие выполнения каждой миссии.
 22. Каждая миссия должна заметно отличаться от других по механике, наблюдению или маленькому выбору пользователя.
+23. task: 180–280 символов, одно основное действие, которое можно пересказать одним предложением.
+24. hint: 100–170 символов. Начинай task с конкретного действия: найди, сравни, заметь, выбери, попробуй определить или сфотографируй.
+25. Не используй кальки «форма в тени», «две загадки в меню», «вкусы могут носить», «выбери угол, где разница ощущается». Пиши проще: «силуэт крыши», «два незнакомых блюда», «каким может быть вкус», «найди ракурс».
 
 МИССИИ ИЗ ПРЕДЫДУЩИХ КВЕСТОВ ЭТОГО ПОЛЬЗОВАТЕЛЯ В ЭТОМ ГОРОДЕ — НЕ ПОВТОРЯЙ ИХ, ЕСЛИ МОЖНО:
 {old_text}
@@ -3361,7 +3504,7 @@ async def groq_meta(city, duration, interests, style, places, avoid_missions=Non
         },
     }
 
-    timeout = aiohttp.ClientTimeout(total=28, connect=5, sock_connect=5, sock_read=24)
+    timeout = aiohttp.ClientTimeout(total=12, connect=4, sock_connect=4, sock_read=10)
     for attempt in range(2):
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -3377,15 +3520,104 @@ async def groq_meta(city, duration, interests, style, places, avoid_missions=Non
                                 result["intro"] = ""
                             if not russian_editorial_ok(result.get("final_challenge"), "general"):
                                 result["final_challenge"] = ""
+                            result["missions"] = await edit_rejected_ai_missions(
+                                result.get("missions"),
+                                places,
+                                style,
+                            )
                             return result
                     logger.error("Groq quest HTTP %s: %s", response.status, body[:700])
         except Exception:
             logger.exception("Groq quest AI Missions v2")
         if attempt == 0:
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
 
     # Important: the current template mission engine remains the fallback.
     return {}
+
+
+async def edit_rejected_ai_missions(missions, places, style):
+    """Rewrite only rejected copy; never change its mechanic or core action."""
+    if not isinstance(missions, list):
+        return missions
+
+    rejected = []
+    for item in missions:
+        if not isinstance(item, dict):
+            continue
+        try:
+            index = int(item.get("poi_index")) - 1
+        except Exception:
+            continue
+        if not 0 <= index < len(places):
+            continue
+        safe, reason = ai_mission_is_safe(places[index], item, style)
+        if not safe:
+            rejected.append({
+                "poi_index": index + 1,
+                "reason": reason,
+                "mission": item,
+            })
+
+    if not rejected:
+        return missions
+
+    prompt = (
+        "Ты редактор русского текста. Исправь только перечисленные плохие миссии. "
+        "Сохрани poi_index, mechanic, смысл и основное действие; не придумывай новое задание "
+        "и новые факты о месте. task — 180–280 символов и одно действие, hint — 100–170. "
+        "Обращайся на «ты». Поля title, task, hint, photo обязательны. Верни JSON "
+        "вида {\"missions\": [...]} без пояснений.\n\n"
+        + json.dumps(rejected, ensure_ascii=False)
+    )
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": "Редактируй русский текст, не меняя миссию."},
+            {"role": "user", "content": prompt},
+        ],
+        "response_format": {"type": "json_object"},
+        "reasoning_effort": "low",
+    }
+    timeout = aiohttp.ClientTimeout(total=10, connect=3, sock_connect=3, sock_read=8)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            ) as response:
+                if response.status != 200:
+                    logger.warning("Mission editor HTTP %s", response.status)
+                    return missions
+                body = await response.json()
+                edited_payload = json.loads(body["choices"][0]["message"]["content"])
+    except Exception:
+        logger.exception("Mission editor failed; validators will use templates")
+        return missions
+
+    edited_by_index = {
+        int(item.get("poi_index")): item
+        for item in (edited_payload.get("missions") or [])
+        if isinstance(item, dict) and str(item.get("poi_index", "")).isdigit()
+    }
+    output = []
+    for original in missions:
+        try:
+            index = int(original.get("poi_index"))
+        except Exception:
+            output.append(original)
+            continue
+        candidate = edited_by_index.get(index, original)
+        # The editor is not allowed to silently change the mechanic.
+        if candidate.get("mechanic") != original.get("mechanic"):
+            candidate = original
+        output.append(candidate)
+    return output
 
 
 def museum_text_keyboard(index):
@@ -3573,7 +3805,14 @@ def clean_ai_mission_value(value, max_len):
     value = re.sub(r"<[^>]+>", "", value)
     value = value.replace("**", "").replace("```", "").replace("`", "")
     value = re.sub(r"\s+", " ", value).strip()
-    return value[:max_len].rstrip()
+    if len(value) <= max_len:
+        return value
+    shortened = value[:max_len + 1]
+    sentence_end = max(shortened.rfind(". "), shortened.rfind("! "), shortened.rfind("? "))
+    if sentence_end >= max_len * 0.6:
+        return shortened[:sentence_end + 1].rstrip()
+    word_end = shortened.rfind(" ", 0, max_len + 1)
+    return shortened[:word_end if word_end > 0 else max_len].rstrip(" ,;:—-")
 
 
 def phrase_for_ai_mechanic(place, mechanic, fallback):
@@ -3607,14 +3846,26 @@ def ai_mission_is_safe(place, candidate, style):
         return False, "mechanic_not_allowed"
 
     values = {
-        "title": clean_ai_mission_value(candidate.get("title"), 70),
-        "task": clean_ai_mission_value(candidate.get("task"), 560),
-        "hint": clean_ai_mission_value(candidate.get("hint"), 340),
-        "photo": clean_ai_mission_value(candidate.get("photo"), 280),
+        "title": clean_ai_mission_value(candidate.get("title"), 500),
+        "task": clean_ai_mission_value(candidate.get("task"), 1000),
+        "hint": clean_ai_mission_value(candidate.get("hint"), 1000),
+        "photo": clean_ai_mission_value(candidate.get("photo"), 1000),
     }
 
     if any(not value for value in values.values()):
         return False, "empty_field"
+
+    if len(values["title"]) > 70 or not 180 <= len(values["task"]) <= 280:
+        return False, "bad_task_length"
+    if not 100 <= len(values["hint"]) <= 170 or len(values["photo"]) > 280:
+        return False, "bad_hint_length"
+
+    if not re.search(
+        r"\b(?:найди|сравни|заметь|выбери|попробуй\s+определить|сфотографируй)\b",
+        values["task"],
+        re.IGNORECASE,
+    ):
+        return False, "missing_concrete_action"
 
     if not contains_cyrillic(values["title"]) or not contains_cyrillic(values["task"]):
         return False, "not_russian"
@@ -3726,43 +3977,21 @@ def ai_mission_is_safe(place, candidate, style):
 
 def apply_human_mission_copy(place, mission):
     """
-    Preserve the creative mission. For food/tea add a clear optional help sentence
-    to the hint instead of replacing the mission itself.
+    Keep mission copy compact; optional AI help is a separate UI action.
     """
     result = dict(mission)
-    group = place_group(place)
-    mechanic = str(result.get("mechanic") or result.get("type") or "").strip()
-
-    if group in {"restaurant", "cafe"}:
-        if mechanic == "spicy":
-            helper = (
-                "Если хочешь проверить догадку, сфотографируй блюдо или его название. "
-                "AI попробует понять, острое оно или нет. Если этого недостаточно, ниже будет готовая фраза: китайский текст, pinyin, русская транскрипция и перевод."
-            )
-        elif mechanic == "ingredients":
-            helper = (
-                "Если хочешь уточнить состав, сфотографируй блюдо или его название. "
-                "AI попробует определить основные ингредиенты. Если этого недостаточно, ниже будет готовая фраза: китайский текст, pinyin, русская транскрипция и перевод."
-            )
-        else:
-            helper = (
-                "Если название или состав непонятны, сфотографируй блюдо или его название. "
-                "AI поможет перевести и объяснить, что это."
-            )
-
-        current_tip = str(result.get("tip") or "").strip()
-        if helper.casefold() not in current_tip.casefold():
-            result["tip"] = (current_tip + " " + helper).strip()
-
-    elif group == "tea":
-        helper = (
-            "Если название чая непонятно, сфотографируй меню, упаковку или табличку — "
-            "AI поможет перевести. Если понадобится уточнение, ниже будет готовая фраза с китайским, pinyin, русской транскрипцией и переводом."
-        )
-        current_tip = str(result.get("tip") or "").strip()
-        if helper.casefold() not in current_tip.casefold():
-            result["tip"] = (current_tip + " " + helper).strip()
-
+    if place_group(place) in {"restaurant", "cafe", "tea"}:
+        tip = str(result.get("tip") or "").strip()
+        sentences = re.split(r"(?<=[.!?])\s+", tip)
+        compact = [
+            sentence
+            for sentence in sentences
+            if not re.search(r"\b(?:AI|ИИ)\b", sentence, re.IGNORECASE)
+        ]
+        if compact:
+            result["tip"] = " ".join(compact).strip()
+        elif tip:
+            result["tip"] = "Рассматривай только то, что доступно без покупки; при необходимости используй кнопки помощи после фото."
     return result
 
 
@@ -3778,8 +4007,8 @@ def merge_ai_mission(place, fallback, candidate, interests, style):
     result = dict(fallback)
     result.update({
         "title": clean_ai_mission_value(candidate.get("title"), 70),
-        "text": clean_ai_mission_value(candidate.get("task"), 560),
-        "tip": clean_ai_mission_value(candidate.get("hint"), 340),
+        "text": clean_ai_mission_value(candidate.get("task"), 280),
+        "tip": clean_ai_mission_value(candidate.get("hint"), 170),
         "photo": clean_ai_mission_value(candidate.get("photo"), 280),
         "mechanic": mechanic,
         "source": "ai_v2",
@@ -4455,7 +4684,6 @@ def checklist_text(quest, completed, bonuses, photos):
         "",
         ("🟩" * len(completed_set)) + ("⬜" * (len(quest["stops"]) - len(completed_set))),
         f"Прогресс: <b>{len(completed_set)}/{len(quest['stops'])}</b>",
-        f"⭐ XP: <b>{earned_xp(quest, completed, bonuses)}/{total_xp(quest)}</b>",
         f"📷 Фото: <b>{len(photos)}/{len(quest['stops'])}</b>",
     ]
     return "\n".join(lines)
@@ -4736,6 +4964,26 @@ def checklist_keyboard(quest, completed):
 
     if len(completed_set) == len(quest["stops"]):
         kb.row(InlineKeyboardButton(text="🏁 Завершить квест", callback_data="quest_finish"))
+    elif quest.get("stops"):
+        next_index = next(
+            (i for i in range(len(quest["stops"])) if i not in completed_set),
+            0,
+        )
+        kb.row(InlineKeyboardButton(
+            text=f"🧭 К миссии {next_index + 1}",
+            callback_data=f"quest_stop:{next_index}",
+        ))
+    kb.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="home"))
+    return kb.as_markup()
+
+
+def quest_launch_keyboard(quest):
+    kb = InlineKeyboardBuilder()
+    if quest.get("stops"):
+        kb.button(text="▶️ Начать с первой миссии", callback_data="quest_stop:0")
+    kb.button(text="✅ Открыть чек-лист", callback_data="show_checklist")
+    kb.button(text="🏠 Главное меню", callback_data="home")
+    kb.adjust(1)
     return kb.as_markup()
 
 
@@ -4756,7 +5004,7 @@ def stop_keyboard(place, index, has_bonus):
         )
     )
     if has_bonus:
-        kb.row(InlineKeyboardButton(text="🎁 Засчитать бонус +10 XP", callback_data=f"bonus_toggle:{index}"))
+        kb.row(InlineKeyboardButton(text="🎁 Отметить доп. задание", callback_data=f"bonus_toggle:{index}"))
     return kb.as_markup()
 
 
@@ -4801,6 +5049,17 @@ async def send_stop_card(message, quest, route, index):
     place = stop["place"]
     mission = stop["mission"]
     legs = route.get("legs", [])
+    raw_name = str(place.get("name") or "").strip()
+    map_name_text = (
+        f" — <b>{esc(raw_name)}</b>"
+        if raw_name and (contains_han(raw_name) or contains_cyrillic(raw_name))
+        else ""
+    )
+    pinyin_text = (
+        f"\n<i>{esc(place.get('pinyin'))}</i>"
+        if contains_han(raw_name) and place.get("pinyin")
+        else ""
+    )
 
     transition = ""
     access_leg = route.get("access_leg")
@@ -4821,22 +5080,31 @@ async def send_stop_card(message, quest, route, index):
     if stop.get("bonus"):
         bonus = stop["bonus"]
         bonus_text = (
-            f"\n\n🎁 <b>BONUS +{bonus['xp']} XP</b>\n{esc(bonus['text'])}"
+            f"\n\n🎁 <b>ДОПОЛНИТЕЛЬНОЕ ЗАДАНИЕ</b>\n{esc(bonus['text'])}"
             f"{phrase_text(bonus['phrase'])}"
+        )
+
+    field_text = ""
+    field_missions = quest.get("field_missions") or []
+    if 0 <= index < len(field_missions):
+        field = field_missions[index]
+        field_text = (
+            f"\n\n🧭 <b>По пути · {esc(field['title'])}</b>\n"
+            f"{esc(field['text'])}"
         )
 
     await message.answer(
         f"📍 <b>{index+1}/{len(quest['stops'])}. {esc(stop['name_ru'])}</b>\n"
-        f"{esc(place['category_label'])} — <b>{esc(place['name'])}</b>\n"
-        f"<i>{esc(place.get('pinyin'))}</i>"
+        f"{esc(place['category_label'])}{map_name_text}"
+        f"{pinyin_text}"
         f"{transition}\n"
         f"💡 <b>Почему здесь:</b> {esc(stop['why_here'])}\n\n"
         f"🎯 <b>Миссия «{esc(mission['title'])}»:</b>\n{esc(mission['text'])}\n\n"
         f"🧭 <b>Подсказка:</b> {esc(mission['tip'])}\n\n"
         f"📷 <b>Фото-трофей:</b> {esc(mission['photo'])}\n"
-        f"⭐ Награда: <b>+{mission['xp']} XP</b>"
         f"{phrase_text(mission.get('phrase'))}"
-        f"{bonus_text}",
+        f"{bonus_text}"
+        f"{field_text}",
         reply_markup=stop_keyboard(place, index, bool(stop.get("bonus"))),
     )
 
@@ -5441,104 +5709,73 @@ def photo_layout_boxes(count):
 
 TRAVEL_CARD_STYLES = {
     "none": "Без рамки",
-    "chinese": "Тонкая китайская рамка",
-    "journal": "Travel-journal рамка",
+    "chinese_seal": "🧧 Китайская печать",
+    "ink_travel": "🖌 Тушь и путешествие",
+    "china_journal": "🧳 Travel Journal",
 }
+
+TRAVEL_CARD_FRAME_FILES = {
+    "chinese_seal": "chinese_seal.png",
+    "ink_travel": "ink_travel.png",
+    "china_journal": "china_journal.png",
+}
+
+LEGACY_TRAVEL_CARD_STYLES = {
+    "chinese": "chinese_seal",
+    "geometric": "chinese_seal",
+    "journal": "china_journal",
+}
+
+FRAME_ASSETS_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "assets",
+    "frames",
+)
+
+
+def normalize_travel_card_style(style):
+    value = str(style or "none").strip()
+    value = LEGACY_TRAVEL_CARD_STYLES.get(value, value)
+    return value if value in TRAVEL_CARD_STYLES else "none"
 
 
 def travel_card_style_label(style):
-    return TRAVEL_CARD_STYLES.get(style, TRAVEL_CARD_STYLES["none"])
+    return TRAVEL_CARD_STYLES[normalize_travel_card_style(style)]
 
 
-def draw_travel_card_frame(draw, style, width=1080, height=1350):
-    red = (165, 61, 49)
-    deep_red = (125, 42, 35)
-    gold = (191, 148, 62)
-    soft_gold = (224, 203, 154)
-    muted = (154, 143, 123)
-
+def apply_travel_card_frame(base_image, style):
+    """Overlay a full-canvas transparent PNG without cropping either image."""
+    style = normalize_travel_card_style(style)
     if style == "none":
-        return
+        return base_image.convert("RGBA")
 
-    if style == "chinese":
-        draw.rounded_rectangle(
-            (57, 51, width - 57, height - 51),
-            radius=27,
-            outline=deep_red,
-            width=3,
-        )
-        draw.rounded_rectangle(
-            (66, 60, width - 66, height - 60),
-            radius=23,
-            outline=soft_gold,
-            width=2,
-        )
+    filename = TRAVEL_CARD_FRAME_FILES.get(style)
+    frame_path = os.path.join(FRAME_ASSETS_DIR, filename or "")
+    if not filename or not os.path.isfile(frame_path):
+        logger.error("Travel-card frame asset is missing: %s", frame_path)
+        return base_image.convert("RGBA")
 
-        inset = 59
-        corner_len = 25
-        xr = width - inset
-        yb = height - inset
+    base = base_image.convert("RGBA")
+    with Image.open(frame_path) as source:
+        overlay = source.convert("RGBA")
+        if overlay.size != base.size:
+            overlay = overlay.resize(base.size, Image.Resampling.LANCZOS)
+        return Image.alpha_composite(base, overlay)
 
-        draw.line((inset, inset, inset + corner_len, inset), fill=gold, width=4)
-        draw.line((inset, inset, inset, inset + corner_len), fill=gold, width=4)
-        draw.line((xr, inset, xr - corner_len, inset), fill=gold, width=4)
-        draw.line((xr, inset, xr, inset + corner_len), fill=gold, width=4)
 
-        draw.line((inset, yb, inset + corner_len, yb), fill=gold, width=4)
-        draw.line((inset, yb, inset, yb - corner_len), fill=gold, width=4)
-        draw.line((xr, yb, xr - corner_len, yb), fill=gold, width=4)
-        draw.line((xr, yb, xr, yb - corner_len), fill=gold, width=4)
-
-        mid_y = height // 2
-        for x in (63, width - 63):
-            draw.polygon(
-                [
-                    (x, mid_y - 9),
-                    (x + 7, mid_y),
-                    (x, mid_y + 9),
-                    (x - 7, mid_y),
-                ],
-                outline=red,
-            )
-        return
-
-    if style == "journal":
-        draw.rounded_rectangle(
-            (52, 47, width - 52, height - 47),
-            radius=30,
-            outline=muted,
-            width=2,
-        )
-
-        x1, y1, x2, y2 = 64, 59, width - 64, height - 59
-        dash, gap = 18, 12
-
-        x = x1
-        while x < x2:
-            draw.line((x, y1, min(x + dash, x2), y1), fill=soft_gold, width=2)
-            draw.line((x, y2, min(x + dash, x2), y2), fill=soft_gold, width=2)
-            x += dash + gap
-
-        y = y1
-        while y < y2:
-            draw.line((x1, y, x1, min(y + dash, y2)), fill=soft_gold, width=2)
-            draw.line((x2, y, x2, min(y + dash, y2)), fill=soft_gold, width=2)
-            y += dash + gap
-
-        # Subtle paper-tape details live on the outer margin only.
-        draw.polygon(
-            [(390, 40), (505, 40), (495, 58), (382, 58)],
-            fill=(238, 224, 190),
-        )
-        draw.polygon(
-            [
-                (575, height - 58),
-                (700, height - 58),
-                (690, height - 40),
-                (565, height - 40),
-            ],
-            fill=(238, 224, 190),
-        )
+def apply_travel_card_frame_bytes(base_bytes, style):
+    """Apply a PNG frame to one already-rendered base card and return JPEG."""
+    with Image.open(io.BytesIO(base_bytes)) as source:
+        result = apply_travel_card_frame(source, style)
+    buffer = io.BytesIO()
+    result.convert("RGB").save(
+        buffer,
+        format="JPEG",
+        quality=93,
+        optimize=True,
+        progressive=True,
+    )
+    return buffer.getvalue()
 
 
 def fit_card_lines(draw, text, max_width, max_lines, start_size, min_size, bold=False):
@@ -5593,7 +5830,6 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
     city = data.get("city") or {}
     route = data.get("route") or {}
     completed = data.get("completed") or []
-    bonuses = data.get("bonuses") or []
 
     city_name = clean_card_text(city_display_ru(city)).upper()
     title = clean_card_text(
@@ -5601,7 +5837,6 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
     )
     caption = clean_card_text(caption)
 
-    xp = earned_xp(quest, completed, bonuses) if quest else 0
     distance = fmt_distance(float(route.get("distance_m") or 0))
     duration = clean_card_text(data.get("duration") or "")
     stop_count = len(quest.get("stops", []))
@@ -5614,13 +5849,6 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
         fill=paper,
     )
     draw.rectangle((40, 35, 55, 1315), fill=red)
-
-    draw_travel_card_frame(
-        draw,
-        frame_style,
-        width=width,
-        height=height,
-    )
 
     # Top identity.
     draw.text((78, 68), "CITYQUEST CHINA", font=kicker_font, fill=gold)
@@ -5647,7 +5875,7 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
     # Stats as proper cards, no emoji/symbol glyph dependency.
     stats = [
         ("МИССИИ", f"{len(completed)}/{stop_count}"),
-        ("XP", str(xp)),
+        ("ФОТО", str(photo_count)),
         ("МАРШРУТ", distance),
         ("ВРЕМЯ", duration or "—"),
     ]
@@ -5791,8 +6019,9 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
         fill=muted,
     )
 
+    result = apply_travel_card_frame(image, frame_style)
     buffer = io.BytesIO()
-    image.save(
+    result.convert("RGB").save(
         buffer,
         format="JPEG",
         quality=93,
@@ -5840,13 +6069,11 @@ async def create_and_save_travel_card(bot, user_id, data, caption_override=None,
     if not images:
         return None, None
 
-    frame_style = (
+    frame_style = normalize_travel_card_style(
         str(style_override).strip()
         if style_override is not None
         else str(data.get("travel_card_style") or "none").strip()
     )
-    if frame_style not in TRAVEL_CARD_STYLES:
-        frame_style = "none"
 
     card_bytes = render_travel_card(
         data,
@@ -5869,11 +6096,13 @@ async def create_and_save_travel_card(bot, user_id, data, caption_override=None,
 
 def travel_card_style_keyboard(current_style="none"):
     kb = InlineKeyboardBuilder()
+    current_style = normalize_travel_card_style(current_style)
 
     for key, label in [
-        ("none", "Без рамки"),
-        ("chinese", "Тонкая китайская"),
-        ("journal", "Travel-journal"),
+        ("none", "▫️ Без рамки"),
+        ("chinese_seal", "🧧 Китайская печать"),
+        ("ink_travel", "🖌 Тушь и путешествие"),
+        ("china_journal", "🧳 Travel Journal"),
     ]:
         prefix = "✅ " if key == current_style else ""
         kb.button(
@@ -5944,7 +6173,7 @@ def passport_main_keyboard(city_groups, has_active=False):
         city = short_text(group["city"], 30)
         missions = f"{group['completed']}/{group['total']}"
         kb.button(
-            text=f"🧧 {city} · {missions} · {group['xp']} XP",
+            text=f"🧧 {city} · {missions} · {group['photos']} фото",
             callback_data=f"passport_city:{group['latest_id']}",
         )
 
@@ -5968,6 +6197,7 @@ def passport_city_keyboard(records):
         )
 
     kb.button(text="🎒 Все города", callback_data="my_quests")
+    kb.button(text="🏠 Главное меню", callback_data="home")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -5991,6 +6221,24 @@ def passport_quest_keyboard(record_id, city_anchor_id, has_card=False, has_photo
         callback_data=f"passport_city:{int(city_anchor_id)}",
     )
     kb.button(text="🎒 Все города", callback_data="my_quests")
+    kb.button(text="🏠 Главное меню", callback_data="home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def passport_media_keyboard(record_id, city_anchor_id):
+    """Navigation shown after archive photos/cards so the user never gets stuck."""
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text="⬅️ К этому квесту",
+        callback_data=f"passport_quest:{int(record_id)}",
+    )
+    kb.button(
+        text="🧧 К городской печати",
+        callback_data=f"passport_city:{int(city_anchor_id)}",
+    )
+    kb.button(text="🎒 Все города", callback_data="my_quests")
+    kb.button(text="🏠 Главное меню", callback_data="home")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -6029,7 +6277,7 @@ def draw_city_seal(draw, x, y, size, red, paper):
     draw.ellipse((cx-r, cy-r, cx+r, cy+r), fill=red)
 
 
-def render_passport_card(city_groups, total_missions, total_xp):
+def render_passport_card(city_groups, total_missions, total_photos):
     width = 1080
     height = 760
 
@@ -6075,7 +6323,10 @@ def render_passport_card(city_groups, total_missions, total_xp):
             str(total_missions),
             ru_count_word(total_missions, "МИССИЯ", "МИССИИ", "МИССИЙ"),
         ),
-        (str(total_xp), "XP"),
+        (
+            str(total_photos),
+            ru_count_word(total_photos, "ФОТО", "ФОТО", "ФОТО"),
+        ),
     ]
 
     stat_w = 280
@@ -6139,7 +6390,7 @@ def render_passport_card(city_groups, total_missions, total_xp):
 
         draw.text(
             (x + 18, y + 104),
-            f"{group['completed']}/{group['total']}  ·  {group['xp']} XP",
+            f"{group['completed']}/{group['total']} миссий  ·  {group['photos']} фото",
             font=small_font,
             fill=muted,
         )
@@ -6192,7 +6443,6 @@ async def send_passport_quest_detail(message, user_id, record_id):
     )
 
     total = len(quest.get("stops") or [])
-    xp = int(record.get("xp") or 0)
     distance = fmt_distance(float(route.get("distance_m") or 0))
     duration = str(payload.get("duration") or "—")
     date = format_passport_date(record.get("finished_at"))
@@ -6208,7 +6458,6 @@ async def send_passport_quest_detail(message, user_id, record_id):
         f"🏮 <b>{esc(record.get('title') or 'CityQuest')}</b>\n"
         f"📅 {esc(date or 'Дата не сохранена')}\n"
         f"✅ Миссии: <b>{len(completed)}/{total}</b>\n"
-        f"⭐ XP: <b>{xp}</b>\n"
         f"📷 Фото-трофеи: <b>{len(photos)}</b>\n"
         f"🚶 Маршрут: <b>{esc(distance)}</b>\n"
         f"⏱ Время: <b>{esc(duration)}</b>"
@@ -6315,25 +6564,14 @@ async def send_quest(message, state):
         f"{mode_block}"
     )
 
-    for i in range(len(quest["stops"])):
-        await send_stop_card(message, quest, route, i)
-
-        # In compact/explorer mode add lightweight tasks between real POIs.
-        field_missions = quest.get("field_missions") or []
-        if i < len(field_missions):
-            field = field_missions[i]
-            await message.answer(
-                f"🧭 <b>По пути · {esc(field['title'])}</b>\n\n"
-                f"{esc(field['text'])}\n\n"
-                "Это небольшое задание по пути — отдельная остановка для него не нужна."
-            )
-
     await state.update_data(completed=[], bonuses=[], photos={}, photo_versions={})
     await state.set_state(QuestForm.quest_active)
     await persist_active_state(message.from_user.id, state)
     await message.answer(
-        checklist_text(quest, [], [], {}),
-        reply_markup=checklist_keyboard(quest, []),
+        "✅ <b>Квест готов.</b>\n\n"
+        "Маршрут сохранён. Открывай миссии по одной — первая появится "
+        "внизу чата, поэтому ничего прокручивать назад не придётся.",
+        reply_markup=quest_launch_keyboard(quest),
     )
 
 
@@ -6660,7 +6898,7 @@ async def interests_continue(callback: CallbackQuery, state: FSMContext):
     )
 
 
-async def generate_quest_for_start(
+async def _generate_quest_for_start(
     message,
     state,
     user_id,
@@ -6674,6 +6912,18 @@ async def generate_quest_for_start(
     interests = data.get("interests", [])
     style = data.get("style")
     candidates = data.get("candidates", [])
+
+    city_center = {
+        "lat": float(city["lat"]),
+        "lon": float(city["lon"]),
+    }
+    route_origin = start_point or city_center
+    await state.update_data(
+        user_location=start_point if start_mode == "location" else None,
+        poi_search_center=route_origin,
+        route_origin=route_origin,
+        city_center=city_center,
+    )
 
     await state.set_state(QuestForm.generating)
 
@@ -6690,15 +6940,17 @@ async def generate_quest_for_start(
             reply_markup=ReplyKeyboardRemove(),
         )
 
-        try:
-            nearby_candidates = await search_places(
+        ok, nearby_candidates = await soft_deadline(
+            search_places(
                 city,
                 interests,
                 duration,
                 start_point=start_point,
-            )
-        except Exception:
-            logger.exception("Places near start")
+            ),
+            timeout=30,
+            label="cascading POI search near start",
+        )
+        if not ok:
             nearby_candidates = []
 
         if nearby_candidates:
@@ -6762,7 +7014,7 @@ async def generate_quest_for_start(
             duration,
             start_point=start_point,
         ),
-        timeout=18,
+        timeout=38,
         label=f"route generation: {city_display_ru(city)}",
     )
     if ok and route_result:
@@ -6871,7 +7123,7 @@ async def generate_quest_for_start(
                 selected,
                 avoid_missions=avoid_missions,
             ),
-            timeout=35,
+            timeout=45,
         )
     except asyncio.TimeoutError:
         logger.warning("Quest AI hard timeout; using safe templates")
@@ -6900,6 +7152,38 @@ async def generate_quest_for_start(
 
     await safe_status_edit(status, "✅ <b>Квест готов — можно начинать!</b>")
     await send_quest(message, state)
+
+
+async def generate_quest_for_start(
+    message,
+    state,
+    user_id,
+    start_point=None,
+    start_mode="center",
+    start_label=None,
+):
+    """Per-user lock around the complete, expensive generation pipeline."""
+    lock_key = int(user_id)
+    if lock_key in GENERATING_USERS:
+        await message.answer(
+            "⏳ Квест уже создаётся. Подожди немного — повторно запускать поиск не нужно.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        logger.info("Duplicate quest generation suppressed for user %s", user_id)
+        return
+
+    GENERATING_USERS.add(lock_key)
+    try:
+        await _generate_quest_for_start(
+            message,
+            state,
+            user_id,
+            start_point=start_point,
+            start_mode=start_mode,
+            start_label=start_label,
+        )
+    finally:
+        GENERATING_USERS.discard(lock_key)
 
 
 @router.callback_query(F.data.startswith("style:"))
@@ -7028,7 +7312,7 @@ async def start_location_received(message: Message, state: FSMContext):
     start_point = point_from_location(message.location)
     distance_from_city = haversine(start_point, city)
 
-    if distance_from_city > 150_000:
+    if distance_from_city > LOCATION_WARN_DISTANCE_M:
         await state.set_state(QuestForm.choosing_start)
         await message.answer(
             f"📍 Эта геолокация находится примерно в "
@@ -7040,6 +7324,14 @@ async def start_location_received(message: Message, state: FSMContext):
             reply_markup=start_point_keyboard(),
         )
         return
+
+    if distance_from_city > LOCATION_ACCEPT_DISTANCE_M:
+        await message.answer(
+            f"⚠️ Точка находится примерно в <b>{fmt_distance(distance_from_city)}</b> "
+            f"от центра <b>{esc(city_display_ru(city))}</b>. Это заметно далеко, "
+            "но я попробую собрать квест непосредственно вокруг присланной геолокации.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
 
     await message.answer(
         "✅ Геолокация принята. Ищу удобный маршрут от твоей точки.",
@@ -7211,6 +7503,14 @@ async def manual_start_pick(callback: CallbackQuery, state: FSMContext):
         "lon": float(candidate["lon"]),
     }
     start_label = start_candidate_name(candidate)
+    distance_from_city = haversine(start_point, city)
+
+    if distance_from_city > LOCATION_ACCEPT_DISTANCE_M:
+        await callback.message.answer(
+            f"⚠️ Выбранное место примерно в <b>{fmt_distance(distance_from_city)}</b> "
+            f"от центра <b>{esc(city_display_ru(city))}</b>. Поиск будет идти вокруг "
+            "самого места, а не вокруг центральной точки города."
+        )
 
     await callback.message.answer(
         f"✅ <b>Точка старта подтверждена:</b> {esc(start_label)}\n"
@@ -7691,7 +7991,7 @@ async def bonus_toggle(callback: CallbackQuery, state: FSMContext):
         msg = "Бонус снят"
     else:
         bonuses.append(idx)
-        msg = "Бонус +10 XP 🎁"
+        msg = "Дополнительное задание выполнено 🎁"
 
     await state.update_data(bonuses=sorted(set(bonuses)))
     await persist_active_state(callback.from_user.id, state)
@@ -8139,7 +8439,6 @@ async def quest_finish(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         "🏆 <b>CityQuest завершён!</b>\n\n"
         f"✅ Миссии: <b>{len(completed)}/{len(quest['stops'])}</b>\n"
-        f"⭐ XP: <b>{earned_xp(quest, completed, bonuses)}/{total_xp(quest)}</b>\n"
         f"📷 Фото-трофеи: <b>{len(photos)}</b>\n\n"
         f"🎁 <b>Финальный штрих:</b> {esc(quest['final_challenge'])}"
     )
@@ -8237,7 +8536,7 @@ async def my_quests(callback: CallbackQuery, state: FSMContext):
     groups = passport_city_groups(records)
 
     total_missions = sum(group["completed"] for group in groups)
-    total_xp = sum(int(record.get("xp") or 0) for record in records)
+    total_photos = sum(int(record.get("photos") or 0) for record in records)
 
     if not records:
         lines = [
@@ -8267,7 +8566,7 @@ async def my_quests(callback: CallbackQuery, state: FSMContext):
     passport_bytes = render_passport_card(
         groups,
         total_missions=total_missions,
-        total_xp=total_xp,
+        total_photos=total_photos,
     )
 
     city_word = ru_count_word(
@@ -8282,12 +8581,18 @@ async def my_quests(callback: CallbackQuery, state: FSMContext):
         "миссии выполнено",
         "миссий выполнено",
     )
+    photo_word = ru_count_word(
+        total_photos,
+        "фото-трофей",
+        "фото-трофея",
+        "фото-трофеев",
+    )
 
     caption = (
         "🎒 <b>МОИ ПРИКЛЮЧЕНИЯ</b>\n\n"
         f"<b>{len(groups)}</b> {city_word}\n"
         f"<b>{total_missions}</b> {mission_word}\n"
-        f"⭐ <b>{total_xp} XP</b>\n\n"
+        f"📷 <b>{total_photos}</b> {photo_word}\n\n"
         "Нажми на городскую печать в списке ниже."
     )
 
@@ -8343,19 +8648,16 @@ async def passport_city(callback: CallbackQuery):
 
     completed_total = 0
     missions_total = 0
-    xp_total = 0
 
     for record in records:
         done, total = completed_record_progress(record)
         completed_total += done
         missions_total += total
-        xp_total += int(record.get("xp") or 0)
 
     await callback.message.answer(
         f"🧧 <b>ГОРОДСКАЯ ПЕЧАТЬ · {esc(city)}</b>\n\n"
         f"🏮 Завершено квестов: <b>{len(records)}</b>\n"
         f"✅ Миссии: <b>{completed_total}/{missions_total}</b>\n"
-        f"⭐ XP: <b>{xp_total}</b>\n\n"
         "Выбери конкретный квест:",
         reply_markup=passport_city_keyboard(records),
     )
@@ -8395,10 +8697,20 @@ async def passport_card(callback: CallbackQuery):
 
     payload = record.get("payload") or {}
     path = payload.get("travel_card_path")
+    city_records = db_completed_for_city(
+        callback.from_user.id,
+        str(record.get("city") or "Китай"),
+    )
+    city_anchor_id = (
+        int(city_records[0]["id"])
+        if city_records
+        else int(record_id)
+    )
 
     if not path or not os.path.exists(path):
         await callback.message.answer(
-            "🖼 Для этого квеста сохранённая travel-card не найдена."
+            "🖼 Для этого квеста сохранённая travel-card не найдена.",
+            reply_markup=passport_media_keyboard(record_id, city_anchor_id),
         )
         return
 
@@ -8415,11 +8727,13 @@ async def passport_card(callback: CallbackQuery):
                 f"🖼 <b>{esc(record.get('title') or 'CityQuest')}</b>\n"
                 f"🧧 {esc(record.get('city') or 'Китай')}"
             ),
+            reply_markup=passport_media_keyboard(record_id, city_anchor_id),
         )
     except Exception:
         logger.exception("Failed to open passport travel card")
         await callback.message.answer(
-            "🤔 Не получилось открыть эту travel-card."
+            "🤔 Не получилось открыть эту travel-card.",
+            reply_markup=passport_media_keyboard(record_id, city_anchor_id),
         )
 
 
@@ -8441,9 +8755,21 @@ async def passport_photos(callback: CallbackQuery):
     payload = record.get("payload") or {}
     quest = payload.get("quest") or {}
     photos = payload.get("photos") or {}
+    city_records = db_completed_for_city(
+        callback.from_user.id,
+        str(record.get("city") or "Китай"),
+    )
+    city_anchor_id = (
+        int(city_records[0]["id"])
+        if city_records
+        else int(record_id)
+    )
 
     if not photos:
-        await callback.message.answer("📷 В этом квесте фото-трофеев нет.")
+        await callback.message.answer(
+            "📷 В этом квесте фото-трофеев нет.",
+            reply_markup=passport_media_keyboard(record_id, city_anchor_id),
+        )
         return
 
     await callback.message.answer(
@@ -8489,6 +8815,11 @@ async def passport_photos(callback: CallbackQuery):
                 key,
             )
 
+    await callback.message.answer(
+        "🧭 <b>Куда дальше?</b>",
+        reply_markup=passport_media_keyboard(record_id, city_anchor_id),
+    )
+
 
 
 @router.callback_query(F.data == "card_style_menu")
@@ -8502,9 +8833,7 @@ async def card_style_menu(callback: CallbackQuery):
         )
         return
 
-    current_style = str(payload.get("travel_card_style") or "none")
-    if current_style not in TRAVEL_CARD_STYLES:
-        current_style = "none"
+    current_style = normalize_travel_card_style(payload.get("travel_card_style"))
 
     await callback.message.answer(
         "🎨 <b>Оформление travel-открытки</b>\n\n"
@@ -8545,15 +8874,18 @@ async def card_style_compare(callback: CallbackQuery):
         if not images:
             raise RuntimeError("No photos for frame comparison")
 
-        previews = []
-        for style in ("none", "chinese", "journal"):
-            card_bytes = render_travel_card(
-                payload,
-                images,
-                caption,
-                frame_style=style,
-            )
-            previews.append((style, card_bytes))
+        # Render layout once. Every preview uses these exact same pixels and
+        # differs only by the local transparent PNG overlay.
+        base_card_bytes = render_travel_card(
+            payload,
+            images,
+            caption,
+            frame_style="none",
+        )
+        previews = [
+            (style, apply_travel_card_frame_bytes(base_card_bytes, style))
+            for style in ("chinese_seal", "ink_travel", "china_journal")
+        ]
 
         await safe_status_edit(status, 
             "✅ <b>Три варианта готовы.</b>\n"
@@ -8572,9 +8904,7 @@ async def card_style_compare(callback: CallbackQuery):
                 ),
             )
 
-        current_style = str(payload.get("travel_card_style") or "none")
-        if current_style not in TRAVEL_CARD_STYLES:
-            current_style = "none"
+        current_style = normalize_travel_card_style(payload.get("travel_card_style"))
 
         await callback.message.answer(
             "🎨 <b>Какой вариант оставить?</b>",
@@ -8591,14 +8921,16 @@ async def card_style_compare(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("card_style:"))
 async def card_style_choose(callback: CallbackQuery):
-    style = callback.data.split(":", 1)[1]
+    raw_style = callback.data.split(":", 1)[1]
 
-    if style not in TRAVEL_CARD_STYLES:
+    if raw_style not in TRAVEL_CARD_STYLES and raw_style not in LEGACY_TRAVEL_CARD_STYLES:
         await callback.answer(
             "Неизвестный стиль.",
             show_alert=True,
         )
         return
+
+    style = normalize_travel_card_style(raw_style)
 
     await callback.answer()
 
@@ -8653,9 +8985,9 @@ async def card_style_choose(callback: CallbackQuery):
         and current_caption != ai_caption
     )
 
-    await safe_status_edit(status, 
-        f"✅ <b>Сохранено:</b> "
-        f"{esc(travel_card_style_label(style))}"
+    await safe_status_edit(status,
+        f"✅ <b>Оформление сохранено:</b> "
+        f"«{esc(travel_card_style_label(style))}»"
     )
 
     await callback.message.answer_photo(
@@ -8915,7 +9247,7 @@ async def about(callback: CallbackQuery):
         "• Названия и координаты мест берутся только из Geoapify; если AI-миссия не проходит проверку, включается безопасный шаблон.\n"
         "• Vision AI разбирает фото, меню, надписи, символы, достопримечательности и памятники.\n"
         "• Если AI не уверен — бот даёт простую китайскую фразу, которую можно показать человеку.\n"
-        "• Активный квест, прогресс, XP и фото сохраняются между перезапусками BotHost.\n"
+        "• Активный квест, прогресс и фото сохраняются между перезапусками BotHost.\n"
         "• После завершения квеста бот собирает travel-открытку из фото-трофеев.\n"
         "• Блок «Впечатления» можно заменить своим текстом и вернуть готовый вариант.\n"
         "• Для travel-открытки можно сравнить три оформления и сохранить понравившееся.\n"
@@ -8935,7 +9267,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Starting CityQuest China v10.3 Russian Editorial Polish")
+    logger.info("Starting CityQuest China v10.4 Core Optimization")
     await dp.start_polling(bot)
 
 
