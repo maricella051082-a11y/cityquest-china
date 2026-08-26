@@ -17,6 +17,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -56,6 +57,36 @@ if not GROQ_API_KEY:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cityquest")
 router = Router()
+
+async def safe_status_edit(status_message, text, reply_markup=None):
+    """
+    Telegram Desktop / some chat contexts may reject editing a bot message.
+    A status update must never crash the whole quest flow: if editing is
+    unavailable, send the new status as a fresh message instead.
+    """
+    try:
+        return await status_message.edit_text(
+            text,
+            reply_markup=reply_markup,
+        )
+    except TelegramBadRequest as exc:
+        logger.warning(
+            "Status message could not be edited; sending a new one instead: %s",
+            exc,
+        )
+        return await status_message.answer(
+            text,
+            reply_markup=reply_markup,
+        )
+    except Exception:
+        logger.exception(
+            "Status edit failed unexpectedly; sending a new message instead"
+        )
+        return await status_message.answer(
+            text,
+            reply_markup=reply_markup,
+        )
+
 
 
 ACTIVE_DATA_KEYS = (
@@ -6180,7 +6211,7 @@ async def city_received(message: Message, state: FSMContext):
         candidates = []
 
     if not candidates:
-        await status.edit_text(
+        await safe_status_edit(status, 
             "🤔 Не удалось быстро подтвердить город.\n\n"
             "Попробуй название с провинцией, например: Langzhong, Sichuan, "
             "или другое написание: Сиань · 西安 · Xi'an."
@@ -6215,7 +6246,7 @@ async def city_received(message: Message, state: FSMContext):
     secondary = city_display_secondary(best)
     secondary_line = f"\n{esc(secondary)}" if secondary else ""
 
-    await status.edit_text(
+    await safe_status_edit(status, 
         f"🇨🇳 <b>Нашёл город!</b>\n\n"
         f"<b>{esc(display_ru)}</b>"
         f"{secondary_line}\n"
@@ -6385,7 +6416,7 @@ async def interests_continue(callback: CallbackQuery, state: FSMContext):
         places = []
 
     if not places:
-        await status.edit_text(
+        await safe_status_edit(status, 
             "🤔 На карте пока не удалось найти ни одной подходящей подробно размеченной точки в этом городе.\n\n"
             "Это ограничение данных карты, а не оценка самого города. "
             "Попробуй другой город или вернись к нему позже."
@@ -6396,7 +6427,7 @@ async def interests_continue(callback: CallbackQuery, state: FSMContext):
     await state.update_data(candidates=places, pool_mode=pool_mode)
     await state.set_state(QuestForm.choosing_style)
 
-    await status.edit_text(
+    await safe_status_edit(status, 
         f"📍 <b>Нашёл {len(places)} кандидата</b>\n\n"
         f"{candidate_summary(places)}\n\n"
         f"{pool_mode_message(pool_mode)}\n\n"
@@ -6456,7 +6487,7 @@ async def generate_quest_for_start(
             )
         else:
             await state.set_state(QuestForm.choosing_start)
-            await status.edit_text(
+            await safe_status_edit(status, 
                 "🤔 Не получилось найти достаточно размеченных мест рядом с этой точкой."
             )
             await message.answer(
@@ -6465,7 +6496,7 @@ async def generate_quest_for_start(
             )
             return
 
-        await status.edit_text(
+        await safe_status_edit(status, 
             f"🔎 <b>Рядом найдено {len(candidates)} подходящих кандидатов.</b>\n\n"
             "Теперь проверяю, можно ли соединить лучшие из них удобным пешим маршрутом "
             "прямо от твоей точки старта."
@@ -6494,7 +6525,7 @@ async def generate_quest_for_start(
     )
 
     if visited_pois and repeat_count:
-        await status.edit_text(
+        await safe_status_edit(status, 
             f"🧭 <b>Учитываю прошлые прогулки по {esc(city_display_ru(city))}.</b>\n\n"
             f"Новых кандидатов: <b>{fresh_count}</b>.\n"
             f"Уже встречались в прошлых квестах: <b>{repeat_count}</b>.\n\n"
@@ -6521,7 +6552,7 @@ async def generate_quest_for_start(
         await state.set_state(QuestForm.choosing_start)
 
         if start_point:
-            await status.edit_text(
+            await safe_status_edit(status, 
                 "🚶 <b>От этой точки не получилось собрать хороший пеший квест.</b>\n\n"
                 "Я не хочу отправлять тебя далеко только ради первой миссии."
             )
@@ -6530,7 +6561,7 @@ async def generate_quest_for_start(
                 reply_markup=start_point_keyboard(),
             )
         else:
-            await status.edit_text(
+            await safe_status_edit(status, 
                 "🗺 Не удалось подтвердить удобный маршрут из центральной части города."
             )
             await message.answer(
@@ -6591,7 +6622,7 @@ async def generate_quest_for_start(
             f"~{fmt_minutes(access['time_s']/60)}."
         )
 
-    await status.edit_text(
+    await safe_status_edit(status, 
         f"🔎 <b>{esc(ADAPTIVE_MODE_LABELS.get(adaptive_mode, 'Квест'))}</b>\n\n"
         f"Старт: <b>{start_description}</b>.\n"
         f"Подтверждённых точек: <b>{len(selected)}</b>.\n"
@@ -6605,7 +6636,7 @@ async def generate_quest_for_start(
 
     selected = await enrich_final_places(selected)
 
-    await status.edit_text(
+    await safe_status_edit(status, 
         f"🤖 <b>Точки проверены.</b>\n\n"
         f"Старт: <b>{start_description}</b>.\n"
         f"Пешком ~{fmt_distance(route['distance_m'])} · "
@@ -6657,7 +6688,7 @@ async def generate_quest_for_start(
         start_label=str(start_label or "").strip(),
     )
 
-    await status.edit_text("✅ <b>Квест готов!</b>")
+    await safe_status_edit(status, "✅ <b>Квест готов!</b>")
     await send_quest(message, state)
 
 
@@ -6721,7 +6752,7 @@ async def handle_manual_start_query(message: Message, state: FSMContext, query: 
         candidates = []
 
     if not candidates:
-        await status.edit_text(
+        await safe_status_edit(status, 
             f"🤔 <b>Не удалось получить подтверждённую точку в {esc(city_display_ru(city))}.</b>\n\n"
             "Geoapify мог не найти место или не ответить вовремя. Попробуй:\n"
             "• полное название отеля/места;\n"
@@ -6740,7 +6771,7 @@ async def handle_manual_start_query(message: Message, state: FSMContext, query: 
         start_query=raw,
     )
 
-    await status.edit_text(
+    await safe_status_edit(status, 
         manual_start_candidate_text(
             candidates[0],
             city,
@@ -7157,14 +7188,14 @@ async def museum_text_received(message: Message, state: FSMContext):
         if not answer:
             raise RuntimeError("Empty museum text AI response")
 
-        await status.edit_text(
+        await safe_status_edit(status, 
             "🏛 <b>Что удалось понять</b>\n\n"
             f"{esc(answer)}"
         )
 
     except Exception:
         logger.exception("Museum text analysis failed")
-        await status.edit_text(
+        await safe_status_edit(status, 
             "🤔 Сейчас не получилось разобрать текст. "
             "Можно попробовать ещё раз или спросить сотрудника готовой фразой."
         )
@@ -7305,7 +7336,7 @@ async def replace_point_confirm(callback: CallbackQuery, state: FSMContext):
         candidate, new_route = None, None
 
     if not candidate or not new_route:
-        await status.edit_text(
+        await safe_status_edit(status, 
             "🤔 <b>Удобной замены сейчас не нашлось.</b>\n\n"
             "Я оставила текущую точку как есть, чтобы не ухудшать маршрут. "
             "Можно попробовать заменить её позже."
@@ -7320,7 +7351,7 @@ async def replace_point_confirm(callback: CallbackQuery, state: FSMContext):
         )
     except Exception:
         logger.exception("Replacement stop construction failed")
-        await status.edit_text(
+        await safe_status_edit(status, 
             "🤔 Нашла альтернативу на карте, но не получилось безопасно "
             "собрать для неё миссию. Текущая точка оставлена без изменений."
         )
@@ -7368,7 +7399,7 @@ async def replace_point_confirm(callback: CallbackQuery, state: FSMContext):
     await persist_active_state(callback.from_user.id, state)
 
     new_name = str(new_stop.get("name_ru") or "")
-    await status.edit_text(
+    await safe_status_edit(status, 
         "✅ <b>Точка заменена.</b>\n\n"
         f"Было: <s>{esc(old_name)}</s>\n"
         f"Стало: <b>{esc(new_name)}</b>\n\n"
@@ -7625,13 +7656,13 @@ async def vision_callback(callback: CallbackQuery, state: FSMContext):
             latest_photos.get(str(idx)) != request_file_id
             or int(latest_versions.get(str(idx), 0)) != request_version
         ):
-            await status.edit_text(
+            await safe_status_edit(status, 
                 "🔄 Пока я анализировал снимок, ты уже заменил фото. "
                 "Старый результат не показываю."
             )
             return
 
-        await status.edit_text(
+        await safe_status_edit(status, 
             "🤖 Сейчас не получилось разобрать фото.\n\n"
             "Можно попробовать ещё раз или просто продолжить квест."
         )
@@ -7659,13 +7690,13 @@ async def vision_callback(callback: CallbackQuery, state: FSMContext):
         latest_photos.get(str(idx)) != request_file_id
         or int(latest_versions.get(str(idx), 0)) != request_version
     ):
-        await status.edit_text(
+        await safe_status_edit(status, 
             "🔄 Пока я анализировал снимок, ты уже заменил фото. "
             "Старый AI-разбор скрыт — используй кнопки под новым снимком."
         )
         return
 
-    await status.edit_text(render_vision_result(result, mode))
+    await safe_status_edit(status, render_vision_result(result, mode))
 
     keys = followup_phrase_keys(mode)
     if keys:
@@ -7821,7 +7852,7 @@ async def vision_free_callback(callback: CallbackQuery, state: FSMContext):
         result = await analyze_photo_with_groq(image_bytes, mode, generic_stop)
     except Exception:
         logger.exception("Free vision")
-        await status.edit_text(
+        await safe_status_edit(status, 
             "🤖 Сейчас не получилось разобрать фото. Попробуй ещё раз или пришли другой снимок."
         )
         await callback.message.answer(
@@ -7830,7 +7861,7 @@ async def vision_free_callback(callback: CallbackQuery, state: FSMContext):
         )
         return
 
-    await status.edit_text(render_vision_result(result, mode))
+    await safe_status_edit(status, render_vision_result(result, mode))
 
     keys = followup_phrase_keys(mode)
     if keys:
@@ -7905,7 +7936,7 @@ async def quest_finish(callback: CallbackQuery, state: FSMContext):
 
     if card_path and os.path.exists(card_path):
         if card_status:
-            await card_status.edit_text("✅ <b>Travel-открытка готова!</b>")
+            await safe_status_edit(card_status, "✅ <b>Travel-открытка готова!</b>")
 
         with open(card_path, "rb") as f:
             card_bytes = f.read()
@@ -7923,7 +7954,7 @@ async def quest_finish(callback: CallbackQuery, state: FSMContext):
         )
     elif photos:
         if card_status:
-            await card_status.edit_text(
+            await safe_status_edit(card_status, 
                 "🤔 Квест сохранён, но открытку сейчас собрать не получилось. "
                 "Попробуем ещё раз из «Моих приключений» позже."
             )
@@ -8314,7 +8345,7 @@ async def card_style_compare(callback: CallbackQuery):
             )
             previews.append((style, card_bytes))
 
-        await status.edit_text(
+        await safe_status_edit(status, 
             "✅ <b>Три варианта готовы.</b>\n"
             "Посмотри их подряд и выбери оформление ниже."
         )
@@ -8342,7 +8373,7 @@ async def card_style_compare(callback: CallbackQuery):
 
     except Exception:
         logger.exception("Travel card comparison failed")
-        await status.edit_text(
+        await safe_status_edit(status, 
             "🤔 Не получилось собрать три превью. "
             "Можно попробовать выбрать оформление по одному."
         )
@@ -8388,7 +8419,7 @@ async def card_style_choose(callback: CallbackQuery):
         card_path = None
 
     if not card_path:
-        await status.edit_text(
+        await safe_status_edit(status, 
             "🤔 Не получилось пересобрать открытку "
             "с этим оформлением."
         )
@@ -8412,7 +8443,7 @@ async def card_style_choose(callback: CallbackQuery):
         and current_caption != ai_caption
     )
 
-    await status.edit_text(
+    await safe_status_edit(status, 
         f"✅ <b>Сохранено:</b> "
         f"{esc(travel_card_style_label(style))}"
     )
@@ -8512,7 +8543,7 @@ async def custom_impression_received(message: Message, state: FSMContext):
         card_path = None
 
     if not card_path:
-        await status.edit_text(
+        await safe_status_edit(status, 
             "🤔 Не получилось пересобрать открытку. Попробуй ещё раз позже."
         )
         await state.set_state(QuestForm.quest_finished)
@@ -8528,7 +8559,7 @@ async def custom_impression_received(message: Message, state: FSMContext):
     with open(card_path, "rb") as f:
         card_bytes = f.read()
 
-    await status.edit_text(
+    await safe_status_edit(status, 
         "✅ <b>Готово — теперь на открытке твои впечатления.</b>"
     )
 
@@ -8579,7 +8610,7 @@ async def restore_ai_impression(callback: CallbackQuery, state: FSMContext):
         card_path = None
 
     if not card_path:
-        await status.edit_text("🤔 Не получилось пересобрать открытку.")
+        await safe_status_edit(status, "🤔 Не получилось пересобрать открытку.")
         return
 
     payload["travel_caption"] = ai_caption
@@ -8590,7 +8621,7 @@ async def restore_ai_impression(callback: CallbackQuery, state: FSMContext):
     with open(card_path, "rb") as f:
         card_bytes = f.read()
 
-    await status.edit_text("✅ <b>Готовый вариант восстановлен.</b>")
+    await safe_status_edit(status, "✅ <b>Готовый вариант восстановлен.</b>")
 
     await callback.message.answer_photo(
         BufferedInputFile(
@@ -8694,7 +8725,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Starting CityQuest China v10.2.2 No-Hang Route Fallback")
+    logger.info("Starting CityQuest China v10.2.3 Safe Status Messages")
     await dp.start_polling(bot)
 
 
