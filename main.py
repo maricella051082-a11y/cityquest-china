@@ -58,6 +58,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cityquest")
 router = Router()
 GENERATING_USERS = set()
+STATUS_MESSAGE_REPLACEMENTS = {}
 
 POI_SEARCH_RADII_M = (2_000, 5_000, 10_000, 15_000)
 LOCATION_ACCEPT_DISTANCE_M = 35_000
@@ -70,8 +71,15 @@ async def safe_status_edit(status_message, text, reply_markup=None):
     A status update must never crash the whole quest flow: if editing is
     unavailable, send the new status as a fresh message instead.
     """
+    chat = getattr(status_message, "chat", None)
+    original_key = (
+        getattr(chat, "id", None),
+        getattr(status_message, "message_id", None),
+    )
+    target_message = STATUS_MESSAGE_REPLACEMENTS.get(original_key, status_message)
+
     try:
-        return await status_message.edit_text(
+        return await target_message.edit_text(
             text,
             reply_markup=reply_markup,
         )
@@ -80,18 +88,26 @@ async def safe_status_edit(status_message, text, reply_markup=None):
             "Status message could not be edited; sending a new one instead: %s",
             exc,
         )
-        return await status_message.answer(
+        replacement = await target_message.answer(
             text,
             reply_markup=reply_markup,
         )
+        STATUS_MESSAGE_REPLACEMENTS[original_key] = replacement
+        if len(STATUS_MESSAGE_REPLACEMENTS) > 500:
+            STATUS_MESSAGE_REPLACEMENTS.pop(next(iter(STATUS_MESSAGE_REPLACEMENTS)))
+        return replacement
     except Exception:
         logger.exception(
             "Status edit failed unexpectedly; sending a new message instead"
         )
-        return await status_message.answer(
+        replacement = await target_message.answer(
             text,
             reply_markup=reply_markup,
         )
+        STATUS_MESSAGE_REPLACEMENTS[original_key] = replacement
+        if len(STATUS_MESSAGE_REPLACEMENTS) > 500:
+            STATUS_MESSAGE_REPLACEMENTS.pop(next(iter(STATUS_MESSAGE_REPLACEMENTS)))
+        return replacement
 
 
 

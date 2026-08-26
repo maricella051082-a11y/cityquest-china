@@ -114,6 +114,33 @@ class GeoTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Corridor of Little Rainbow", text)
 
 
+class StatusMessageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fallback_message_is_reused_for_later_status_updates(self):
+        class Chat:
+            id = 101
+
+        class Message:
+            chat = Chat()
+            message_id = 202
+
+        original = Message()
+        replacement = Message()
+        replacement.message_id = 203
+        original.edit_text = AsyncMock(side_effect=RuntimeError("not editable"))
+        original.answer = AsyncMock(return_value=replacement)
+        replacement.edit_text = AsyncMock(return_value=replacement)
+        replacement.answer = AsyncMock(return_value=replacement)
+        main.STATUS_MESSAGE_REPLACEMENTS.clear()
+
+        first = await main.safe_status_edit(original, "Первый статус")
+        second = await main.safe_status_edit(original, "Второй статус")
+
+        self.assertIs(first, replacement)
+        self.assertIs(second, replacement)
+        original.answer.assert_awaited_once()
+        replacement.edit_text.assert_awaited_once()
+
+
 class RouteTests(unittest.IsolatedAsyncioTestCase):
     def test_route_rejects_four_monuments_even_in_compact_mode(self):
         monuments = [
