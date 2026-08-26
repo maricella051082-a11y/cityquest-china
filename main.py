@@ -67,6 +67,7 @@ ACTIVE_DATA_KEYS = (
     "interests",
     "start_mode",
     "start_point",
+    "start_label",
     "replacement_history",
     "completed",
     "bonuses",
@@ -842,6 +843,7 @@ class QuestForm(StatesGroup):
     choosing_interests = State()
     choosing_style = State()
     choosing_start = State()
+    waiting_start_text = State()
     generating = State()
     quest_active = State()
     waiting_photo = State()
@@ -1514,11 +1516,12 @@ def start_point_keyboard():
                     request_location=True,
                 )
             ],
-            [KeyboardButton(text="🏙 Начать из центра города")],
+            [KeyboardButton(text="⌨️ Ввести место или адрес")],
+            [KeyboardButton(text="🏙 Начать из центральной части города")],
         ],
         resize_keyboard=True,
         one_time_keyboard=True,
-        input_field_placeholder="Выбери точку старта",
+        input_field_placeholder="Название отеля, места или адрес",
     )
 
 
@@ -1529,10 +1532,81 @@ def point_from_location(location):
     }
 
 
-def start_point_label(mode):
+def start_point_label(mode, label=None):
     if mode == "location":
         return "📍 от твоей геолокации"
+    if mode == "manual":
+        value = str(label or "").strip()
+        return f"⌨️ от {value}" if value else "⌨️ от указанного места"
     return "🏙 из центральной части города"
+
+
+def manual_start_confirm_keyboard(candidate_count):
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text="✅ Начать отсюда",
+        callback_data="manual_start_pick:0",
+    )
+    if int(candidate_count or 0) > 1:
+        kb.button(
+            text="🔎 Другие варианты",
+            callback_data="manual_start_more",
+        )
+    kb.button(
+        text="✏️ Ввести другое место",
+        callback_data="manual_start_retry",
+    )
+    kb.button(
+        text="🏙 Из центральной части города",
+        callback_data="manual_start_center",
+    )
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def manual_start_choices_keyboard(candidates):
+    kb = InlineKeyboardBuilder()
+
+    for i, candidate in enumerate(candidates[:5]):
+        label = short_text(start_candidate_name(candidate), 38)
+        kb.button(
+            text=f"{i+1}. {label}",
+            callback_data=f"manual_start_pick:{i}",
+        )
+
+    kb.button(
+        text="✏️ Ввести другое место",
+        callback_data="manual_start_retry",
+    )
+    kb.button(
+        text="🏙 Из центральной части города",
+        callback_data="manual_start_center",
+    )
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def manual_start_candidate_text(candidate, city):
+    name = start_candidate_name(candidate)
+    formatted = str(candidate.get("formatted") or "").strip()
+    distance = float(candidate.get("distance_from_city_m") or 0)
+
+    lines = [
+        "📍 <b>Нашла точку старта</b>",
+        "",
+        f"<b>{esc(name)}</b>",
+    ]
+
+    if formatted and formatted.casefold() != name.casefold():
+        lines.append(esc(formatted))
+
+    lines += [
+        f"📌 Координаты: {candidate['lat']:.5f}, {candidate['lon']:.5f}",
+        f"🏙 От центральной точки {esc(city_display_ru(city))}: ~{esc(fmt_distance(distance))}",
+        "",
+        "Начать квест отсюда?",
+    ]
+    return "\n".join(lines)
 
 
 def clean_category_label(categories):
@@ -1943,6 +2017,193 @@ async def geocode_city_candidates(city_query):
         item.pop("_score", None)
 
     return final[:5]
+
+
+def start_candidate_name(candidate):
+    name = str(candidate.get("name") or "").strip()
+    if name:
+        return name
+
+    formatted = str(candidate.get("formatted") or "").strip()
+    if formatted:
+        return formatted.split(",")[0].strip()
+
+    return "Точка старта"
+
+
+async def _fetch_start_query(session, query, city):
+    url = "https://api.geoapify.com/v1/geocode/search"
+    params = {
+        "text": query,
+        "filter": "countrycode:cn",
+        "bias": f"proximity:{city['lon']},{city['lat']}",
+        "limit": 10,
+        "format": "json",
+        "lang": "en",
+        "apiKey": GEOAPIFY_API_KEY,
+    }
+
+    try:
+        async with session.get(url, params=params) as response:
+            if response.status != 200:
+                logger.warning(
+                    "Start geocode %s HTTP %s",
+                    query,
+                    response.status,
+                )
+                return []
+            data = await response.json()
+            return data.get("results") or []
+    except Exception:
+        logger.exception("Start-point geocode failed for %s", query)
+        return []
+
+
+async def geocode_start_candidates(query, city):
+    """
+    Resolve a hotel/place name or a street address inside the already chosen
+    Chinese city. Geoapify is biased toward that city, then results are
+    validated by distance/admin data before the user confirms one.
+    """
+    raw = str(query or "").strip()
+    if not raw or not city:
+        return []
+
+    city_name = str(city.get("city") or city.get("name") or "").strip()
+    queries = [raw]
+
+    if city_name and normalize_city_text(city_name) not in normalize_city_text(raw):
+        queries.append(f"{raw}, {city_name}, China")
+
+    # Keep API usage small and predictable.
+    dedup_queries = []
+    seen_queries = set()
+    for value in queries[:2]:
+        key = value.casefold().strip()
+        if key and key not in seen_queries:
+            seen_queries.add(key)
+            dedup_queries.append(value)
+
+    timeout = aiohttp.ClientTimeout(
+        total=15,
+        connect=6,
+        sock_connect=6,
+        sock_read=10,
+    )
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            result_sets = await asyncio.gather(
+                *[
+                    _fetch_start_query(session, value, city)
+                    for value in dedup_queries
+                ],
+                return_exceptions=False,
+            )
+    except Exception:
+        logger.exception("Manual start-point lookup session failed")
+        return []
+
+    current_names = {
+        normalize_city_text(city.get("city")),
+        normalize_city_text(city.get("name")),
+        normalize_city_text(city.get("county")),
+        normalize_city_text(city_display_ru(city)),
+    }
+    current_names.discard("")
+
+    collected = {}
+
+    for results in result_sets:
+        for item in results:
+            lat = item.get("lat")
+            lon = item.get("lon")
+            if lat is None or lon is None:
+                continue
+
+            candidate_point = {
+                "lat": float(lat),
+                "lon": float(lon),
+            }
+            distance_m = haversine(candidate_point, city)
+
+            result_names = {
+                normalize_city_text(item.get("city")),
+                normalize_city_text(item.get("county")),
+                normalize_city_text(item.get("district")),
+            }
+            result_names.discard("")
+            admin_match = bool(current_names.intersection(result_names))
+
+            # Tourist start points should be in or reasonably near the chosen
+            # city. A matching administrative label permits a wider radius.
+            max_distance = 150_000 if admin_match else 100_000
+            if distance_m > max_distance:
+                continue
+
+            rank = item.get("rank") or {}
+            confidence = float(rank.get("confidence") or 0)
+            importance = float(rank.get("importance") or 0)
+
+            # Lower is better: closeness dominates, confidence breaks ties.
+            score = (
+                distance_m
+                - confidence * 12_000
+                - importance * 2_000
+                - (18_000 if admin_match else 0)
+            )
+
+            place_id = str(item.get("place_id") or "").strip()
+            dedupe = (
+                place_id
+                or f"{float(lat):.5f}:{float(lon):.5f}"
+            )
+
+            candidate = {
+                "place_id": place_id,
+                "name": item.get("name"),
+                "formatted": item.get("formatted") or raw,
+                "city": item.get("city"),
+                "county": item.get("county"),
+                "district": item.get("district"),
+                "state": item.get("state"),
+                "result_type": item.get("result_type"),
+                "lat": float(lat),
+                "lon": float(lon),
+                "distance_from_city_m": float(distance_m),
+                "_score": float(score),
+            }
+
+            old = collected.get(dedupe)
+            if not old or candidate["_score"] < old["_score"]:
+                collected[dedupe] = candidate
+
+    ranked = sorted(
+        collected.values(),
+        key=lambda item: item.get("_score", 0),
+    )
+
+    # Remove near-duplicate pins returned for the same hotel/entrance.
+    final = []
+    for candidate in ranked:
+        duplicate = False
+        for existing in final:
+            same_name = (
+                poi_history_name(start_candidate_name(candidate))
+                == poi_history_name(start_candidate_name(existing))
+            )
+            if haversine(candidate, existing) < 80 and same_name:
+                duplicate = True
+                break
+
+        if not duplicate:
+            candidate.pop("_score", None)
+            final.append(candidate)
+
+        if len(final) >= 5:
+            break
+
+    return final
 
 
 async def fetch_places_source(session, city, source_key, categories, limit=20, bias_point=None):
@@ -5520,17 +5781,24 @@ def route_summary(route, quest, duration):
 
     start_line = ""
     access_leg = route.get("access_leg")
-    if route.get("start_mode") == "location":
+    start_mode = route.get("start_mode") or "center"
+    start_label = str(route.get("start_label") or "").strip()
+
+    if start_mode == "location":
         start_line = "📍 Старт: <b>от твоей геолокации</b>\n"
-        if access_leg:
-            start_line += (
-                f"🚶 До первой точки: ~{fmt_distance(access_leg['distance_m'])} · "
-                f"~{fmt_minutes(access_leg['time_s']/60)}\n"
-            )
+    elif start_mode == "manual":
+        shown = esc(start_label or "указанное место")
+        start_line = f"⌨️ Старт: <b>от «{shown}»</b>\n"
+
+    if start_mode in {"location", "manual"} and access_leg:
+        start_line += (
+            f"🚶 До первой точки: ~{fmt_distance(access_leg['distance_m'])} · "
+            f"~{fmt_minutes(access_leg['time_s']/60)}\n"
+        )
 
     if len(quest.get("stops", [])) <= 1:
         walk_line = ""
-        if route.get("start_mode") == "location":
+        if start_mode in {"location", "manual"}:
             walk_line = (
                 f"🚶 Пешком до точки: ~{fmt_distance(route['distance_m'])} · "
                 f"~{fmt_minutes(walk)}\n"
@@ -5944,6 +6212,7 @@ async def generate_quest_for_start(
     user_id,
     start_point=None,
     start_mode="center",
+    start_label=None,
 ):
     data = await state.get_data()
     city = data.get("city")
@@ -5955,9 +6224,14 @@ async def generate_quest_for_start(
     await state.set_state(QuestForm.generating)
 
     if start_point:
+        start_source = (
+            "твоей геолокации"
+            if start_mode == "location"
+            else f"указанной точки «{esc(start_label or 'место старта')}»"
+        )
         status = await message.answer(
-            "📍 <b>Подбираю маршрут рядом с тобой…</b>\n\n"
-            "Сначала ищу подходящие реальные места ближе к твоей геолокации, "
+            "📍 <b>Подбираю маршрут от выбранной точки…</b>\n\n"
+            f"Сначала ищу подходящие реальные места ближе к {start_source}, "
             "но сохраняю разнообразие и выбранные интересы.",
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -5985,7 +6259,7 @@ async def generate_quest_for_start(
                 "🤔 Не получилось найти достаточно размеченных мест рядом с этой точкой."
             )
             await message.answer(
-                "Можно отправить геолокацию ещё раз или начать из центральной части города.",
+                "Можно отправить геолокацию, ввести другое место/адрес или начать из центральной части города.",
                 reply_markup=start_point_keyboard(),
             )
             return
@@ -6044,7 +6318,7 @@ async def generate_quest_for_start(
                 "Я не хочу отправлять тебя далеко только ради первой миссии."
             )
             await message.answer(
-                "Попробуй отправить геолокацию ещё раз или начни из центральной части города.",
+                "Попробуй отправить геолокацию, ввести другое место/адрес или начать из центральной части города.",
                 reply_markup=start_point_keyboard(),
             )
         else:
@@ -6052,21 +6326,30 @@ async def generate_quest_for_start(
                 "🗺 Не удалось подтвердить удобный маршрут из центральной части города."
             )
             await message.answer(
-                "Можно попробовать текущую геолокацию или вернуться и выбрать другие интересы.",
+                "Можно попробовать геолокацию, ввести место/адрес вручную или вернуться и выбрать другие интересы.",
                 reply_markup=start_point_keyboard(),
             )
         return
 
+    route["start_mode"] = start_mode
+    route["start_label"] = str(start_label or "").strip()
+
     await state.update_data(
         start_mode=start_mode,
         start_point=start_point,
+        start_label=str(start_label or "").strip(),
     )
 
-    start_description = (
-        "от твоей геолокации"
-        if start_point
-        else "из центральной части города"
-    )
+    if start_mode == "location":
+        start_description = "от твоей геолокации"
+    elif start_mode == "manual":
+        start_description = (
+            f"от «{esc(start_label)}»"
+            if start_label
+            else "от указанного места"
+        )
+    else:
+        start_description = "из центральной части города"
 
     selected_repeats = sum(
         1
@@ -6146,6 +6429,7 @@ async def generate_quest_for_start(
         style=style,
         start_mode=start_mode,
         start_point=start_point,
+        start_label=str(start_label or "").strip(),
     )
 
     await status.edit_text("✅ <b>Квест готов!</b>")
@@ -6161,20 +6445,107 @@ async def style_cb(callback: CallbackQuery, state: FSMContext):
         style=style,
         start_mode=None,
         start_point=None,
+        start_label=None,
+        start_candidates=[],
+        start_query=None,
     )
     await state.set_state(QuestForm.choosing_start)
 
     await callback.message.answer(
         "📍 <b>Откуда начнём?</b>\n\n"
-        "Если ты уже в городе, отправь своё местоположение — "
-        "я постараюсь собрать интересный пеший квест ближе к тебе.\n\n"
-        "Если не хочешь делиться геолокацией или пока только планируешь поездку, "
-        "выбери «Начать из центра города».",
+        "📍 <b>Геолокация</b> — удобно, если ты уже в городе и открываешь бота с телефона.\n\n"
+        "⌨️ <b>Название места или адрес</b> — можно написать отель, вокзал, торговый центр, "
+        "достопримечательность или обычный адрес. Это удобно в Telegram Desktop и при планировании поездки.\n\n"
+        "🏙 <b>Центральная часть города</b> — использую центральную координату города из Geoapify "
+        "как ориентир. Это не обязательно главная площадь.",
         reply_markup=start_point_keyboard(),
     )
 
 
+async def handle_manual_start_query(message: Message, state: FSMContext, query: str):
+    raw = str(query or "").strip()
+    if len(raw) < 2:
+        await message.answer(
+            "Напиши название места или адрес чуть подробнее.\n\n"
+            "Например: <b>The Temple House</b> или адрес отеля."
+        )
+        return
+
+    data = await state.get_data()
+    city = data.get("city")
+    if not city:
+        await message.answer(
+            "Город потерялся из текущего сценария. Начни новый квест через /start.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    await state.set_state(QuestForm.waiting_start_text)
+    status = await message.answer(
+        f"🔎 <b>Ищу точку старта в {esc(city_display_ru(city))}…</b>\n\n"
+        f"Запрос: {esc(short_text(raw, 120))}",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+    try:
+        candidates = await geocode_start_candidates(raw, city)
+    except Exception:
+        logger.exception("Manual start lookup")
+        candidates = []
+
+    if not candidates:
+        await status.edit_text(
+            f"🤔 <b>Не удалось уверенно найти эту точку в {esc(city_display_ru(city))}.</b>\n\n"
+            "Попробуй:\n"
+            "• полное название отеля/места;\n"
+            "• название на английском или китайском;\n"
+            "• полный адрес с районом;\n"
+            "• или выбери центральную часть города."
+        )
+        await message.answer(
+            "⌨️ Введи другое название или адрес:",
+            reply_markup=start_point_keyboard(),
+        )
+        return
+
+    await state.update_data(
+        start_candidates=candidates,
+        start_query=raw,
+    )
+
+    await status.edit_text(
+        manual_start_candidate_text(
+            candidates[0],
+            city,
+        ),
+        reply_markup=manual_start_confirm_keyboard(len(candidates)),
+    )
+
+
+@router.message(
+    QuestForm.choosing_start,
+    F.text == "⌨️ Ввести место или адрес",
+)
+@router.message(
+    QuestForm.waiting_start_text,
+    F.text == "⌨️ Ввести место или адрес",
+)
+async def manual_start_prompt(message: Message, state: FSMContext):
+    await state.set_state(QuestForm.waiting_start_text)
+    await message.answer(
+        "⌨️ <b>Напиши название места или адрес</b>\n\n"
+        "Подойдут, например:\n"
+        "• название отеля: <b>The Temple House</b>;\n"
+        "• китайское название места;\n"
+        "• вокзал или торговый центр;\n"
+        "• полный почтовый адрес.\n\n"
+        "Я найду варианты внутри выбранного города и сначала попрошу подтвердить точку.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
 @router.message(QuestForm.choosing_start, F.location)
+@router.message(QuestForm.waiting_start_text, F.location)
 async def start_location_received(message: Message, state: FSMContext):
     data = await state.get_data()
     city = data.get("city")
@@ -6189,16 +6560,15 @@ async def start_location_received(message: Message, state: FSMContext):
     start_point = point_from_location(message.location)
     distance_from_city = haversine(start_point, city)
 
-    # A wildly remote coordinate is almost certainly the wrong start point.
-    # We do not silently build a route that would require hours just to reach
-    # the selected city.
     if distance_from_city > 150_000:
+        await state.set_state(QuestForm.choosing_start)
         await message.answer(
             f"📍 Эта геолокация находится примерно в "
-            f"<b>{fmt_distance(distance_from_city)}</b> от центра "
+            f"<b>{fmt_distance(distance_from_city)}</b> от центральной точки "
             f"<b>{esc(city_display_ru(city))}</b>.\n\n"
             "Похоже, сейчас ты далеко от выбранного города. "
-            "Для этого квеста отправь другую геолокацию или начни из центра города.",
+            "Можно отправить другую геолокацию, ввести место/адрес вручную "
+            "или начать из центральной части города.",
             reply_markup=start_point_keyboard(),
         )
         return
@@ -6214,16 +6584,30 @@ async def start_location_received(message: Message, state: FSMContext):
         message.from_user.id,
         start_point=start_point,
         start_mode="location",
+        start_label="Текущая геолокация",
     )
 
 
 @router.message(
     QuestForm.choosing_start,
+    F.text == "🏙 Начать из центральной части города",
+)
+@router.message(
+    QuestForm.waiting_start_text,
+    F.text == "🏙 Начать из центральной части города",
+)
+@router.message(
+    QuestForm.choosing_start,
+    F.text == "🏙 Начать из центра города",
+)
+@router.message(
+    QuestForm.waiting_start_text,
     F.text == "🏙 Начать из центра города",
 )
 async def start_from_center(message: Message, state: FSMContext):
     await message.answer(
-        "✅ Начинаем из центральной части города.",
+        "✅ Начинаем от центральной координаты города, которую вернул Geoapify.\n"
+        "Это ориентир для подбора маршрута, а не обязательно главная площадь.",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -6233,15 +6617,145 @@ async def start_from_center(message: Message, state: FSMContext):
         message.from_user.id,
         start_point=None,
         start_mode="center",
+        start_label=None,
+    )
+
+
+@router.message(QuestForm.waiting_start_text)
+async def manual_start_text_received(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer(
+            "Пришли название места или адрес текстом."
+        )
+        return
+
+    await handle_manual_start_query(
+        message,
+        state,
+        message.text,
     )
 
 
 @router.message(QuestForm.choosing_start)
-async def start_point_unknown(message: Message):
+async def start_point_text_or_unknown(message: Message, state: FSMContext):
+    # The input field remains useful on Desktop: typing anything other than
+    # the dedicated buttons is treated as a hotel/place/address query.
+    if message.text:
+        await handle_manual_start_query(
+            message,
+            state,
+            message.text,
+        )
+        return
+
     await message.answer(
-        "Выбери один из двух вариантов ниже: отправить геолокацию "
-        "или начать из центра города.",
+        "Выбери геолокацию, введи название места/адрес "
+        "или начни из центральной части города.",
         reply_markup=start_point_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "manual_start_more")
+async def manual_start_more(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    data = await state.get_data()
+    candidates = data.get("start_candidates") or []
+
+    if not candidates:
+        await callback.message.answer(
+            "Варианты уже недоступны. Введи место или адрес ещё раз."
+        )
+        await state.set_state(QuestForm.waiting_start_text)
+        return
+
+    lines = [
+        "🔎 <b>Другие найденные варианты</b>",
+        "",
+        "Выбери нужную точку:",
+        "",
+    ]
+
+    for i, candidate in enumerate(candidates[:5], 1):
+        name = start_candidate_name(candidate)
+        formatted = short_text(candidate.get("formatted") or "", 100)
+        lines.append(
+            f"<b>{i}.</b> {esc(name)}"
+            + (f"\n{esc(formatted)}" if formatted else "")
+        )
+
+    await callback.message.answer(
+        "\n\n".join(lines),
+        reply_markup=manual_start_choices_keyboard(candidates),
+    )
+
+
+@router.callback_query(F.data == "manual_start_retry")
+async def manual_start_retry(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(QuestForm.waiting_start_text)
+    await callback.message.answer(
+        "✏️ <b>Введи другое место или адрес</b>\n\n"
+        "Можно использовать английское, китайское или полное почтовое название."
+    )
+
+
+@router.callback_query(F.data == "manual_start_center")
+async def manual_start_center(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.answer(
+        "✅ Использую центральную координату выбранного города как ориентир."
+    )
+    await generate_quest_for_start(
+        callback.message,
+        state,
+        callback.from_user.id,
+        start_point=None,
+        start_mode="center",
+        start_label=None,
+    )
+
+
+@router.callback_query(F.data.startswith("manual_start_pick:"))
+async def manual_start_pick(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    data = await state.get_data()
+    candidates = data.get("start_candidates") or []
+    city = data.get("city")
+
+    try:
+        index = int(callback.data.split(":", 1)[1])
+        candidate = candidates[index]
+    except Exception:
+        await callback.message.answer(
+            "🤔 Этот вариант уже недоступен. Введи место или адрес ещё раз."
+        )
+        await state.set_state(QuestForm.waiting_start_text)
+        return
+
+    if not city:
+        await callback.message.answer(
+            "Город потерялся из текущего сценария. Начни новый квест."
+        )
+        return
+
+    start_point = {
+        "lat": float(candidate["lat"]),
+        "lon": float(candidate["lon"]),
+    }
+    start_label = start_candidate_name(candidate)
+
+    await callback.message.answer(
+        f"✅ <b>Точка старта подтверждена:</b> {esc(start_label)}\n"
+        f"{esc(short_text(candidate.get('formatted') or '', 180))}"
+    )
+
+    await generate_quest_for_start(
+        callback.message,
+        state,
+        callback.from_user.id,
+        start_point=start_point,
+        start_mode="manual",
+        start_label=start_label,
     )
 
 
@@ -7939,7 +8453,8 @@ async def about(callback: CallbackQuery):
         "• Для travel-открытки можно сравнить три оформления и сохранить понравившееся.\n"
         "• «Мои приключения» работают как паспорт городов с красными печатями, статистикой и архивом квестов.\n"
         "• Неудачную точку активного квеста можно заменить без пересборки всего путешествия.\n"
-        "• При новом квесте в уже исследованном городе новые места получают приоритет; старые POI используются только как резерв и получают новую миссию."
+        "• При новом квесте в уже исследованном городе новые места получают приоритет; старые POI используются только как резерв и получают новую миссию.\n"
+        "• Точку старта можно задать геолокацией, названием места/отеля, адресом или центральной координатой города."
     )
 
 
@@ -7952,7 +8467,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Starting CityQuest China v10.1 Anti Repeat POIs")
+    logger.info("Starting CityQuest China v10.2 Manual Start Point")
     await dp.start_polling(bot)
 
 
