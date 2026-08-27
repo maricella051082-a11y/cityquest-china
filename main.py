@@ -5990,8 +5990,20 @@ def free_photo_actions_keyboard():
     return kb.as_markup()
 
 
-def free_photo_nav_keyboard():
+def free_photo_nav_keyboard(quest=None, current_index=0):
     kb = InlineKeyboardBuilder()
+    stops = (quest or {}).get("stops") or []
+    if stops:
+        index = max(0, min(int(current_index or 0), len(stops) - 1))
+        kb.button(
+            text="↩️ Вернуться к текущей миссии",
+            callback_data=f"quest_stop:{index}",
+        )
+        if index + 1 < len(stops):
+            kb.button(
+                text="Следующая миссия ➡️",
+                callback_data=f"quest_stop:{index + 1}",
+            )
     kb.button(text="📷 Другой снимок", callback_data="free_photo")
     kb.button(text="🏠 Главное меню", callback_data="home")
     kb.adjust(1)
@@ -9165,6 +9177,8 @@ async def quest_stop_callback(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Активный квест не найден.", show_alert=True)
         return
 
+    await state.update_data(current_mission_index=idx)
+    await persist_active_state(callback.from_user.id, state)
     await callback.answer()
     await send_stop_card(callback.message, quest, route, idx)
 
@@ -9255,6 +9269,7 @@ async def receive_free_nonphoto(message: Message):
 async def vision_free_callback(callback: CallbackQuery, state: FSMContext):
     mode = callback.data.split(":", 1)[1]
     data = await state.get_data()
+    active = data if data.get("quest") else (db_load_active(callback.from_user.id) or {})
     file_id = data.get("free_photo_id")
 
     if not file_id:
@@ -9282,7 +9297,9 @@ async def vision_free_callback(callback: CallbackQuery, state: FSMContext):
         )
         await callback.message.answer(
             "Что дальше?",
-            reply_markup=free_photo_nav_keyboard(),
+            reply_markup=free_photo_nav_keyboard(
+                active.get("quest"), active.get("current_mission_index", 0)
+            ),
         )
         return
 
@@ -9297,7 +9314,9 @@ async def vision_free_callback(callback: CallbackQuery, state: FSMContext):
 
     await callback.message.answer(
         "Что дальше?",
-        reply_markup=free_photo_nav_keyboard(),
+        reply_markup=free_photo_nav_keyboard(
+            active.get("quest"), active.get("current_mission_index", 0)
+        ),
     )
 
 

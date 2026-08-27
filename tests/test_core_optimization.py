@@ -293,6 +293,18 @@ class CopyTests(unittest.TestCase):
 
 
 class NavigationTests(unittest.TestCase):
+    def test_free_photo_navigation_returns_to_active_quest(self):
+        quest = {"stops": [{}, {}, {}]}
+        markup = main.free_photo_nav_keyboard(quest, 1)
+        callbacks = [
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("quest_stop:1", callbacks)
+        self.assertIn("quest_stop:2", callbacks)
+        self.assertIn("free_photo", callbacks)
+
     def test_archive_media_navigation_has_no_dead_end(self):
         markup = main.passport_media_keyboard(12, 34)
         callbacks = {
