@@ -1106,6 +1106,7 @@ EXACT_RU_NAMES = {
     "喜茶": "Чайная HEYTEA",
     "星巴克": "Starbucks",
     "隋大兴唐长安城宫城南墙遗址": "Остатки южной стены дворцового города Чанъань",
+    "太平天国听王府": "Резиденция Тин-вана времён Тайпинского Небесного государства",
 }
 
 FOOD_GLOSSARY = {
@@ -1713,6 +1714,8 @@ def poi_type_from_name(name):
     rules = [
         (("博物馆", "美术馆", "纪念馆", "museum"), "🏛 музей"),
         (("宫殿", "故宫", "palace"), "🏯 дворец"),
+        (("王府",), "🏯 историческая резиденция"),
+        (("故居", "旧居", "former residence"), "🏠 исторический дом"),
         (("雕像", "塑像", "铜像", "statue"), "🗿 статуя"),
         (("纪念碑", "纪念塔", "monument", "memorial"), "🗿 памятник / мемориал"),
         (("广场", "square", "plaza"), "🏙 площадь"),
@@ -1850,6 +1853,9 @@ def translated_suffix_name(original: str) -> str:
     pinyin = pinyin_without_tones(original)
 
     suffixes = [
+        ("王府", "историческая резиденция"),
+        ("故居", "исторический дом"),
+        ("旧居", "исторический дом"),
         ("遗址", "историческое место"),
         ("遗迹", "историческое место"),
         ("纪念碑", "памятник / мемориал"),
@@ -1889,6 +1895,8 @@ def translated_suffix_name(original: str) -> str:
             if pinyin and base:
                 base_py = pinyin_without_tones(base)
                 if base_py:
+                    if len(base_py) > 32 or len(base_py.split()) > 5:
+                        return ru_type.capitalize()
                     return f"{ru_type.capitalize()} {base_py}"
             return ru_type.capitalize()
 
@@ -1953,6 +1961,8 @@ def safe_russian_name(place):
         place.get("category_label") or "интересное место",
     ).capitalize()
     pinyin = pinyin_without_tones(original)
+    if len(original) >= 12 or len(pinyin) > 42 or len(pinyin.split()) > 7:
+        return category
     return f"{category} · {pinyin}" if pinyin else category
 
 

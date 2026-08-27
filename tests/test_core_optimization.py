@@ -425,6 +425,30 @@ class NavigationTests(unittest.TestCase):
         )
         self.assertEqual(main.display_pinyin_for_place(place), "")
 
+    def test_taiping_residence_gets_readable_russian_name(self):
+        place = {
+            "name": "太平天国听王府",
+            "pinyin": "Tài píng tiān guó tīng wáng fǔ",
+            "category_label": "🏯 историческая резиденция",
+        }
+        self.assertEqual(
+            main.safe_russian_name(place),
+            "Резиденция Тин-вана времён Тайпинского Небесного государства",
+        )
+        self.assertEqual(
+            main.clean_category_label(["tourism.sights"], place["name"]),
+            "🏯 историческая резиденция",
+        )
+
+    def test_unknown_long_chinese_name_does_not_become_pinyin_wall(self):
+        place = {
+            "name": "某某某某某某某某某某某历史建筑",
+            "category_label": "🏯 историческое место",
+        }
+        shown = main.safe_russian_name(place)
+        self.assertEqual(shown, "Историческое место")
+        self.assertNotIn(" · ", shown)
+
     def test_text_photo_mission_explicitly_explains_translation(self):
         place = {"category_label": "🏺 историческое место"}
         mission = {
