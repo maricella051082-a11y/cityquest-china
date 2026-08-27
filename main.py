@@ -1107,6 +1107,7 @@ EXACT_RU_NAMES = {
     "星巴克": "Starbucks",
     "隋大兴唐长安城宫城南墙遗址": "Остатки южной стены дворцового города Чанъань",
     "太平天国听王府": "Резиденция Тин-вана времён Тайпинского Небесного государства",
+    "郁达夫杭州故居": "Дом Юй Дафу в Ханчжоу",
 }
 
 FOOD_GLOSSARY = {
@@ -6561,7 +6562,7 @@ TRAVEL_CARD_TEXT_LAYOUTS = {
     "ink_travel": {
         # The ink mountains occupy most of the upper-left and lower-right
         # corners. Text uses the genuinely transparent part of this overlay.
-        "header_left": 355, "header_right": 920,
+        "header_left": 410, "header_right": 920,
         "content_left": 185, "content_right": 920,
         "bottom_left": 130, "bottom_right": 680,
         "kicker_y": 78, "line_y": 110, "city_y": 132,

@@ -467,6 +467,14 @@ class NavigationTests(unittest.TestCase):
             "🏯 историческая резиденция",
         )
 
+    def test_yu_dafu_house_gets_readable_russian_name(self):
+        place = {
+            "name": "郁达夫杭州故居",
+            "pinyin": "Yù Dá Fū Háng Zhōu Gù Jū",
+            "category_label": "🏯 исторический дом",
+        }
+        self.assertEqual(main.safe_russian_name(place), "Дом Юй Дафу в Ханчжоу")
+
     def test_unknown_long_chinese_name_does_not_become_pinyin_wall(self):
         place = {
             "name": "某某某某某某某某某某某历史建筑",
@@ -701,6 +709,7 @@ class TravelCardFrameTests(unittest.TestCase):
         layouts = main.TRAVEL_CARD_TEXT_LAYOUTS
         self.assertLess(layouts["ink_travel"]["bottom_right"], layouts["none"]["bottom_right"])
         self.assertGreater(layouts["ink_travel"]["header_left"], layouts["none"]["header_left"])
+        self.assertGreaterEqual(layouts["ink_travel"]["header_left"], 400)
         self.assertNotEqual(layouts["chinese_seal"], layouts["china_journal"])
 
     def test_none_keeps_pixels_and_png_overlay_keeps_canvas_size(self):
