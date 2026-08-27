@@ -390,6 +390,33 @@ class NavigationTests(unittest.TestCase):
         }
         self.assertIn("vision:text:f3:2", callbacks)
         self.assertIn("photo_replace:f3", callbacks)
+        self.assertIn("quest_stop:0", callbacks)
+
+    def test_photo_navigation_returns_to_current_before_advancing(self):
+        stop = {"place": {"category_label": "🌿 парк"}}
+        markup = main.photo_actions_keyboard(
+            stop, 1, version=1, photo_key="s1", total_stops=3
+        )
+        callbacks = {
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+            if button.callback_data
+        }
+        self.assertIn("quest_stop:1", callbacks)
+        self.assertIn("photo_continue:1", callbacks)
+
+        last_markup = main.photo_actions_keyboard(
+            stop, 2, version=1, photo_key="s2", total_stops=3
+        )
+        last_callbacks = {
+            button.callback_data
+            for row in last_markup.inline_keyboard
+            for button in row
+            if button.callback_data
+        }
+        self.assertIn("quest_stop:2", last_callbacks)
+        self.assertNotIn("photo_continue:2", last_callbacks)
 
     def test_known_quest_place_does_not_offer_place_recognition(self):
         stop = {"place": {"category_label": "🏺 историческое место"}}

@@ -3916,7 +3916,8 @@ def museum_text_keyboard(index):
         text="📱 Спросить: «Как это называется?»",
         callback_data=f"museum_phrase:what_called:{index}",
     )
-    kb.button(text="➡️ Продолжить квест", callback_data=f"photo_continue:{index}")
+    kb.button(text="↩️ Вернуться к текущей миссии", callback_data=f"quest_stop:{index}")
+    kb.button(text="Следующая миссия ➡️", callback_data=f"photo_continue:{index}")
     kb.button(text="✅ Чек-лист", callback_data="show_checklist")
     kb.adjust(1)
     return kb.as_markup()
@@ -5927,7 +5928,7 @@ def phrase_show_keyboard(keys, idx):
     return kb.as_markup()
 
 
-def photo_actions_keyboard(stop, index, version=0, photo_key=None):
+def photo_actions_keyboard(stop, index, version=0, photo_key=None, total_stops=None):
     group = place_group(stop["place"])
     kb = InlineKeyboardBuilder()
 
@@ -5965,7 +5966,9 @@ def photo_actions_keyboard(stop, index, version=0, photo_key=None):
         kb.button(text="🔤 Что написано?", callback_data=f"vision:text{suffix}")
 
     kb.button(text="🔄 Другое фото", callback_data=f"photo_replace:{photo_key}")
-    kb.button(text="➡️ Продолжить квест", callback_data=f"photo_continue:{index}")
+    kb.button(text="↩️ Вернуться к текущей миссии", callback_data=f"quest_stop:{index}")
+    if total_stops is None or index + 1 < int(total_stops):
+        kb.button(text="Следующая миссия ➡️", callback_data=f"photo_continue:{index}")
     kb.button(text="✅ Чек-лист", callback_data="show_checklist")
     kb.adjust(1)
     return kb.as_markup()
@@ -8975,8 +8978,14 @@ async def receive_photo(message: Message, state: FSMContext):
         f"{location_line}\n"
         "Для каждой миссии хранится <b>один фото-трофей</b>. "
         "Если нажать «🔄 Другое фото», этот снимок будет заменён.\n\n"
-        "Разбор фото необязателен: можно сразу нажать «➡️ Продолжить квест».",
-        reply_markup=photo_actions_keyboard(stop, idx, version=version, photo_key=key),
+        "Разбор фото необязателен. Можно вернуться к текущей миссии или перейти к следующей.",
+        reply_markup=photo_actions_keyboard(
+            stop,
+            idx,
+            version=version,
+            photo_key=key,
+            total_stops=len(quest.get("stops") or []),
+        ),
     )
 
 
@@ -9027,6 +9036,7 @@ async def vision_callback(callback: CallbackQuery, state: FSMContext):
                 idx,
                 version=current_version,
                 photo_key=photo_key,
+                total_stops=len(quest.get("stops") or []),
             ),
         )
         return
