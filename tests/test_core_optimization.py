@@ -160,6 +160,58 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("На осмотр мест, еду и отдых", text)
         self.assertNotIn("Запас", text)
 
+    def test_center_route_names_the_real_first_start(self):
+        quest = {
+            "stops": [{"name_ru": "Восточные ворота", "mission": {"minutes": 12}}],
+            "field_missions": [],
+        }
+        route = {
+            "time_s": 0,
+            "distance_m": 0,
+            "legs": [],
+            "start_mode": "center",
+        }
+        text = main.route_summary(route, quest, "2 часа")
+        self.assertIn("Старт: <b>Восточные ворота</b>", text)
+        self.assertIn("Открой первую миссию", text)
+        self.assertNotIn("координат", text.lower())
+
+    def test_all_day_route_can_be_compact_when_missions_fill_the_day(self):
+        route = {"time_s": 10 * 60, "distance_m": 710, "legs": []}
+        self.assertTrue(main.route_fits(route, "весь день", 7))
+
+    def test_all_day_quest_reaches_fourteen_total_missions_with_few_places(self):
+        missions = main.build_field_missions(
+            "compact", ["nature"], 2, duration="весь день", ai_meta={}
+        )
+        self.assertEqual(len(missions), 12)
+        combined = " ".join(item["text"] for item in missions).lower()
+        self.assertTrue(any(word in combined for word in ("дерево", "цветок", "растение")))
+
+    def test_every_duration_gets_linking_route_missions(self):
+        cases = [("2 часа", 3, 1), ("4 часа", 5, 2), ("6 часов", 6, 4)]
+        for duration, stops, expected in cases:
+            with self.subTest(duration=duration):
+                missions = main.build_field_missions(
+                    "rich", ["history"], stops, duration=duration, ai_meta={}
+                )
+                self.assertEqual(len(missions), expected)
+                self.assertTrue(all("after_poi_index" in item for item in missions))
+
+    def test_full_quest_lists_route_missions(self):
+        quest = {
+            "stops": [{
+                "name_ru": "Музей",
+                "place": {"name": "Museum"},
+                "mission": {"title": "Экспонат", "text": "Найди необычную деталь."},
+            }],
+            "field_missions": [{"title": "Живая находка", "text": "Найди красивое дерево."}],
+        }
+        route = {"time_s": 0, "distance_m": 0, "legs": []}
+        text = main.full_quest_text(quest, route, "2 часа")
+        self.assertIn("Миссии по пути", text)
+        self.assertIn("Живая находка", text)
+
     async def test_second_ranked_route_can_win(self):
         pool = [
             {"name": "A", "lat": 30.000, "lon": 120.000},
@@ -301,7 +353,157 @@ class NavigationTests(unittest.TestCase):
         self.assertIn("quest_stop:0", callbacks)
         self.assertIn("quest_stop:2", callbacks)
         self.assertIn("show_checklist", callbacks)
-        self.assertIn("photo_add:1", callbacks)
+        self.assertIn("photo_add:s1", callbacks)
+
+    def test_field_photo_has_own_callback_and_context(self):
+        place = {"lat": 31.2, "lon": 121.5}
+        field = {"title": "Живая находка", "photo": "Сними дерево."}
+        markup = main.stop_keyboard(place, 0, False, 2, [(3, field)])
+        callbacks = {
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+            if button.callback_data
+        }
+        self.assertIn("photo_add:s0", callbacks)
+        self.assertIn("photo_add:f3", callbacks)
+
+        quest = {
+            "stops": [{"name_ru": "Парк", "place": place, "mission": {"title": "Парк"}}],
+            "field_missions": [{}, {}, {}, {"title": "Живая находка", "after_poi_index": 0}],
+        }
+        context = main.photo_context(quest, "f3")
+        self.assertEqual(context[1], 0)
+        self.assertEqual(context[3], "Живая находка")
+
+    def test_legacy_numeric_photo_key_is_still_readable(self):
+        self.assertEqual(main.photo_value({"2": "old-file"}, "s2"), "old-file")
+
+    def test_field_photo_actions_keep_their_own_key(self):
+        stop = {"place": {"category_label": "🏛 музей"}}
+        markup = main.photo_actions_keyboard(stop, 0, version=2, photo_key="f3")
+        callbacks = {
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+            if button.callback_data
+        }
+        self.assertIn("vision:text:f3:2", callbacks)
+        self.assertIn("photo_replace:f3", callbacks)
+
+    def test_known_quest_place_does_not_offer_place_recognition(self):
+        stop = {"place": {"category_label": "🏺 историческое место"}}
+        markup = main.photo_actions_keyboard(stop, 0, version=1)
+        callbacks = {
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+            if button.callback_data
+        }
+        self.assertFalse(any(value.startswith("vision:place:") for value in callbacks))
+        self.assertTrue(any(value.startswith("vision:monument:") for value in callbacks))
+
+    def test_chinese_ruins_are_not_generic_attractions(self):
+        categories = ["tourism.sights"]
+        label = main.clean_category_label(categories, "成都东华门遗址")
+        self.assertEqual(label, "🏺 историческое место")
+        self.assertIn("Историческое место", main.translated_suffix_name("成都东华门遗址"))
+
+    def test_long_chinese_poi_gets_readable_name_without_full_pinyin(self):
+        place = {
+            "name": "隋大兴唐长安城宫城南墙遗址",
+            "pinyin": "Suí dà xīng táng cháng ān chéng gōng chéng nán qiáng yí zhǐ",
+            "category_label": "🏺 историческое место",
+        }
+        stop = {
+            "name_ru": "Достопримечательность · Sui Da Xing Tang Chang An Cheng Gong Cheng Nan Qiang Yi Zhi",
+            "place": place,
+        }
+        self.assertEqual(
+            main.display_stop_name(stop),
+            "Остатки южной стены дворцового города Чанъань",
+        )
+        self.assertEqual(main.display_pinyin_for_place(place), "")
+
+    def test_text_photo_mission_explicitly_explains_translation(self):
+        place = {"category_label": "🏺 историческое место"}
+        mission = {
+            "type": "text",
+            "title": "Один иероглиф",
+            "text": "Найди иероглиф.",
+            "tip": "Выбери хорошо видимую надпись.",
+            "photo": "Сфотографируй иероглиф.",
+        }
+        edited = main.apply_human_mission_copy(place, mission)
+        self.assertIn("Загрузи снимок", edited["tip"])
+        self.assertIn("Прочитать / перевести", edited["tip"])
+        self.assertIn("pinyin", edited["tip"])
+        self.assertNotIn("бот", edited["tip"].lower())
+        self.assertNotIn("AI", edited["tip"])
+
+    def test_food_photo_mission_explains_available_analysis(self):
+        place = {"category_label": "🍜 ресторан"}
+        mission = {
+            "type": "color",
+            "title": "Яркая тарелка",
+            "text": "Выбери блюдо.",
+            "tip": "Заказывать необязательно.",
+            "photo": "Сфотографируй блюдо.",
+        }
+        edited = main.apply_human_mission_copy(place, mission)
+        self.assertIn("узнать больше о блюде", edited["tip"])
+        self.assertIn("возможный состав и остроту", edited["tip"])
+
+    def test_full_quest_shows_photo_help_without_opening_mission(self):
+        quest = {
+            "stops": [{
+                "name_ru": "Чайная",
+                "place": {"category_label": "🍵 чайная", "name": "Tea"},
+                "mission": {
+                    "type": "compare",
+                    "title": "Два аромата",
+                    "text": "Сравни два чая.",
+                    "tip": "Сравни варианты.",
+                    "photo": "Сфотографируй два названия.",
+                },
+            }],
+            "field_missions": [],
+        }
+        route = {"time_s": 0, "distance_m": 0, "legs": [], "start_mode": "center"}
+        text = main.full_quest_text(quest, route, "2 часа")
+        self.assertIn("Добавь фото", text)
+        self.assertIn("Прочитать / перевести", text)
+        self.assertIn("pinyin", text)
+
+    def test_museum_tip_cannot_leak_ai_wording(self):
+        place = {"category_label": "🏛 музей"}
+        mission = {
+            "type": "museum",
+            "title": "Экспонат-загадка",
+            "text": "Найди экспонат.",
+            "tip": (
+                "Сфотографируй экспонат и спроси AI. "
+                "AI попробует объяснить, что это. "
+                "Если фото запрещены, введи название вручную."
+            ),
+            "photo": "Сфотографируй экспонат.",
+        }
+        edited = main.apply_human_mission_copy(place, mission)
+        self.assertNotIn("AI", edited["tip"])
+        self.assertNotIn("бот", edited["tip"].lower())
+        self.assertIn("Загрузи снимок", edited["tip"])
+        self.assertIn("дополнительную информацию", edited["tip"])
+
+    def test_mission_does_not_require_nonexistent_text_answer(self):
+        original = (
+            "Выбери один предмет, который привлёк внимание. "
+            "Опиши, чем он отличается. Укажи, что понравилось, и запиши ответ."
+        )
+        edited = main.neutralize_unavailable_response_actions(original)
+        self.assertNotRegex(edited.lower(), r"\b(?:опиши|укажи|запиши)\b")
+        self.assertIn("Обрати внимание, чем он отличается", edited)
+        self.assertIn("Реши для себя, что понравилось", edited)
+        self.assertIn("запомни ответ", edited.lower())
 
     def test_museum_stop_restores_no_photo_action(self):
         place = {

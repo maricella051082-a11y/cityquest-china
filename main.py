@@ -1105,6 +1105,7 @@ EXACT_RU_NAMES = {
     "小雁塔": "Малая пагода диких гусей",
     "喜茶": "Чайная HEYTEA",
     "星巴克": "Starbucks",
+    "隋大兴唐长安城宫城南墙遗址": "Остатки южной стены дворцового города Чанъань",
 }
 
 FOOD_GLOSSARY = {
@@ -1175,6 +1176,7 @@ PHRASES = {
         "translation": "Что это?",
     },
     "what_called": {
+        "title": "🏷 Как это называется?",
         "hanzi": "这个叫什么？",
         "pinyin": "Zhège jiào shénme?",
         "ru": "Чжэгэ цзяо шэньмэ?",
@@ -1603,7 +1605,7 @@ def start_point_keyboard():
                 )
             ],
             [KeyboardButton(text="⌨️ Ввести место или адрес")],
-            [KeyboardButton(text="🏙 Начать из центральной части города")],
+            [KeyboardButton(text="🏙 Подобрать старт в центре")],
         ],
         resize_keyboard=True,
         one_time_keyboard=True,
@@ -1624,7 +1626,7 @@ def start_point_label(mode, label=None):
     if mode == "manual":
         value = str(label or "").strip()
         return f"⌨️ от {value}" if value else "⌨️ от указанного места"
-    return "🏙 из центральной части города"
+    return "🏙 у первой точки в центре"
 
 
 def manual_start_confirm_keyboard(candidate_count):
@@ -1643,7 +1645,7 @@ def manual_start_confirm_keyboard(candidate_count):
         callback_data="manual_start_retry",
     )
     kb.button(
-        text="🏙 Из центральной части города",
+        text="🏙 Подобрать старт в центре",
         callback_data="manual_start_center",
     )
     kb.adjust(1)
@@ -1665,7 +1667,7 @@ def manual_start_choices_keyboard(candidates):
         callback_data="manual_start_retry",
     )
     kb.button(
-        text="🏙 Из центральной части города",
+        text="🏙 Подобрать старт в центре",
         callback_data="manual_start_center",
     )
     kb.adjust(1)
@@ -1719,6 +1721,7 @@ def poi_type_from_name(name):
         (("宝塔", "佛塔", "pagoda"), "🏯 пагода"),
         (("寺", "庙", "清真寺", "temple", "mosque"), "🛕 храм / религиозное место"),
         (("陵", "墓", "mausoleum", "tomb"), "🪦 мавзолей / историческое захоронение"),
+        (("遗址", "遗迹", "ruins", "archaeological site"), "🏺 историческое место"),
         (("喷泉", "fountain"), "⛲ фонтан"),
         (("剧院", "theatre", "theater"), "🎭 театр"),
         (("公园", "park"), "🌿 парк"),
@@ -1847,6 +1850,8 @@ def translated_suffix_name(original: str) -> str:
     pinyin = pinyin_without_tones(original)
 
     suffixes = [
+        ("遗址", "историческое место"),
+        ("遗迹", "историческое место"),
         ("纪念碑", "памятник / мемориал"),
         ("雕像", "статуя"),
         ("塑像", "статуя"),
@@ -1949,6 +1954,34 @@ def safe_russian_name(place):
     ).capitalize()
     pinyin = pinyin_without_tones(original)
     return f"{category} · {pinyin}" if pinyin else category
+
+
+def display_stop_name(stop):
+    """Current readable label, including upgrades for already saved quests."""
+    place = stop.get("place") or {}
+    refreshed = safe_russian_name(place)
+    saved = str(stop.get("name_ru") or "").strip()
+    original = str(place.get("name") or "").strip()
+    if original in EXACT_RU_NAMES:
+        return refreshed
+    if contains_han(original) and (
+        len(original) >= 12
+        or "достопримечательность ·" in saved.casefold()
+        or len(saved) > 55
+    ):
+        return refreshed
+    return saved or refreshed or "Остановка"
+
+
+def display_pinyin_for_place(place):
+    """Long official names are not useful as a full pronunciation exercise."""
+    original = str(place.get("name") or "").strip()
+    pinyin = str(place.get("pinyin") or "").strip()
+    if not pinyin or not contains_han(original):
+        return ""
+    if len(original) >= 12 or len(pinyin.split()) > 8 or len(pinyin) > 70:
+        return ""
+    return pinyin
 
 
 async def fetch_place_details(session, place):
@@ -2954,7 +2987,6 @@ def route_fits(route, duration, count, relaxed=False):
     walk = route["time_s"] / 60
     mission_est = 14 * count
     pause = max(15, total * 0.12)
-
     walk_share = 0.52 if relaxed else 0.45
     leg_limit = MAX_LEG_MINUTES[duration] + (10 if relaxed else 0)
 
@@ -3337,8 +3369,22 @@ AI_META_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        "route_missions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "after_poi_index": {"type": "integer"},
+                    "title": {"type": "string"},
+                    "task": {"type": "string"},
+                    "photo": {"type": "string"},
+                },
+                "required": ["after_poi_index", "title", "task", "photo"],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["title", "intro", "missions"],
+    "required": ["title", "intro", "missions", "route_missions"],
     "additionalProperties": False,
 }
 
@@ -3541,6 +3587,7 @@ def natural_travel_caption(city):
 async def groq_meta(city, duration, interests, style, places, avoid_missions=None):
     fallback_missions = safe_fallback_missions(places, interests)
     interest_text = ", ".join(INTERESTS[k]["label"] for k in interests)
+    route_mission_count = max(1, target_mission_count(duration) - len(places))
 
     poi_payload = []
     for i, (place, fallback) in enumerate(zip(places, fallback_missions), 1):
@@ -3596,7 +3643,7 @@ async def groq_meta(city, duration, interests, style, places, avoid_missions=Non
 16. Task — это маленькая игра или наблюдение с понятным результатом. Hint — конкретная помощь. Photo — ясный фото-трофей. Никаких абстрактных «проанализируй», «учитывай», «сформулируй».
 17. В одном квесте чередуй механики: поиск детали, сравнение, догадка, цвет, ракурс, символ, текст, необычная находка. Не делай шесть заданий по схеме «найди объект и сфотографируй».
 14. В task должна быть САМА МИССИЯ — интересное действие или наблюдение. В hint — помощь, как её выполнить. В photo — фото-трофей.
-15. AI не должен быть смыслом миссии. Фраза «сфотографируй и AI поможет...» допустима только как дополнительная помощь в hint, особенно для еды, меню и музея.
+15. Не упоминай AI, ИИ или бота в title, task, hint и photo. Описывай помощь нейтрально через действие пользователя: «добавь фото», «выбери “Прочитать / перевести”», «посмотри перевод и pinyin».
 16. Отбрасывай только действительно плохой русский: канцелярит, бессмысленные указания и фотографический жаргон.
 17. Не пиши «учитывай растения, здания, одежду», «видимая часть», «разложи в кадр», «чтобы AI распознал контраст», «ингредиентное сочетание».
 18. Не придумывай точное расположение детали внутри объекта, если оно не подтверждено: никаких «на задней стенке» или «слева от входа».
@@ -3611,6 +3658,8 @@ async def groq_meta(city, duration, interests, style, places, avoid_missions=Non
 27. Не проси «запиши ответ/догадку»: в миссии нет текстового поля. Можно предложить выбрать свою версию или проверить догадку по меню.
 28. Не предполагай пруд, фонтан, водопад, колонну или конкретный объект без verified_description. Если идея необязательна, пиши условно: «если увидишь воду…».
 29. Десертные задания допустимы в кафе, ресторанах, чайных и точках стритфуда; делай их живыми и конкретными.
+30. Не пиши «укажи ответ», «напиши, что понравилось» или «введи результат»: в миссии нет поля ответа. Предлагай выбрать вариант для себя или проверить догадку через доступное действие с фото.
+31. Вообще не используй в заданиях глаголы «опиши», «укажи», «запиши», «напиши» и «расскажи». Пользователь нигде не вводит впечатления. Используй «обрати внимание», «подумай», «реши для себя», «выбери» или «запомни».
 
 МИССИИ ИЗ ПРЕДЫДУЩИХ КВЕСТОВ ЭТОГО ПОЛЬЗОВАТЕЛЯ В ЭТОМ ГОРОДЕ — НЕ ПОВТОРЯЙ ИХ, ЕСЛИ МОЖНО:
 {old_text}
@@ -3618,10 +3667,23 @@ async def groq_meta(city, duration, interests, style, places, avoid_missions=Non
 РЕАЛЬНЫЕ ТОЧКИ И БЕЗОПАСНЫЕ КОРИДОРЫ:
 {json.dumps(poi_payload, ensure_ascii=False, indent=2)}
 
+ДОРОЖНЫЕ МИССИИ:
+- Помимо заданий у POI создай route_missions — самостоятельные наблюдения, которые выполняются между остановками.
+- Количество: ровно {route_mission_count}. Вместе с {len(places)} миссиями у мест это даст полноценную программу для формата «{duration}».
+- Для каждой укажи after_poi_index от 0 до {max(0, len(places) - 1)}: после какой основной остановки показать её. Распредели задания по всему маршруту; после одной остановки может быть несколько.
+- Они не должны зависеть от наличия конкретной достопримечательности. Используй то, что реально можно встретить на обычной улице: дерево, цветок или горшок; вывеску; витрину или маленький магазин; необычный транспорт; звук; цвет; городской быт; старое рядом с новым.
+- Часть миссий может выполняться во время отдыха на лавке или за едой: услышать звуки, почувствовать запахи и температуру воздуха, заметить движение улицы, выбрать запомнившуюся сцену. Не требуй мешать другим людям.
+- Каждая дорожная миссия должна быть связана хотя бы с одним выбранным интересом пользователя: {interest_text}.
+- Это переходы между главами квеста, а не случайный довесок. Продолжай мотив предыдущей остановки или мягко подводи к категории следующей: после музея можно искать современного «родственника» предмета, после еды — цвет или аромат улицы, перед парком — первые признаки природы. Используй только подтверждённые названия и категории из списка, не выдумывай детали мест.
+- photo: короткое описание отдельного фото-трофея для этой миссии. Если миссия про звук, запах, вкус, температуру или другое нефотографируемое ощущение, верни пустую строку. Не заставляй фотографировать каждую миссию.
+- У каждой должна быть своя механика. Не повторяй задания у POI и не делай все задания фотографическими.
+- Не утверждай, что конкретный объект обязательно встретится: давай 2–3 равноправных варианта находки.
+
 Верни JSON по схеме:
 - title: атмосферное название всего квеста на русском;
 - intro: 1–2 коротких предложения;
 - missions: для каждого poi_index ровно одна миссия: mechanic, title, task, hint, photo.
+- route_missions: связанные с отрезками маршрута задания: after_poi_index, title, task, photo.
 """.strip()
 
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -3835,7 +3897,7 @@ def heritage_mission_variants(place):
                 "иероглиф, облачный орнамент, красную деталь или необычную форму крыши. "
                 "Если ничего из списка нет — выбери любую характерную деталь."
             ),
-            "tip": "Загрузи фото находки и нажми «Что за символ?» — AI попробует объяснить то, что действительно видно.",
+            "tip": "Загрузи фото находки и нажми «Что за символ?», чтобы узнать больше о том, что действительно видно.",
             "photo": "Сделай крупный кадр найденного элемента.",
             "xp": 30,
             "minutes": 15,
@@ -3859,7 +3921,7 @@ def heritage_mission_variants(place):
                 "Найди любой хорошо видимый китайский иероглиф на табличке, вывеске, воротах или стенде. "
                 "Выбери один, который кажется самым интересным по форме."
             ),
-            "tip": "После загрузки фото нажми «Что написано?» — бот попробует прочитать его и дать pinyin и перевод.",
+            "tip": "После загрузки фото нажми «Что написано?», чтобы посмотреть распознанный текст, pinyin и перевод.",
             "photo": "Сфотографируй иероглиф достаточно близко, чтобы он был читаем.",
             "xp": 30,
             "minutes": 12,
@@ -4174,9 +4236,6 @@ def ai_mission_is_safe(place, candidate, style):
         if not water_verified and not conditional:
             return False, "unverified_water_feature"
 
-    if group in {"heritage", "temple", "park", "art", "viewpoint", "other"}:
-        if re.search(r"\b(?:ai|ии)\b", values["hint"].casefold()):
-            return False, "unnecessary_ai_in_visual_hint"
     if group not in {"restaurant", "cafe", "tea", "market"}:
         food_terms = re.compile(
             r"\b(?:меню|блюд\w*|еда|напит\w*|остр\w*|ингредиент\w*|чай\w*|аромат\w*|вкус\w*)\b"
@@ -4190,23 +4249,120 @@ def ai_mission_is_safe(place, candidate, style):
     return True, "ok"
 
 
+def photo_learning_instruction(place, mission):
+    """Explain the useful action unlocked after this mission's photo."""
+    if not str(mission.get("photo") or "").strip():
+        return ""
+
+    group = place_group(place)
+    mechanic = str(mission.get("mechanic") or mission.get("type") or "").casefold()
+    combined = " ".join(
+        str(mission.get(key) or "") for key in ("title", "text", "photo")
+    ).casefold()
+
+    if mechanic == "text" or re.search(r"иероглиф|надпис|вывеск|табличк|меню|назван", combined):
+        return (
+            "Загрузи снимок кнопкой «📷 Добавить фото» и выбери «Прочитать / перевести» — "
+            "так ты сможешь посмотреть распознанный текст, pinyin и перевод."
+        )
+    if group in {"restaurant", "cafe", "tea"}:
+        return (
+            "Загрузи снимок кнопкой «📷 Добавить фото» — так ты сможешь узнать больше о блюде или напитке, "
+            "посмотреть возможный состав и остроту."
+        )
+    if mechanic == "symbol" or re.search(r"символ|орнамент|традиц|дракон|фонар", combined):
+        return (
+            "Загрузи снимок кнопкой «📷 Добавить фото» и выбери «Что за символ?» или «Что здесь традиционного?» — "
+            "так ты сможешь узнать больше о видимой детали."
+        )
+    if group == "museum" or mechanic in {"object", "detail"}:
+        return (
+            "Загрузи снимок кнопкой «📷 Добавить фото» и выбери «Что за объект?» или «Что можно понять по фото?» — "
+            "так ты сможешь получить дополнительную информацию о находке."
+        )
+    return (
+        "Загрузи снимок кнопкой «📷 Добавить фото» — так ты сможешь узнать больше об объекте или детали, "
+        "перевести надпись или посмотреть, что связано с китайской культурой."
+    )
+
+
+def neutralize_unavailable_response_actions(value):
+    """Remove requests that require a text-answer UI the quest does not have."""
+    text = str(value or "")
+    replacements = [
+        (r"\b[Оо]пиши\s*,?", lambda m: "Обрати внимание," if m.group(0)[0].isupper() else "обрати внимание,"),
+        (r"\b[Уу]кажи\s*,?", lambda m: "Реши для себя," if m.group(0)[0].isupper() else "реши для себя,"),
+        (r"\b[Зз]апиши\s*,?", lambda m: "Запомни" if m.group(0)[0].isupper() else "запомни"),
+        (r"\b[Нн]апиши\s*,?", lambda m: "Подумай," if m.group(0)[0].isupper() else "подумай,"),
+        (r"\b[Рр]асскажи\s*,?", lambda m: "Подумай," if m.group(0)[0].isupper() else "подумай,"),
+    ]
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def neutralize_tool_mentions(value):
+    """Describe the user's result without naming the implementation."""
+    text = str(value or "")
+    replacements = [
+        (r"(?:спроси|спросить)\s+(?:AI|ИИ)", "загрузи фото и выбери подходящее действие"),
+        (r"(?:AI|ИИ)\s+(?:попробует\s+)?объяснить", "ты сможешь узнать больше"),
+        (r"(?:AI|ИИ)\s+поможет\s+перевести", "ты сможешь посмотреть перевод"),
+        (r"(?:AI|ИИ)\s+поможет", "ты сможешь получить дополнительную информацию"),
+        (r"\bбот\s+(?:попробует\s+)?объяснить", "ты сможешь узнать больше"),
+    ]
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def compact_photo_instruction(place, mission):
+    """Short version for the all-missions overview."""
+    if not str(mission.get("photo") or "").strip():
+        return ""
+    group = place_group(place)
+    mechanic = str(mission.get("mechanic") or mission.get("type") or "").casefold()
+    combined = " ".join(str(mission.get(key) or "") for key in ("title", "text", "photo")).casefold()
+    if mechanic == "text" or re.search(r"иероглиф|надпис|вывеск|табличк|меню|назван", combined):
+        return "📷 Добавь фото → «Прочитать / перевести»: текст, pinyin и перевод."
+    if group in {"restaurant", "cafe", "tea"}:
+        return "📷 Добавь фото → посмотри информацию о блюде или напитке, составе и остроте."
+    if mechanic == "symbol" or re.search(r"символ|орнамент|традиц", combined):
+        return "📷 Добавь фото → узнай больше о символе или традиционной детали."
+    return "📷 Добавь фото → узнай больше о выбранной находке."
+
+
 def apply_human_mission_copy(place, mission):
-    """
-    Keep mission copy compact; optional AI help is a separate UI action.
-    """
+    """Keep natural mission copy and always expose useful photo actions."""
     result = dict(mission)
-    if place_group(place) in {"restaurant", "cafe", "tea"}:
-        tip = str(result.get("tip") or "").strip()
-        sentences = re.split(r"(?<=[.!?])\s+", tip)
-        compact = [
-            sentence
-            for sentence in sentences
-            if not re.search(r"\b(?:AI|ИИ)\b", sentence, re.IGNORECASE)
-        ]
-        if compact:
-            result["tip"] = " ".join(compact).strip()
-        elif tip:
-            result["tip"] = "Рассматривай только то, что доступно без покупки; при необходимости используй кнопки помощи после фото."
+    result["text"] = neutralize_unavailable_response_actions(
+        neutralize_tool_mentions(result.get("text"))
+    )
+    result["photo"] = neutralize_tool_mentions(result.get("photo"))
+    instruction = photo_learning_instruction(place, result)
+    tip = neutralize_unavailable_response_actions(
+        neutralize_tool_mentions(result.get("tip"))
+    )
+    # User-facing guidance describes available actions, not the underlying
+    # implementation. A deterministic instruction below restores the useful
+    # part if a generated sentence mentions AI or the bot.
+    sentences = re.split(r"(?<=[.!?])\s+", tip)
+    neutral_sentences = [
+        sentence for sentence in sentences
+        if not re.search(r"(?:AI|ИИ|бот)", sentence, re.IGNORECASE)
+    ]
+    tip = " ".join(neutral_sentences).strip()
+    result["tip"] = tip
+    tip_low = tip.casefold()
+    already_explains_action = bool(
+        re.search(r"фото|снимок|сфотограф", tip_low)
+        and re.search(
+            r"прочитать\s*/\s*перевести|что за символ|что за объект|что можно понять|кнопк|ai|ии",
+            tip_low,
+        )
+    )
+    if instruction and not already_explains_action:
+        result["tip"] = f"{tip} {instruction}".strip()
     return result
 
 
@@ -4318,9 +4474,10 @@ def mission_for_place(place, interests, index, used_titles):
                 "title": "Два аромата",
                 "text": (
                     "Найди два разных чая и попробуй сравнить их по аромату. Какой кажется более цветочным, "
-                    "травянистым, ореховым или просто приятнее? Если понюхать нельзя — сравни их по названию и описанию в меню."
+                    "травянистым, ореховым или просто приятнее? Если понюхать нельзя или меню только на китайском, "
+                    "сфотографируй два названия, выбери «Прочитать / перевести» и сравни их по переводу."
                 ),
-                "tip": "Покупать напиток не обязательно. Если название непонятно, сфотографируй меню или упаковку — AI поможет перевести.",
+                "tip": "Покупать напиток не обязательно. Если название непонятно, сфотографируй меню или упаковку и выбери «Прочитать / перевести».",
                 "photo": "Сфотографируй два названия чая, упаковки или чашки, которые ты сравнивал.",
                 "xp": 30,
                 "minutes": 15,
@@ -4345,7 +4502,7 @@ def mission_for_place(place, interests, index, used_titles):
                     "Найди одну деталь, которая делает это место именно чайным: чашку, чайник, банку с чаем, "
                     "упаковку, меню или способ подачи. Выбери ту, которую хочется запомнить."
                 ),
-                "tip": "Если не уверен, что написано на упаковке или в меню, сфотографируй текст — AI поможет перевести.",
+                "tip": "Если не уверен, что написано на упаковке или в меню, сфотографируй текст и выбери «Прочитать / перевести».",
                 "photo": "Сфотографируй выбранную чайную деталь.",
                 "xp": 20,
                 "minutes": 10,
@@ -4357,7 +4514,7 @@ def mission_for_place(place, interests, index, used_titles):
                     "Найди в меню или на упаковке название чая, которого ты раньше не встречал. "
                     "Сначала попробуй догадаться по названию или оформлению, чем он может отличаться от знакомых тебе чаёв."
                 ),
-                "tip": "Сфотографируй название — AI поможет перевести и объяснить его. Если понадобится уточнение, ниже появится готовая фраза.",
+                "tip": "Сфотографируй название и выбери «Прочитать / перевести». Если понадобится уточнение, используй готовую фразу ниже.",
                 "photo": "Сфотографируй название выбранного чая или его упаковку.",
                 "xp": 25,
                 "minutes": 12,
@@ -4414,7 +4571,7 @@ def mission_for_place(place, interests, index, used_titles):
                 "text": (
                     "Выбери незнакомое блюдо и попробуй угадать, острое ли оно, по фотографии, цвету и названию."
                 ),
-                "tip": "Не уверен — ничего страшного: догадку можно проверить с помощью AI или готовой китайской фразы.",
+                "tip": "Не уверен — ничего страшного: добавь фото для проверки догадки или используй готовую китайскую фразу.",
                 "photo": "Сфотографируй блюдо или его название в меню.",
                 "xp": 20,
                 "minutes": 10,
@@ -4427,7 +4584,7 @@ def mission_for_place(place, interests, index, used_titles):
                     "Выбери незнакомое блюдо и попробуй определить хотя бы один главный ингредиент: "
                     "мясо, рыба, овощи, грибы, лапша, рис или что-то совсем неожиданное."
                 ),
-                "tip": "Если по виду непонятно, проверь догадку по названию или с помощью AI.",
+                "tip": "Если по виду непонятно, проверь догадку по названию или добавь фотографию.",
                 "photo": "Сфотографируй блюдо или его название в меню.",
                 "xp": 20,
                 "minutes": 10,
@@ -4450,7 +4607,7 @@ def mission_for_place(place, interests, index, used_titles):
                     "Найди одну вещь, которую ты не ожидал здесь увидеть: блюдо, упаковку, предмет, вывеску, "
                     "необычный товар или декоративную деталь. Сначала попробуй сам догадаться, что это."
                 ),
-                "tip": "Если после догадки всё ещё непонятно, загрузи фото — бот предложит подходящий разбор для еды, текста, предмета или символа.",
+                "tip": "Если после догадки всё ещё непонятно, загрузи фото и выбери подходящее действие: еда, текст, предмет или символ.",
                 "photo": "Сфотографируй свою необычную находку.",
                 "xp": 20,
                 "minutes": 10,
@@ -4508,9 +4665,9 @@ def mission_for_place(place, interests, index, used_titles):
                     "Рассмотри его и попробуй догадаться, для чего он использовался или что в нём самое необычное."
                 ),
                 "tip": (
-                    "Если фотографировать можно — сфотографируй экспонат или табличку рядом с ним и спроси AI. "
-                    "Если фото запрещены — найди название экспоната или текст на табличке и введи его в бот вручную. "
-                    "AI попробует объяснить, что это. Если названия нет, нажми «🏛 Узнать об экспонате без фото» — там есть готовые вопросы на китайском с pinyin, русской транскрипцией и переводом."
+                    "Если фотографировать можно — сфотографируй экспонат или табличку рядом с ним и выбери подходящее действие с фото. "
+                    "Если фото запрещены — найди название экспоната или текст на табличке и введи его вручную. "
+                    "Если названия нет, нажми «🏛 Узнать об экспонате без фото» — там есть готовые вопросы на китайском с pinyin, русской транскрипцией и переводом."
                 ),
                 "photo": "Если съёмка разрешена, сфотографируй экспонат или табличку рядом с ним.",
                 "xp": 30,
@@ -4664,10 +4821,16 @@ def missing_interest_labels(places, interests):
     ]
 
 
-def build_field_missions(mode, interests, real_stop_count):
-    if mode == "rich":
-        return []
+def target_mission_count(duration):
+    return {
+        "2 часа": 4,
+        "4 часа": 7,
+        "6 часов": 10,
+        "весь день": 14,
+    }.get(duration, 7)
 
+
+def build_field_missions(mode, interests, real_stop_count, duration=None, ai_meta=None):
     templates = [
         {
             "title": "Короткая вывеска",
@@ -4694,6 +4857,69 @@ def build_field_missions(mode, interests, real_stop_count):
             "title": "Цвет города",
             "text": (
                 "Выбери один цвет, который сегодня часто встречается вокруг, и найди его ещё два раза по пути."
+            ),
+        },
+        {
+            "title": "Живая находка",
+            "text": (
+                "По пути выбери самую красивую живую деталь: дерево, цветок, растение в горшке или зелень на балконе. "
+                "Заметь, что именно выделяет её среди улицы — цвет, форма или неожиданное место."
+            ),
+        },
+        {
+            "title": "Магазин, в который хочется заглянуть",
+            "text": (
+                "Найди по пути небольшую лавку, витрину или вход, который вызывает любопытство. "
+                "До перевода вывески попробуй угадать по деталям, что там продают или делают."
+            ),
+        },
+        {
+            "title": "Звуковая открытка",
+            "text": (
+                "На минуту прислушайся к улице и выбери один звук, который мог бы стать звуковой открыткой этого города: "
+                "голоса, музыка, транспорт, птицы или работа мастерской."
+            ),
+        },
+        {
+            "title": "Пять минут на лавке",
+            "text": (
+                "Во время отдыха выбери одну сцену обычной городской жизни и последи за ней несколько минут: "
+                "как меняется улица, свет, звуки или поток транспорта. Реши, какая деталь лучше всего передаёт настроение места."
+            ),
+        },
+        {
+            "title": "Запах этого часа",
+            "text": (
+                "Остановись в безопасном месте и заметь самый характерный запах вокруг: еду, чай, растения, дождь, "
+                "дерево или нагретую улицу. Если запахов почти нет, выбери самое заметное ощущение воздуха."
+            ),
+        },
+        {
+            "title": "Город в движении",
+            "text": (
+                "Найди движение, за которым интересно наблюдать: велосипеды, лодки, транспорт, тени, флаги, листья или поток людей. "
+                "Выбери то, что задаёт улице её ритм, не фотографируя незнакомцев крупным планом."
+            ),
+        },
+        {
+            "title": "Маленькое удобство",
+            "text": (
+                "Заметь одну деталь, которая делает повседневную жизнь удобнее: место для отдыха, навигацию, доставку, "
+                "парковку велосипедов, торговый автомат или другое местное решение."
+            ),
+        },
+        {
+            "title": "Три слоя улицы",
+            "text": (
+                "Посмотри вниз, прямо и вверх и выбери по одной интересной детали на каждом уровне: покрытие или порог, "
+                "витрину или дверь, балкон, ветви, крышу либо вывеску."
+            ),
+        },
+        {
+            "title": "След времени",
+            "text": (
+                "Найди вещь, на которой заметно время или частое использование: потёртую ручку, ступень, старую вывеску, "
+                "ремонт, дерево у стены или выцветшую краску. Выбери деталь, у которой хочется представить историю."
             ),
         },
     ]
@@ -4724,10 +4950,52 @@ def build_field_missions(mode, interests, real_stop_count):
             ),
         })
 
-    wanted = 2 if mode == "compact" else 3
+    wanted = max(1, target_mission_count(duration) - real_stop_count)
     wanted = min(wanted, max(1, len(templates)))
 
-    return templates[:wanted]
+    generated = ai_meta.get("route_missions") if isinstance(ai_meta, dict) else None
+    accepted = []
+    if isinstance(generated, list):
+        for item in generated:
+            if not isinstance(item, dict):
+                continue
+            title = clean_ai_mission_value(item.get("title"), 70)
+            task = neutralize_unavailable_response_actions(
+                clean_ai_mission_value(item.get("task"), 280)
+            )
+            photo = clean_ai_mission_value(item.get("photo"), 220)
+            if not russian_editorial_ok(title, "title") or not russian_editorial_ok(task):
+                continue
+            try:
+                after_index = int(item.get("after_poi_index"))
+            except (TypeError, ValueError):
+                after_index = len(accepted) % max(1, real_stop_count)
+            after_index = max(0, min(max(0, real_stop_count - 1), after_index))
+            candidate = {
+                "title": title,
+                "text": task,
+                "photo": photo,
+                "after_poi_index": after_index,
+                "source": "ai_route",
+            }
+            if any(mission_copy_similarity(task, old["text"]) >= 0.52 for old in accepted):
+                continue
+            accepted.append(candidate)
+            if len(accepted) >= wanted:
+                break
+
+    used_titles = {item["title"] for item in accepted}
+    for fallback in templates:
+        if len(accepted) >= wanted:
+            break
+        if fallback["title"] not in used_titles:
+            fallback = dict(fallback)
+            fallback["after_poi_index"] = len(accepted) % max(1, real_stop_count)
+            if fallback["title"] not in {"Звуковая открытка", "Запах этого часа", "Пять минут на лавке"}:
+                fallback["photo"] = "Сфотографируй выбранную находку, если она действительно передаёт смысл задания."
+            accepted.append(fallback)
+            used_titles.add(fallback["title"])
+    return accepted
 
 
 def adaptive_mode_note(mode, places, interests):
@@ -4771,7 +5039,7 @@ def repeat_alternate_mission(place, fallback):
             ),
             "tip": (
                 "Покупать ничего не нужно: подойдут меню, упаковки, банки с чаем или уже готовые напитки. "
-                "Если название непонятно, сфотографируй его или введи текст в бот — AI поможет перевести."
+                "Если название непонятно, сфотографируй его и выбери «Прочитать / перевести» или введи текст вручную."
             ),
             "photo": "Сфотографируй два варианта чая, меню или упаковки, которые ты сравнивал.",
             "xp": 25,
@@ -4793,7 +5061,7 @@ def repeat_alternate_mission(place, fallback):
     return result
 
 
-def build_quest(city, interests, style, places, ai_meta, adaptive_mode="rich"):
+def build_quest(city, interests, style, places, ai_meta, adaptive_mode="rich", duration=None):
     stops = []
     social_used = False
     used_titles = set()
@@ -4924,7 +5192,9 @@ def build_quest(city, interests, style, places, ai_meta, adaptive_mode="rich"):
         "stops": stops,
         "adaptive_mode": adaptive_mode,
         "adaptive_note": adaptive_mode_note(adaptive_mode, places, interests),
-        "field_missions": build_field_missions(adaptive_mode, interests, len(places)),
+        "field_missions": build_field_missions(
+            adaptive_mode, interests, len(places), duration=duration, ai_meta=ai_meta
+        ),
         "ai_missions_accepted": accepted_ai,
     }
 
@@ -4954,16 +5224,54 @@ def checklist_text(quest, completed, bonuses, photos):
 
     for i, stop in enumerate(quest["stops"]):
         mark = "✅" if i in completed_set else "☐"
-        photo_mark = " 📷" if str(i) in photos else ""
-        lines.append(f"{mark} <b>{i+1}.</b> {esc(stop['name_ru'])}{photo_mark}")
+        photo_mark = " 📷" if (f"s{i}" in photos or str(i) in photos) else ""
+        lines.append(f"{mark} <b>{i+1}.</b> {esc(display_stop_name(stop))}{photo_mark}")
 
     lines += [
         "",
         ("🟩" * len(completed_set)) + ("⬜" * (len(quest["stops"]) - len(completed_set))),
         f"Прогресс: <b>{len(completed_set)}/{len(quest['stops'])}</b>",
-        f"📷 Фото: <b>{len(photos)}/{len(quest['stops'])}</b>",
+        f"📷 Фото-трофеи: <b>{len(photos)}</b>",
     ]
     return "\n".join(lines)
+
+
+def normalize_photo_key(value):
+    raw = str(value or "").strip().lower()
+    if raw.isdigit():
+        return f"s{int(raw)}"
+    if len(raw) >= 2 and raw[0] in {"s", "f"} and raw[1:].isdigit():
+        return f"{raw[0]}{int(raw[1:])}"
+    return ""
+
+
+def photo_value(mapping, key, default=None):
+    key = normalize_photo_key(key)
+    if not key:
+        return default
+    if key in mapping:
+        return mapping[key]
+    if key.startswith("s") and key[1:] in mapping:  # legacy quests
+        return mapping[key[1:]]
+    return default
+
+
+def photo_context(quest, key):
+    key = normalize_photo_key(key)
+    stops = quest.get("stops") or []
+    if key.startswith("s"):
+        index = int(key[1:])
+        if 0 <= index < len(stops):
+            stop = stops[index]
+            return key, index, stop, str((stop.get("mission") or {}).get("title") or stop.get("name_ru") or "Миссия")
+    if key.startswith("f"):
+        field_index = int(key[1:])
+        fields = quest.get("field_missions") or []
+        if 0 <= field_index < len(fields) and stops:
+            field = fields[field_index]
+            anchor = max(0, min(len(stops) - 1, int(field.get("after_poi_index", 0))))
+            return key, anchor, stops[anchor], str(field.get("title") or "Миссия по пути")
+    return None
 
 
 def place_unique_key(place):
@@ -5234,7 +5542,7 @@ def checklist_keyboard(quest, completed):
 
     for i, stop in enumerate(quest["stops"]):
         kb.button(
-            text=f"{'✅' if i in completed_set else '☐'} {i+1} · {short_text(stop['name_ru'], 30)}",
+            text=f"{'✅' if i in completed_set else '☐'} {i+1} · {short_text(display_stop_name(stop), 30)}",
             callback_data=f"mission_toggle:{i}",
         )
     kb.adjust(1)
@@ -5277,11 +5585,12 @@ def full_quest_keyboard(quest):
 def full_quest_text(quest, route, duration):
     sections = [route_summary(route, quest, duration), "", "📋 <b>Все миссии</b>"]
     for index, stop in enumerate(quest.get("stops", []), start=1):
-        mission = stop.get("mission") or {}
-        raw_name = str((stop.get("place") or {}).get("name") or "").strip()
+        place = stop.get("place") or {}
+        mission = apply_human_mission_copy(place, stop.get("mission") or {})
+        raw_name = str(place.get("name") or "").strip()
         sections.extend([
             "",
-            f"📍 <b>{index}. {esc(stop.get('name_ru') or 'Остановка')}</b>",
+            f"📍 <b>{index}. {esc(display_stop_name(stop))}</b>",
         ])
         if raw_name and contains_han(raw_name):
             sections.append(f"🏮 {esc(raw_name)}")
@@ -5289,17 +5598,59 @@ def full_quest_text(quest, route, duration):
             f"🎯 <b>{esc(mission.get('title') or 'Миссия')}</b>",
             esc(mission.get("text") or ""),
         ])
+        photo_line = compact_photo_instruction(place, mission)
+        if photo_line:
+            sections.append(esc(photo_line))
+    field_missions = quest.get("field_missions") or []
+    if field_missions:
+        sections.extend(["", "🧭 <b>Миссии по пути</b>"])
+        for index, field in enumerate(field_missions, start=1):
+            anchor = int(field.get("after_poi_index", 0) or 0)
+            stops = quest.get("stops") or []
+            place = (
+                (stops[max(0, min(len(stops) - 1, anchor))].get("place") or {})
+                if stops else {}
+            )
+            sections.extend([
+                "",
+                f"🚶 <b>{index}. {esc(field.get('title') or 'Наблюдение')}</b>",
+                esc(neutralize_unavailable_response_actions(field.get("text"))),
+            ])
+            photo_line = compact_photo_instruction(place, field)
+            if photo_line:
+                sections.append(esc(photo_line))
     return "\n".join(sections)
 
 
-def stop_keyboard(place, index, has_bonus, total_stops):
+async def answer_long_html(message, value, reply_markup=None, limit=3800):
+    """Send long HTML assembled from self-contained paragraphs."""
+    paragraphs = str(value or "").split("\n\n")
+    chunks = []
+    current = ""
+    for paragraph in paragraphs:
+        candidate = f"{current}\n\n{paragraph}" if current else paragraph
+        if current and len(candidate) > limit:
+            chunks.append(current)
+            current = paragraph
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    for index, chunk in enumerate(chunks):
+        await message.answer(
+            chunk,
+            reply_markup=reply_markup if index == len(chunks) - 1 else None,
+        )
+
+
+def stop_keyboard(place, index, has_bonus, total_stops, field_photo_missions=None):
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(
         text="📍 Открыть точку на карте",
         url=f"https://www.openstreetmap.org/?mlat={place['lat']}&mlon={place['lon']}#map=17/{place['lat']}/{place['lon']}",
     ))
     kb.row(
-        InlineKeyboardButton(text="📷 Добавить фото", callback_data=f"photo_add:{index}"),
+        InlineKeyboardButton(text="📷 Добавить фото", callback_data=f"photo_add:s{index}"),
         InlineKeyboardButton(text="✅ Выполнено", callback_data=f"mission_toggle:{index}"),
     )
     navigation = []
@@ -5322,6 +5673,11 @@ def stop_keyboard(place, index, has_bonus, total_stops):
     )
     if has_bonus:
         kb.row(InlineKeyboardButton(text="🎁 Отметить доп. задание", callback_data=f"bonus_toggle:{index}"))
+    for field_index, field in (field_photo_missions or []):
+        kb.row(InlineKeyboardButton(
+            text=f"📷 Фото · {short_text(field.get('title') or 'По пути', 28)}",
+            callback_data=f"photo_add:f{field_index}",
+        ))
     return kb.as_markup()
 
 
@@ -5364,7 +5720,9 @@ def mission_nav_keyboard(quest, idx):
 async def send_stop_card(message, quest, route, index):
     stop = quest["stops"][index]
     place = stop["place"]
-    mission = stop["mission"]
+    # Render through the current copy policy so old saved quests also receive
+    # neutral photo guidance after a deployment.
+    mission = apply_human_mission_copy(place, stop["mission"])
     legs = route.get("legs", [])
     raw_name = str(place.get("name") or "").strip()
     map_name_text = (
@@ -5372,11 +5730,8 @@ async def send_stop_card(message, quest, route, index):
         if raw_name and (contains_han(raw_name) or contains_cyrillic(raw_name))
         else ""
     )
-    pinyin_text = (
-        f"\n<i>{esc(place.get('pinyin'))}</i>"
-        if contains_han(raw_name) and place.get("pinyin")
-        else ""
-    )
+    displayed_pinyin = display_pinyin_for_place(place)
+    pinyin_text = f"\n<i>{esc(displayed_pinyin)}</i>" if displayed_pinyin else ""
 
     transition = ""
     access_leg = route.get("access_leg")
@@ -5403,15 +5758,26 @@ async def send_stop_card(message, quest, route, index):
 
     field_text = ""
     field_missions = quest.get("field_missions") or []
-    if 0 <= index < len(field_missions):
-        field = field_missions[index]
-        field_text = (
-            f"\n\n🧭 <b>По пути · {esc(field['title'])}</b>\n"
-            f"{esc(field['text'])}"
-        )
+    assigned_fields = [
+        (field_index, field) for field_index, field in enumerate(field_missions)
+        if int(field.get("after_poi_index", field_index % max(1, len(quest.get("stops") or [])))) == index
+    ]
+    if assigned_fields:
+        field_parts = []
+        for _, field in assigned_fields:
+            field_task = neutralize_unavailable_response_actions(field.get("text"))
+            part = f"\n\n🧭 <b>По пути · {esc(field['title'])}</b>\n{esc(field_task)}"
+            if field.get("photo"):
+                field_instruction = photo_learning_instruction(place, field)
+                part += f"\n📷 <b>Отдельный фото-трофей:</b> {esc(field['photo'])}"
+                if field_instruction:
+                    part += f"\n💡 {esc(field_instruction)}"
+            field_parts.append(part)
+        field_text = "".join(field_parts)
+    photo_help = photo_help_text(stop, bool(assigned_fields))
 
     await message.answer(
-        f"📍 <b>{index+1}/{len(quest['stops'])}. {esc(stop['name_ru'])}</b>\n"
+        f"📍 <b>{index+1}/{len(quest['stops'])}. {esc(display_stop_name(stop))}</b>\n"
         f"{esc(place['category_label'])}{map_name_text}"
         f"{pinyin_text}"
         f"{transition}\n"
@@ -5419,10 +5785,17 @@ async def send_stop_card(message, quest, route, index):
         f"🎯 <b>Миссия «{esc(mission['title'])}»:</b>\n{esc(mission['text'])}\n\n"
         f"🧭 <b>Подсказка:</b> {esc(mission['tip'])}\n\n"
         f"📷 <b>Фото-трофей:</b> {esc(mission['photo'])}\n"
+        f"\n{photo_help}"
         f"{phrase_text(mission.get('phrase'))}"
         f"{bonus_text}"
         f"{field_text}",
-        reply_markup=stop_keyboard(place, index, bool(stop.get("bonus")), len(quest["stops"])),
+        reply_markup=stop_keyboard(
+            place,
+            index,
+            bool(stop.get("bonus")),
+            len(quest["stops"]),
+            [(field_index, field) for field_index, field in assigned_fields if field.get("photo")],
+        ),
     )
 
 
@@ -5434,50 +5807,71 @@ def phrase_show_keyboard(keys, idx):
     return kb.as_markup()
 
 
-def photo_actions_keyboard(stop, index, version=0):
+def photo_actions_keyboard(stop, index, version=0, photo_key=None):
     group = place_group(stop["place"])
     kb = InlineKeyboardBuilder()
 
-    suffix = f":{index}:{int(version)}"
+    photo_key = normalize_photo_key(photo_key or f"s{index}")
+    suffix = f":{photo_key}:{int(version)}"
 
     if group in {"restaurant", "cafe", "tea"}:
         kb.button(text="🍜 Что на фото / в меню?", callback_data=f"vision:menu{suffix}")
         kb.button(text="🌶 Острое или нет?", callback_data=f"vision:spicy{suffix}")
         kb.button(text="🥢 Из чего это?", callback_data=f"vision:ingredients{suffix}")
         kb.button(text="🔤 Прочитать / перевести", callback_data=f"vision:text{suffix}")
+        kb.button(text="🧠 Что это за предмет?", callback_data=f"vision:object{suffix}")
 
     elif group == "market":
         kb.button(text="🍜 Это еда / меню", callback_data=f"vision:menu{suffix}")
         kb.button(text="🧧 Это предмет / символ", callback_data=f"vision:monument{suffix}")
         kb.button(text="🏮 Что здесь традиционного?", callback_data=f"vision:tradition{suffix}")
         kb.button(text="🔤 Прочитать / перевести", callback_data=f"vision:text{suffix}")
-        kb.button(text="🏯 Что это за место?", callback_data=f"vision:place{suffix}")
 
     elif group in {"heritage", "temple"}:
-        kb.button(text="🏯 Что это за место?", callback_data=f"vision:place{suffix}")
-        kb.button(text="🗿 Что за памятник / объект?", callback_data=f"vision:monument{suffix}")
+        kb.button(text="🔎 Что за деталь / объект?", callback_data=f"vision:monument{suffix}")
         kb.button(text="🧠 Что за символ?", callback_data=f"vision:symbol{suffix}")
         kb.button(text="🏮 Что здесь традиционного?", callback_data=f"vision:tradition{suffix}")
         kb.button(text="🔤 Что написано?", callback_data=f"vision:text{suffix}")
 
     elif group == "museum":
-        kb.button(text="🏯 Что это за место?", callback_data=f"vision:place{suffix}")
         kb.button(text="🗿 Что за объект?", callback_data=f"vision:monument{suffix}")
         kb.button(text="🧠 Что можно понять по фото?", callback_data=f"vision:object{suffix}")
         kb.button(text="🔤 Прочитать надпись", callback_data=f"vision:text{suffix}")
 
     else:
-        kb.button(text="🏯 Что это за место?", callback_data=f"vision:place{suffix}")
-        kb.button(text="🗿 Что за памятник / объект?", callback_data=f"vision:monument{suffix}")
+        kb.button(text="🔎 Что за деталь / объект?", callback_data=f"vision:monument{suffix}")
         kb.button(text="🏮 Найти китайские элементы", callback_data=f"vision:tradition{suffix}")
         kb.button(text="📸 Оценить кадр", callback_data=f"vision:photo{suffix}")
         kb.button(text="🔤 Что написано?", callback_data=f"vision:text{suffix}")
 
-    kb.button(text="🔄 Другое фото", callback_data=f"photo_replace:{index}")
+    kb.button(text="🔄 Другое фото", callback_data=f"photo_replace:{photo_key}")
     kb.button(text="➡️ Продолжить квест", callback_data=f"photo_continue:{index}")
     kb.button(text="✅ Чек-лист", callback_data="show_checklist")
     kb.adjust(1)
     return kb.as_markup()
+
+
+def photo_help_text(stop, has_field_missions=False):
+    group = place_group(stop.get("place") or {})
+    if group in {"restaurant", "cafe", "tea"}:
+        actions = "разобрать блюдо или меню, проверить остроту и состав, перевести надпись или определить предмет"
+    elif group == "market":
+        actions = "определить еду, предмет или символ и перевести надпись"
+    elif group in {"heritage", "temple", "museum", "monument"}:
+        actions = "разобрать найденную деталь или объект, понять символ и прочитать или перевести надпись"
+    else:
+        actions = "разобрать найденную деталь или объект, найти китайские элементы, перевести надпись или оценить кадр"
+
+    field_note = (
+        " У визуальных заданий «По пути» есть отдельные кнопки и собственные фотослоты."
+        if has_field_missions else ""
+    )
+    return (
+        "📱 <b>Что можно сделать с фото:</b> нажми «📷 Добавить фото» и отправь снимок. "
+        f"После загрузки появятся действия с фото: можно {actions}."
+        f"{field_note} Если по снимку не всё ясно, используй готовый вопрос на китайском с pinyin, "
+        "русской транскрипцией и переводом."
+    )
 
 
 def free_photo_actions_keyboard():
@@ -5703,7 +6097,7 @@ def glossary_notes_for_text(text_value: str) -> list[str]:
 
 
 def render_vision_result(result, mode="object"):
-    title = str(result.get("title") or "AI-разбор фото").strip()
+    title = str(result.get("title") or "Разбор фото").strip()
     intro = str(result.get("intro") or "").strip()
     conclusion = str(result.get("conclusion") or "").strip()
     uncertain = bool(result.get("uncertain"))
@@ -5780,7 +6174,9 @@ def followup_phrase_keys(mode):
         return ["inside", "meatfish", "what"]
     if mode == "menu":
         return ["spicy", "meatfish", "inside", "recommend"]
-    return []
+    if mode in {"text", "place", "monument", "object", "symbol", "tradition"}:
+        return ["what", "what_called"]
+    return ["what"]
 
 
 TRAVEL_CAPTION_SCHEMA = {
@@ -6353,9 +6749,9 @@ def render_travel_card(data, photo_images, caption, frame_style="none"):
 
     # Compact route line(s): user sees actual places included.
     stops = [
-        clean_card_text(stop.get("name_ru") or "")
+        clean_card_text(display_stop_name(stop))
         for stop in quest.get("stops", [])
-        if clean_card_text(stop.get("name_ru") or "")
+        if clean_card_text(display_stop_name(stop))
     ][:4]
 
     if stops:
@@ -6404,10 +6800,10 @@ async def collect_card_photos(bot, photos):
 
     def sort_key(item):
         key, _ = item
-        try:
-            return int(key)
-        except Exception:
-            return 999
+        normalized = normalize_photo_key(key)
+        if normalized:
+            return (0 if normalized.startswith("s") else 1, int(normalized[1:]))
+        return (2, 999)
 
     for _, file_id in sorted(photos.items(), key=sort_key)[:5]:
         try:
@@ -6846,6 +7242,8 @@ def route_summary(route, quest, duration):
     walk = route["time_s"] / 60
     route_heading = "🗺 <b>План прогулки</b>"
     missions = sum(int(s["mission"].get("minutes", 12)) for s in quest["stops"])
+    route_missions = len(quest.get("field_missions") or [])
+    missions += route_missions * 12
     total = DURATION_MINUTES[duration]
     free_time = max(0, total - walk - missions)
 
@@ -6859,6 +7257,16 @@ def route_summary(route, quest, duration):
     elif start_mode == "manual":
         shown = esc(start_label or "указанное место")
         start_line = f"⌨️ Старт: <b>от «{shown}»</b>\n"
+    else:
+        stops = quest.get("stops") or []
+        first_name = (
+            display_stop_name(stops[0])
+            if stops else "первая остановка"
+        )
+        start_line = (
+            f"📍 Старт: <b>{esc(first_name)}</b>\n"
+            "🗺 Открой первую миссию, чтобы посмотреть точку на карте.\n"
+        )
 
     if start_mode in {"location", "manual"} and access_leg:
         start_line += (
@@ -6887,7 +7295,7 @@ def route_summary(route, quest, duration):
         f"{route_heading}\n"
         f"{start_line}"
         f"🚶 Пешком всего: ~{fmt_distance(route['distance_m'])} · ~{fmt_minutes(walk)}\n"
-        f"🎯 Миссии: ~{fmt_minutes(missions)}\n"
+        f"🎯 Миссии у мест и по пути: ~{fmt_minutes(missions)}\n"
         f"🧭 На осмотр мест, еду и отдых: до ~{fmt_minutes(free_time)}"
     )
 
@@ -7427,7 +7835,8 @@ async def _generate_quest_for_start(
             else "от указанного места"
         )
     else:
-        start_description = "из центральной части города"
+        first_name = safe_russian_name(selected[0]) if selected else "первая остановка"
+        start_description = f"у первой остановки «{esc(first_name)}»"
 
     selected_repeats = sum(
         1
@@ -7504,6 +7913,7 @@ async def _generate_quest_for_start(
         selected,
         ai_meta,
         adaptive_mode=adaptive_mode,
+        duration=duration,
     )
 
     await state.update_data(
@@ -7571,8 +7981,8 @@ async def style_cb(callback: CallbackQuery, state: FSMContext):
         "📍 <b>Геолокация</b> — удобно, если ты уже в городе и открываешь бота с телефона.\n\n"
         "⌨️ <b>Название места или адрес</b> — можно написать отель, вокзал, торговый центр, "
         "достопримечательность или обычный адрес. Это удобно в Telegram Desktop и при планировании поездки.\n\n"
-        "🏙 <b>Центральная часть города</b> — использую центральную координату города из Geoapify "
-        "как ориентир. Это не обязательно главная площадь.",
+        "🏙 <b>Подобрать старт в центре</b> — найду первую реальную остановку в центральной части. "
+        "После построения покажу её название и кнопку карты — начинать нужно будет именно от неё.",
         reply_markup=start_point_keyboard(),
     )
 
@@ -7729,10 +8139,18 @@ async def start_location_received(message: Message, state: FSMContext):
     QuestForm.waiting_start_text,
     F.text == "🏙 Начать из центра города",
 )
+@router.message(
+    QuestForm.choosing_start,
+    F.text == "🏙 Подобрать старт в центре",
+)
+@router.message(
+    QuestForm.waiting_start_text,
+    F.text == "🏙 Подобрать старт в центре",
+)
 async def start_from_center(message: Message, state: FSMContext):
     await message.answer(
-        "✅ Начинаем от центральной координаты города, которую вернул Geoapify.\n"
-        "Это ориентир для подбора маршрута, а не обязательно главная площадь.",
+        "✅ Подбираю удобную первую остановку в центральной части города.\n"
+        "Когда маршрут будет готов, покажу точное место старта и карту.",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -7828,7 +8246,8 @@ async def manual_start_retry(callback: CallbackQuery, state: FSMContext):
 async def manual_start_center(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await callback.message.answer(
-        "✅ Использую центральную координату выбранного города как ориентир."
+        "✅ Подбираю удобную первую остановку в центральной части города.\n"
+        "Точное место старта и карта появятся в готовом маршруте."
     )
     await generate_quest_for_start(
         callback.message,
@@ -7946,7 +8365,7 @@ async def museum_text_menu(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         "🏛 <b>Если фотографировать нельзя</b>\n\n"
         "Посмотри, есть ли рядом название экспоната или табличка.\n\n"
-        "• Если есть — введи название или текст сюда вручную, и AI попробует объяснить, что это.\n"
+        "• Если есть — введи название или текст сюда вручную, чтобы узнать, что это.\n"
         "• Если названия нет — можно показать сотруднику готовый вопрос на китайском.",
         reply_markup=museum_text_keyboard(idx),
     )
@@ -7969,7 +8388,7 @@ async def museum_text_start(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         "⌨️ <b>Введи название экспоната или текст с таблички</b>\n\n"
         "Можно перепечатать китайское, английское или русское название. "
-        "AI попробует объяснить простыми словами, что это и для чего предмет мог использоваться.\n\n"
+        "Получи простое объяснение, что это и для чего предмет мог использоваться.\n\n"
         "Если надпись длинная, достаточно названия и 1–2 основных строк."
     )
 
@@ -8134,7 +8553,7 @@ async def replace_point_request(callback: CallbackQuery, state: FSMContext):
         return
 
     stop = quest["stops"][idx]
-    has_photo = bool((data.get("photos") or {}).get(str(idx)))
+    has_photo = bool(photo_value(data.get("photos") or {}, f"s{idx}"))
 
     photo_warning = (
         "\n\n📷 Фото-трофей этой миссии тоже будет удалён, "
@@ -8237,9 +8656,10 @@ async def replace_point_confirm(callback: CallbackQuery, state: FSMContext):
     photos = dict(data.get("photos") or {})
     photo_versions = dict(data.get("photo_versions") or {})
     photos.pop(str(idx), None)
-    photo_versions[str(idx)] = int(
-        photo_versions.get(str(idx), 0)
-    ) + 1
+    photos.pop(f"s{idx}", None)
+    old_version = int(photo_value(photo_versions, f"s{idx}", 0) or 0)
+    photo_versions.pop(str(idx), None)
+    photo_versions[f"s{idx}"] = old_version + 1
 
     bonuses = [
         value
@@ -8361,18 +8781,19 @@ async def bonus_toggle(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("photo_add:"))
 async def photo_add(callback: CallbackQuery, state: FSMContext):
-    idx = int(callback.data.split(":", 1)[1])
+    photo_key = normalize_photo_key(callback.data.split(":", 1)[1])
     data = await restore_active_state(callback.from_user.id, state)
     quest = data.get("quest")
+    context = photo_context(quest or {}, photo_key)
 
-    if not quest or idx >= len(quest["stops"]):
+    if not quest or not context:
         await callback.answer("Миссия не найдена.", show_alert=True)
         return
 
-    await state.update_data(photo_target=idx)
+    await state.update_data(photo_target=photo_key)
     await state.set_state(QuestForm.waiting_photo)
     await callback.answer(
-        "📷 Теперь отправь фотографию в чат. После загрузки появятся кнопки AI-разбора.",
+        "📷 Теперь отправь фотографию в чат. После загрузки появятся действия с фото.",
         show_alert=True,
     )
 
@@ -8380,15 +8801,15 @@ async def photo_add(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("photo_replace:"))
 async def photo_replace(callback: CallbackQuery, state: FSMContext):
-    idx = int(callback.data.split(":", 1)[1])
+    photo_key = normalize_photo_key(callback.data.split(":", 1)[1])
     data = await restore_active_state(callback.from_user.id, state)
     quest = data.get("quest")
 
-    if not quest or idx < 0 or idx >= len(quest["stops"]):
+    if not quest or not photo_context(quest, photo_key):
         await callback.answer("Миссия не найдена.", show_alert=True)
         return
 
-    await state.update_data(photo_target=idx)
+    await state.update_data(photo_target=photo_key)
     await state.set_state(QuestForm.waiting_photo)
     await callback.answer(
         "🔄 Теперь отправь новый снимок в чат. Он заменит прежний фото-трофей.",
@@ -8410,9 +8831,11 @@ async def cancelphoto(message: Message, state: FSMContext):
 @router.message(QuestForm.waiting_photo, F.photo)
 async def receive_photo(message: Message, state: FSMContext):
     data = await state.get_data()
-    quest, idx = data.get("quest"), data.get("photo_target")
+    quest = data.get("quest")
+    photo_key = normalize_photo_key(data.get("photo_target"))
+    context = photo_context(quest or {}, photo_key)
 
-    if not quest or idx is None:
+    if not quest or not context:
         await message.answer("Не удалось определить миссию.")
         return
 
@@ -8425,8 +8848,13 @@ async def receive_photo(message: Message, state: FSMContext):
     photos = dict(data.get("photos", {}))
     versions = dict(data.get("photo_versions", {}))
 
-    key = str(idx)
-    previous_exists = bool(photos.get(key))
+    key, idx, stop, mission_title = context
+    previous_exists = bool(photo_value(photos, key))
+
+    # Transparently migrate an old numeric stop key when its photo is replaced.
+    if key.startswith("s"):
+        photos.pop(key[1:], None)
+        versions.pop(key[1:], None)
 
     photos[key] = chosen.file_id
     versions[key] = int(versions.get(key, 0)) + 1
@@ -8440,15 +8868,18 @@ async def receive_photo(message: Message, state: FSMContext):
     await state.set_state(QuestForm.quest_active)
     await persist_active_state(message.from_user.id, state)
 
-    stop = quest["stops"][idx]
     verb = "заменено" if previous_exists else "сохранено"
 
+    shown_stop_name = display_stop_name(stop)
+    photo_heading = shown_stop_name if key.startswith("s") else mission_title
+    location_line = "" if key.startswith("s") else f"📍 {esc(shown_stop_name)}\n"
     await message.answer(
-        f"📷 <b>Фото {verb}: {esc(stop['name_ru'])}</b>\n\n"
+        f"📷 <b>Фото {verb}: {esc(photo_heading)}</b>\n"
+        f"{location_line}\n"
         "Для каждой миссии хранится <b>один фото-трофей</b>. "
         "Если нажать «🔄 Другое фото», этот снимок будет заменён.\n\n"
-        "AI-разбор необязателен: можно сразу нажать «➡️ Продолжить квест».",
-        reply_markup=photo_actions_keyboard(stop, idx, version=version),
+        "Разбор фото необязателен: можно сразу нажать «➡️ Продолжить квест».",
+        reply_markup=photo_actions_keyboard(stop, idx, version=version, photo_key=key),
     )
 
 
@@ -8465,7 +8896,7 @@ async def vision_callback(callback: CallbackQuery, state: FSMContext):
         return
 
     mode = parts[1]
-    idx = int(parts[2])
+    photo_key = normalize_photo_key(parts[2])
     expected_version = int(parts[3]) if len(parts) >= 4 and parts[3].isdigit() else None
 
     data = await restore_active_state(callback.from_user.id, state)
@@ -8473,8 +8904,13 @@ async def vision_callback(callback: CallbackQuery, state: FSMContext):
     photos = data.get("photos", {})
     versions = data.get("photo_versions", {})
 
-    file_id = photos.get(str(idx))
-    current_version = int(versions.get(str(idx), 0))
+    context = photo_context(quest or {}, photo_key)
+    if not context:
+        await callback.answer("Миссия не найдена.", show_alert=True)
+        return
+    photo_key, idx, stop, _ = context
+    file_id = photo_value(photos, photo_key)
+    current_version = int(photo_value(versions, photo_key, 0) or 0)
 
     if not quest or not file_id:
         await callback.answer("Сначала добавь фото.", show_alert=True)
@@ -8493,6 +8929,7 @@ async def vision_callback(callback: CallbackQuery, state: FSMContext):
                 quest["stops"][idx],
                 idx,
                 version=current_version,
+                photo_key=photo_key,
             ),
         )
         return
@@ -8518,8 +8955,8 @@ async def vision_callback(callback: CallbackQuery, state: FSMContext):
         latest_versions = latest.get("photo_versions", {})
 
         if (
-            latest_photos.get(str(idx)) != request_file_id
-            or int(latest_versions.get(str(idx), 0)) != request_version
+            photo_value(latest_photos, photo_key) != request_file_id
+            or int(photo_value(latest_versions, photo_key, 0) or 0) != request_version
         ):
             await safe_status_edit(status, 
                 "🔄 Пока я анализировал снимок, ты уже заменил фото. "
@@ -8552,12 +8989,12 @@ async def vision_callback(callback: CallbackQuery, state: FSMContext):
     latest_versions = latest.get("photo_versions", {})
 
     if (
-        latest_photos.get(str(idx)) != request_file_id
-        or int(latest_versions.get(str(idx), 0)) != request_version
+        photo_value(latest_photos, photo_key) != request_file_id
+        or int(photo_value(latest_versions, photo_key, 0) or 0) != request_version
     ):
         await safe_status_edit(status, 
             "🔄 Пока я анализировал снимок, ты уже заменил фото. "
-            "Старый AI-разбор скрыт — используй кнопки под новым снимком."
+            "Старый разбор скрыт — используй кнопки под новым снимком."
         )
         return
 
@@ -8657,7 +9094,8 @@ async def show_full_quest_callback(callback: CallbackQuery, state: FSMContext):
         return
 
     await callback.answer()
-    await callback.message.answer(
+    await answer_long_html(
+        callback.message,
         full_quest_text(quest, route, duration),
         reply_markup=full_quest_keyboard(quest),
     )
@@ -9143,23 +9581,18 @@ async def passport_photos(callback: CallbackQuery):
 
     def photo_sort_key(item):
         key, _ = item
-        try:
-            return int(key)
-        except Exception:
-            return 999
+        normalized = normalize_photo_key(key)
+        if normalized:
+            return (0 if normalized.startswith("s") else 1, int(normalized[1:]))
+        return (2, 999)
 
     for key, file_id in sorted(photos.items(), key=photo_sort_key):
-        try:
-            idx = int(key)
-        except Exception:
-            idx = -1
-
         stop_name = ""
         mission_title = ""
-        if 0 <= idx < len(quest.get("stops") or []):
-            stop = quest["stops"][idx]
-            stop_name = str(stop.get("name_ru") or "")
-            mission_title = str((stop.get("mission") or {}).get("title") or "")
+        context = photo_context(quest, key)
+        if context:
+            _, idx, stop, mission_title = context
+            stop_name = display_stop_name(stop)
 
         caption_parts = []
         if stop_name:
@@ -9618,7 +10051,7 @@ async def about(callback: CallbackQuery):
         "• «Мои приключения» работают как паспорт городов с красными печатями, статистикой и архивом квестов.\n"
         "• Неудачную точку активного квеста можно заменить без пересборки всего путешествия.\n"
         "• При новом квесте в уже исследованном городе новые места получают приоритет; старые POI используются только как резерв и получают новую миссию.\n"
-        "• Точку старта можно задать геолокацией, названием места/отеля, адресом или центральной координатой города."
+        "• Точку старта можно задать геолокацией, названием места/отеля или адресом. Также можно подобрать первую остановку в центральной части города."
     )
 
 
