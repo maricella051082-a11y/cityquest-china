@@ -459,11 +459,12 @@ class NavigationTests(unittest.TestCase):
             "photo": "Сфотографируй иероглиф.",
         }
         edited = main.apply_human_mission_copy(place, mission)
-        self.assertIn("Загрузи снимок", edited["tip"])
-        self.assertIn("Прочитать / перевести", edited["tip"])
-        self.assertIn("pinyin", edited["tip"])
         self.assertNotIn("бот", edited["tip"].lower())
         self.assertNotIn("AI", edited["tip"])
+        instruction = main.compact_photo_instruction(place, edited)
+        self.assertIn("После фото", instruction)
+        self.assertIn("Прочитать / перевести", instruction)
+        self.assertIn("pinyin", instruction)
 
     def test_food_photo_mission_explains_available_analysis(self):
         place = {"category_label": "🍜 ресторан"}
@@ -475,8 +476,9 @@ class NavigationTests(unittest.TestCase):
             "photo": "Сфотографируй блюдо.",
         }
         edited = main.apply_human_mission_copy(place, mission)
-        self.assertIn("узнать больше о блюде", edited["tip"])
-        self.assertIn("возможный состав и остроту", edited["tip"])
+        instruction = main.compact_photo_instruction(place, edited)
+        self.assertIn("После фото", instruction)
+        self.assertIn("составе и остроте", instruction)
 
     def test_full_quest_shows_photo_help_without_opening_mission(self):
         quest = {
@@ -495,7 +497,7 @@ class NavigationTests(unittest.TestCase):
         }
         route = {"time_s": 0, "distance_m": 0, "legs": [], "start_mode": "center"}
         text = main.full_quest_text(quest, route, "2 часа")
-        self.assertIn("Добавь фото", text)
+        self.assertIn("После фото", text)
         self.assertIn("Прочитать / перевести", text)
         self.assertIn("pinyin", text)
 
@@ -515,8 +517,22 @@ class NavigationTests(unittest.TestCase):
         edited = main.apply_human_mission_copy(place, mission)
         self.assertNotIn("AI", edited["tip"])
         self.assertNotIn("бот", edited["tip"].lower())
-        self.assertIn("Загрузи снимок", edited["tip"])
-        self.assertIn("дополнительную информацию", edited["tip"])
+        self.assertIn("Узнать об экспонате без фото", edited["tip"])
+        instruction = main.compact_photo_instruction(place, edited)
+        self.assertIn("После фото", instruction)
+        self.assertIn("экспонате", instruction)
+
+    def test_every_field_mission_gets_its_own_optional_photo_slot(self):
+        visual = main.ensure_field_mission_photo({
+            "title": "Современный родственник",
+            "text": "Найди предмет, похожий на музейный экспонат.",
+        })
+        sensory = main.ensure_field_mission_photo({
+            "title": "Звуковая открытка",
+            "text": "Прислушайся к звукам улицы.",
+        })
+        self.assertIn("отдельный фото-трофей", visual["photo"])
+        self.assertIn("Если хочешь", sensory["photo"])
 
     def test_mission_does_not_require_nonexistent_text_answer(self):
         original = (
@@ -528,6 +544,16 @@ class NavigationTests(unittest.TestCase):
         self.assertIn("Обрати внимание, чем он отличается", edited)
         self.assertIn("Реши для себя, что понравилось", edited)
         self.assertIn("запомни ответ", edited.lower())
+
+    def test_awkward_generated_russian_is_normalized(self):
+        original = (
+            "Встреться с вывеской и запомни в уме слово. "
+            "Если не можешь фото, просто запомни ощущение."
+        )
+        edited = main.neutralize_unavailable_response_actions(original)
+        self.assertIn("Найди вывеску", edited)
+        self.assertNotIn("в уме", edited)
+        self.assertIn("если нельзя сделать фото", edited.lower())
 
     def test_museum_stop_restores_no_photo_action(self):
         place = {

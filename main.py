@@ -3658,7 +3658,7 @@ async def groq_meta(city, duration, interests, style, places, avoid_missions=Non
 17. Не пиши «учитывай растения, здания, одежду», «видимая часть», «разложи в кадр», «чтобы AI распознал контраст», «ингредиентное сочетание».
 18. Не придумывай точное расположение детали внутри объекта, если оно не подтверждено: никаких «на задней стенке» или «слева от входа».
 19. Для еды можно давать разные игровые задачи: вкус-загадка, необычное блюдо, цвет, подача, сравнение, чашка/посуда, острота, состав, название.
-20. Для музея миссия должна работать даже без фотографии. Если фото разрешено — в hint можно предложить AI как дополнительный способ узнать больше.
+20. Для музея миссия должна работать даже без фотографии. Если фото разрешено — в hint можно нейтрально предложить загрузить снимок и выбрать подходящее действие с фото.
 21. Поле photo — это фото-трофей, а не обязательное условие выполнения каждой миссии.
 22. Каждая миссия должна заметно отличаться от других по механике, наблюдению или маленькому выбору пользователя.
 23. task: 180–280 символов, одно основное действие, которое можно пересказать одним предложением.
@@ -3735,6 +3735,7 @@ async def groq_meta(city, duration, interests, style, places, avoid_missions=Non
                         data = json.loads(body)
                         result = json.loads(data["choices"][0]["message"]["content"])
                         if isinstance(result, dict):
+                            result = await edit_all_ai_copy(result)
                             if not russian_editorial_ok(result.get("title"), "title"):
                                 result["title"] = ""
                             if not russian_editorial_ok(result.get("intro"), "intro"):
@@ -3753,6 +3754,68 @@ async def groq_meta(city, duration, interests, style, places, avoid_missions=Non
 
     # Important: the current template mission engine remains the fallback.
     return {}
+
+
+async def edit_all_ai_copy(result):
+    """Mandatory second pass: ideas first, natural Russian copy second."""
+    if not isinstance(result, dict):
+        return result
+    original_missions = result.get("missions") or []
+    original_routes = result.get("route_missions") or []
+    prompt = (
+        "Отредактируй весь JSON как строгий русскоязычный редактор туристического приложения. "
+        "Не меняй количество элементов, poi_index, after_poi_index, mechanic, смысл заданий и факты. "
+        "Исправь кальки, неестественные сочетания и машинный русский. Пиши коротко и разговорно. "
+        "Нельзя: «встреться с вывеской», «запомни в уме», «если не можешь фото», "
+        "«опиши», «укажи», «запиши», «напиши», «расскажи», AI, ИИ, бот. "
+        "Вместо этого: «найди вывеску», «запомни», «если нельзя сделать фото», "
+        "«обрати внимание», «подумай», «реши для себя». Не добавляй инструкции, которых не было. "
+        "Верни только JSON по той же схеме.\n\n"
+        + json.dumps(result, ensure_ascii=False)
+    )
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": "Ты редактор естественного современного русского языка. Не меняй содержание и структуру."},
+            {"role": "user", "content": prompt},
+        ],
+        "reasoning_effort": "medium",
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "cityquest_russian_editor",
+                "strict": True,
+                "schema": AI_META_SCHEMA,
+            },
+        },
+    }
+    timeout = aiohttp.ClientTimeout(total=12, connect=3, sock_connect=3, sock_read=10)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json=payload,
+            ) as response:
+                if response.status != 200:
+                    return result
+                body = await response.json()
+                edited = json.loads(body["choices"][0]["message"]["content"])
+    except Exception:
+        logger.exception("Full Russian mission editor failed")
+        return result
+
+    edited_missions = edited.get("missions") or []
+    edited_routes = edited.get("route_missions") or []
+    if len(edited_missions) != len(original_missions) or len(edited_routes) != len(original_routes):
+        return result
+    for old, new in zip(original_missions, edited_missions):
+        if old.get("poi_index") != new.get("poi_index") or old.get("mechanic") != new.get("mechanic"):
+            return result
+    for old, new in zip(original_routes, edited_routes):
+        if old.get("after_poi_index") != new.get("after_poi_index"):
+            return result
+    return edited
 
 
 async def edit_rejected_ai_missions(missions, places, style):
@@ -4308,6 +4371,27 @@ def neutralize_unavailable_response_actions(value):
     ]
     for pattern, replacement in replacements:
         text = re.sub(pattern, replacement, text)
+    text = re.sub(r"\bзапомни(?:в)?\s+в?\s*уме\b", "запомни", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\bесли\s+не\s+можешь\s+(?:сделать\s+)?фото\b",
+        "если нельзя сделать фото",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\bесли\s+не\s+можешь\s+сфотографировать\b",
+        "если фотографировать нельзя",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\b[Вв]стрет(?:ься|ись)\s+с\s+(вывеск|табличк|надпис|витрин)\w*",
+        lambda m: (
+            ("Найди " if m.group(0)[0].isupper() else "найди ")
+            + {"вывеск": "вывеску", "табличк": "табличку", "надпис": "надпись", "витрин": "витрину"}[m.group(1).casefold()]
+        ),
+        text,
+    )
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -4333,13 +4417,15 @@ def compact_photo_instruction(place, mission):
     group = place_group(place)
     mechanic = str(mission.get("mechanic") or mission.get("type") or "").casefold()
     combined = " ".join(str(mission.get(key) or "") for key in ("title", "text", "photo")).casefold()
+    if group == "museum":
+        return "📱 После фото: узнай больше об экспонате или переведи текст на табличке."
     if mechanic == "text" or re.search(r"иероглиф|надпис|вывеск|табличк|меню|назван", combined):
-        return "📷 Добавь фото → «Прочитать / перевести»: текст, pinyin и перевод."
+        return "📱 После фото: «Прочитать / перевести» — текст, pinyin и перевод."
     if group in {"restaurant", "cafe", "tea"}:
-        return "📷 Добавь фото → посмотри информацию о блюде или напитке, составе и остроте."
+        return "📱 После фото: посмотри информацию о блюде или напитке, составе и остроте."
     if mechanic == "symbol" or re.search(r"символ|орнамент|традиц", combined):
-        return "📷 Добавь фото → узнай больше о символе или традиционной детали."
-    return "📷 Добавь фото → узнай больше о выбранной находке."
+        return "📱 После фото: узнай больше о символе или традиционной детали."
+    return "📱 После фото: узнай больше о выбранной находке."
 
 
 def apply_human_mission_copy(place, mission):
@@ -4348,11 +4434,27 @@ def apply_human_mission_copy(place, mission):
     result["text"] = neutralize_unavailable_response_actions(
         neutralize_tool_mentions(result.get("text"))
     )
-    result["photo"] = neutralize_tool_mentions(result.get("photo"))
-    instruction = photo_learning_instruction(place, result)
+    result["photo"] = neutralize_unavailable_response_actions(
+        neutralize_tool_mentions(result.get("photo"))
+    )
     tip = neutralize_unavailable_response_actions(
         neutralize_tool_mentions(result.get("tip"))
     )
+    if place_group(place) == "museum":
+        museum_sentences = re.split(r"(?<=[.!?])\s+", tip)
+        useful = [
+            sentence for sentence in museum_sentences
+            if sentence and not re.search(
+                r"фото|сним|съ[её]м|табличк|кнопк|узнать об экспонате|ai|ии|бот",
+                sentence,
+                re.IGNORECASE,
+            )
+        ]
+        useful.append(
+            "Если съёмка запрещена, выбери «🏛 Узнать об экспонате без фото»: "
+            "введи название вручную или используй готовый вопрос."
+        )
+        tip = " ".join(useful).strip()
     # User-facing guidance describes available actions, not the underlying
     # implementation. A deterministic instruction below restores the useful
     # part if a generated sentence mentions AI or the bot.
@@ -4363,16 +4465,6 @@ def apply_human_mission_copy(place, mission):
     ]
     tip = " ".join(neutral_sentences).strip()
     result["tip"] = tip
-    tip_low = tip.casefold()
-    already_explains_action = bool(
-        re.search(r"фото|снимок|сфотограф", tip_low)
-        and re.search(
-            r"прочитать\s*/\s*перевести|что за символ|что за объект|что можно понять|кнопк|ai|ии",
-            tip_low,
-        )
-    )
-    if instruction and not already_explains_action:
-        result["tip"] = f"{tip} {instruction}".strip()
     return result
 
 
@@ -4840,6 +4932,27 @@ def target_mission_count(duration):
     }.get(duration, 7)
 
 
+def ensure_field_mission_photo(field):
+    """Give every route mission a consistent optional trophy slot."""
+    result = dict(field or {})
+    result["text"] = neutralize_unavailable_response_actions(result.get("text"))
+    if str(result.get("photo") or "").strip():
+        result["photo"] = neutralize_unavailable_response_actions(result.get("photo"))
+        return result
+    combined = f"{result.get('title') or ''} {result.get('text') or ''}".casefold()
+    sensory = re.search(
+        r"звук|услыш|прислуш|аромат|запах|температур|ощущени|вкус|попробуй на вкус",
+        combined,
+    )
+    if sensory:
+        result["photo"] = (
+            "Если хочешь, сфотографируй место или деталь, которая будет напоминать об этом моменте."
+        )
+    else:
+        result["photo"] = "Сфотографируй выбранную находку — у этой миссии будет отдельный фото-трофей."
+    return result
+
+
 def build_field_missions(mode, interests, real_stop_count, duration=None, ai_meta=None):
     templates = [
         {
@@ -4988,6 +5101,7 @@ def build_field_missions(mode, interests, real_stop_count, duration=None, ai_met
                 "after_poi_index": after_index,
                 "source": "ai_route",
             }
+            candidate = ensure_field_mission_photo(candidate)
             if any(mission_copy_similarity(task, old["text"]) >= 0.52 for old in accepted):
                 continue
             accepted.append(candidate)
@@ -5003,7 +5117,7 @@ def build_field_missions(mode, interests, real_stop_count, duration=None, ai_met
             fallback["after_poi_index"] = len(accepted) % max(1, real_stop_count)
             if fallback["title"] not in {"Звуковая открытка", "Запах этого часа", "Пять минут на лавке"}:
                 fallback["photo"] = "Сфотографируй выбранную находку, если она действительно передаёт смысл задания."
-            accepted.append(fallback)
+            accepted.append(ensure_field_mission_photo(fallback))
             used_titles.add(fallback["title"])
     return accepted
 
@@ -5611,7 +5725,10 @@ def full_quest_text(quest, route, duration):
         photo_line = compact_photo_instruction(place, mission)
         if photo_line:
             sections.append(esc(photo_line))
-    field_missions = quest.get("field_missions") or []
+    field_missions = [
+        ensure_field_mission_photo(field)
+        for field in (quest.get("field_missions") or [])
+    ]
     if field_missions:
         sections.extend(["", "🧭 <b>Миссии по пути</b>"])
         for index, field in enumerate(field_missions, start=1):
@@ -5767,7 +5884,10 @@ async def send_stop_card(message, quest, route, index):
         )
 
     field_text = ""
-    field_missions = quest.get("field_missions") or []
+    field_missions = [
+        ensure_field_mission_photo(field)
+        for field in (quest.get("field_missions") or [])
+    ]
     assigned_fields = [
         (field_index, field) for field_index, field in enumerate(field_missions)
         if int(field.get("after_poi_index", field_index % max(1, len(quest.get("stops") or [])))) == index
@@ -5778,13 +5898,14 @@ async def send_stop_card(message, quest, route, index):
             field_task = neutralize_unavailable_response_actions(field.get("text"))
             part = f"\n\n🧭 <b>По пути · {esc(field['title'])}</b>\n{esc(field_task)}"
             if field.get("photo"):
-                field_instruction = photo_learning_instruction(place, field)
+                field_instruction = compact_photo_instruction(place, field)
                 part += f"\n📷 <b>Отдельный фото-трофей:</b> {esc(field['photo'])}"
                 if field_instruction:
                     part += f"\n💡 {esc(field_instruction)}"
             field_parts.append(part)
         field_text = "".join(field_parts)
-    photo_help = photo_help_text(stop, bool(assigned_fields))
+    photo_action = compact_photo_instruction(place, mission)
+    photo_action_text = f"{esc(photo_action)}\n" if photo_action else ""
 
     await message.answer(
         f"📍 <b>{index+1}/{len(quest['stops'])}. {esc(display_stop_name(stop))}</b>\n"
@@ -5795,7 +5916,7 @@ async def send_stop_card(message, quest, route, index):
         f"🎯 <b>Миссия «{esc(mission['title'])}»:</b>\n{esc(mission['text'])}\n\n"
         f"🧭 <b>Подсказка:</b> {esc(mission['tip'])}\n\n"
         f"📷 <b>Фото-трофей:</b> {esc(mission['photo'])}\n"
-        f"\n{photo_help}"
+        f"{photo_action_text}"
         f"{phrase_text(mission.get('phrase'))}"
         f"{bonus_text}"
         f"{field_text}",
@@ -5859,29 +5980,6 @@ def photo_actions_keyboard(stop, index, version=0, photo_key=None):
     kb.button(text="✅ Чек-лист", callback_data="show_checklist")
     kb.adjust(1)
     return kb.as_markup()
-
-
-def photo_help_text(stop, has_field_missions=False):
-    group = place_group(stop.get("place") or {})
-    if group in {"restaurant", "cafe", "tea"}:
-        actions = "разобрать блюдо или меню, проверить остроту и состав, перевести надпись или определить предмет"
-    elif group == "market":
-        actions = "определить еду, предмет или символ и перевести надпись"
-    elif group in {"heritage", "temple", "museum", "monument"}:
-        actions = "разобрать найденную деталь или объект, понять символ и прочитать или перевести надпись"
-    else:
-        actions = "разобрать найденную деталь или объект, найти китайские элементы, перевести надпись или оценить кадр"
-
-    field_note = (
-        " У визуальных заданий «По пути» есть отдельные кнопки и собственные фотослоты."
-        if has_field_missions else ""
-    )
-    return (
-        "📱 <b>Что можно сделать с фото:</b> нажми «📷 Добавить фото» и отправь снимок. "
-        f"После загрузки появятся действия с фото: можно {actions}."
-        f"{field_note} Если по снимку не всё ясно, используй готовый вопрос на китайском с pinyin, "
-        "русской транскрипцией и переводом."
-    )
 
 
 def free_photo_actions_keyboard():
