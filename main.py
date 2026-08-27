@@ -4411,21 +4411,10 @@ def neutralize_tool_mentions(value):
 
 
 def compact_photo_instruction(place, mission):
-    """Short version for the all-missions overview."""
+    """One neutral prompt shared by every photo mission."""
     if not str(mission.get("photo") or "").strip():
         return ""
-    group = place_group(place)
-    mechanic = str(mission.get("mechanic") or mission.get("type") or "").casefold()
-    combined = " ".join(str(mission.get(key) or "") for key in ("title", "text", "photo")).casefold()
-    if group == "museum":
-        return "📱 После фото: узнай больше об экспонате или переведи текст на табличке."
-    if mechanic == "text" or re.search(r"иероглиф|надпис|вывеск|табличк|меню|назван", combined):
-        return "📱 После фото: «Прочитать / перевести» — текст, pinyin и перевод."
-    if group in {"restaurant", "cafe", "tea"}:
-        return "📱 После фото: посмотри информацию о блюде или напитке, составе и остроте."
-    if mechanic == "symbol" or re.search(r"символ|орнамент|традиц", combined):
-        return "📱 После фото: узнай больше о символе или традиционной детали."
-    return "📱 После фото: узнай больше о выбранной находке."
+    return "📱 Загрузи фото и получи больше информации или переведи текст."
 
 
 def apply_human_mission_copy(place, mission):

@@ -462,9 +462,10 @@ class NavigationTests(unittest.TestCase):
         self.assertNotIn("бот", edited["tip"].lower())
         self.assertNotIn("AI", edited["tip"])
         instruction = main.compact_photo_instruction(place, edited)
-        self.assertIn("После фото", instruction)
-        self.assertIn("Прочитать / перевести", instruction)
-        self.assertIn("pinyin", instruction)
+        self.assertEqual(
+            instruction,
+            "📱 Загрузи фото и получи больше информации или переведи текст.",
+        )
 
     def test_food_photo_mission_explains_available_analysis(self):
         place = {"category_label": "🍜 ресторан"}
@@ -477,8 +478,10 @@ class NavigationTests(unittest.TestCase):
         }
         edited = main.apply_human_mission_copy(place, mission)
         instruction = main.compact_photo_instruction(place, edited)
-        self.assertIn("После фото", instruction)
-        self.assertIn("составе и остроте", instruction)
+        self.assertEqual(
+            instruction,
+            "📱 Загрузи фото и получи больше информации или переведи текст.",
+        )
 
     def test_full_quest_shows_photo_help_without_opening_mission(self):
         quest = {
@@ -497,9 +500,10 @@ class NavigationTests(unittest.TestCase):
         }
         route = {"time_s": 0, "distance_m": 0, "legs": [], "start_mode": "center"}
         text = main.full_quest_text(quest, route, "2 часа")
-        self.assertIn("После фото", text)
-        self.assertIn("Прочитать / перевести", text)
-        self.assertIn("pinyin", text)
+        self.assertIn(
+            "Загрузи фото и получи больше информации или переведи текст",
+            text,
+        )
 
     def test_museum_tip_cannot_leak_ai_wording(self):
         place = {"category_label": "🏛 музей"}
@@ -519,8 +523,10 @@ class NavigationTests(unittest.TestCase):
         self.assertNotIn("бот", edited["tip"].lower())
         self.assertIn("Узнать об экспонате без фото", edited["tip"])
         instruction = main.compact_photo_instruction(place, edited)
-        self.assertIn("После фото", instruction)
-        self.assertIn("экспонате", instruction)
+        self.assertEqual(
+            instruction,
+            "📱 Загрузи фото и получи больше информации или переведи текст.",
+        )
 
     def test_every_field_mission_gets_its_own_optional_photo_slot(self):
         visual = main.ensure_field_mission_photo({
